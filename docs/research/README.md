@@ -6,7 +6,7 @@ design is reviewed independently before it is called SOUND.
 | Stream | Question | Status |
 |---|---|---|
 | R1 prior art | What makes a good harness — SWE-agent, mini-SWE-agent, OpenHands, Aider, Claude Code, Codex CLI, opencode, Goose; failure modes; confinement; MCP and plugin models; Rust crates; local-model tool calling | in progress |
-| R2 suite inventory | What already exists in the suite that the harness reuses, must comply with, or replaces | in progress |
+| R2 suite inventory | What already exists in the suite that the harness reuses, must comply with, or replaces | **done** — [R2-suite-inventory-2026-09-23.md](R2-suite-inventory-2026-09-23.md) (12 hard requirements, reusable parts, placement mechanics, contradictions) |
 | R3 fleet lessons | Every failure the suite's own agent fleet has hit, turned into a requirement the harness meets by construction | queued (lane ah02) |
 | R4 Component D review | First independent review of the 2026-09-14 agent-harness draft: what carries forward | queued (lane ah01) |
 | R5 integration map | Per app: what an agent would do with it, effect classes, the capabilities it would declare | after R1-R2 |

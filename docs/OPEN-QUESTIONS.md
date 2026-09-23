@@ -13,3 +13,7 @@ research pipeline and v0.1 design must answer.
 8. **Licence (owner):** follows the suite ruling OI-05.
 9. **Where the admin assistant ends:** which operations are ever automatic, and which always need a human yes?
 10. **Remote model hosts over rustynet:** a GPU box on the mesh serving the model to a laptop — in scope for v1?
+11. **rustyharness vs the charter's "rustyai" (owner):** the charter already names rustyai as the confined AI over personal data (the personal-data app's router, maximal-sensitivity floor). Is rustyharness the runtime rustyai is built on, or a separate dev/ops tool that never touches personal data? The answer decides which security floor applies to which parts.
+12. **Confinement mode (owner, suite OI-24):** separate OS account, VM/container, or interim only. The harness's execution design depends on it; the suite's confinement design v0.2 (reviewed SOUND) lists the properties P1-P8 any agent runtime must have.
+13. **Local-only vs cloud models:** the existing in-suite agent tooling (rustynet-mcp ai-agent, rustyfin ai-agent) is cloud-capable or cloud-first; the Component D draft says local only. The harness needs one stated egress posture.
+14. **Reuse rustyfin's assistant tool contract?** It is the most mature in-suite pattern (per-tool access mode, risk tier, confirmation policy, six-layer permission check, confirmation tokens; MIT) — but the proposed membership ADR would archive rustyfin.
