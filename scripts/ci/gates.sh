@@ -9,16 +9,25 @@ set -eu
 
 cd "$(dirname "$0")/../.."
 
-printf '=== 1/4 cargo fmt --all --check ===\n'
+printf '=== 1/5 cargo fmt --all --check ===\n'
 cargo fmt --all --check
 
-printf '=== 2/4 cargo deny check advisories bans licenses sources ===\n'
+printf '=== 2/5 purity (dep shape, pure-content, INV-28) ===\n'
+sh scripts/ci/purity.sh
+printf '%s\n' '--- purity refusal witnesses (planted violations must be refused) ---'
+sh scripts/ci/purity-selftest.sh
+
+printf '=== 3/5 cargo deny check advisories bans licenses sources ===\n'
 cargo deny check advisories bans licenses sources
 
-printf '=== 3/4 cargo clippy --workspace --all-targets -- -D warnings ===\n'
+printf '=== 4/5 cargo clippy --workspace --all-targets -- -D warnings ===\n'
 cargo clippy --locked --workspace --all-targets -- -D warnings
+printf '%s\n' '--- clippy again with gate-outcome/json (the §6 wire types must compile in CI too) ---'
+cargo clippy --locked --workspace --all-targets --features gate-outcome/json -- -D warnings
 
-printf '=== 4/4 cargo test --workspace ===\n'
+printf '=== 5/5 cargo test --workspace ===\n'
 cargo test --locked --workspace
+printf '%s\n' '--- tests again with gate-outcome/json ---'
+cargo test --locked --workspace --features gate-outcome/json
 
-printf 'All 4 rustyharness gates passed.\n'
+printf 'All 5 rustyharness gates passed.\n'

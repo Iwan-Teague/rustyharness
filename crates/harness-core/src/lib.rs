@@ -4,14 +4,16 @@
 //! settled by reviewed suite designs; everything else waits for the
 //! rustyharness design (docs/00-overview.md, research pipeline in docs/research/).
 //!
-//! Deliberately ABSENT: a run-outcome / verdict type. The suite has exactly one
-//! gate-layer outcome type (`charter/design/gate-outcome-UNIFIED-v0.2.md`,
-//! `GateOutcome { Passed(Witness), Failed, Indeterminate { why } }`), to be built
-//! as the shared `gate-outcome` crate. Defining a private one here would repeat
-//! the supersession-drift defect the suite has already fixed twice (AQ-151,
-//! AQ-189). rustyharness is standalone-first (docs/adr/0002-standalone-first.md),
-//! so it must not depend on the suite: that type has to live in a small
-//! standalone crate both can depend on. The v0.1 design settles how.
+//! The gate-layer outcome type lives in the sibling `gate-outcome` crate
+//! (`GateOutcome { Passed(Witness), Failed, Indeterminate { why } }`); this
+//! crate defines none and must never (the INV-28 grep gate refuses any
+//! `enum …Outcome`/`enum …Verdict` under `crates/harness-*`). The run-loop
+//! types here (`StopCause`, `Meter`, `LoopDetector`) are deliberately NOT
+//! verdicts: they describe why a run loop ended, not whether a claim held.
+//!
+//! H1a adds the §1.3 run-loop slice: [`Meter`] (six self-measured budget
+//! dimensions replacing the steps-only `Budget`) and [`LoopDetector`]
+//! (design §2.6). Both are pure: time and token usage are passed IN.
 
 #![forbid(unsafe_code)]
 // The panic-set lints ratchet production code; unit tests may assert loosely.
@@ -20,7 +22,11 @@
     allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
 )]
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::time::Duration;
+
+use gate_outcome::Digest;
 
 /// Data that crossed a trust boundary into the harness: tool output, file
 /// contents, test logs, web pages, model completions.
@@ -28,6 +34,14 @@ use std::fmt;
 /// It is DATA, never instructions. The wrapper has no `Deref`, so the inner
 /// value cannot be used by accident; reading it means calling [`Untrusted::inspect`]
 /// with a named reason, which is a greppable, reviewable choke point.
+///
+/// # INV-2 (compile-fail): no `Deref` coercion out of `Untrusted`
+///
+/// ```compile_fail
+/// use harness_core::{Source, Untrusted};
+/// let u = Untrusted::new(String::from("secret"), Source::Model);
+/// let leaked: &String = &u;
+/// ```
 pub struct Untrusted<T> {
     value: T,
     source: Source,
@@ -73,56 +87,648 @@ impl<T> fmt::Debug for Untrusted<T> {
     }
 }
 
-/// A hard limit on how much work one run may do. Every loop in the harness
-/// charges a budget; an exhausted budget stops the run, it is never extended
-/// silently.
+/// A budget dimension (design §2.4). The six are self-measured by [`Meter`]:
+/// spend is recorded by the meter, never asserted by a caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BudgetDim {
+    /// Model/tool steps taken.
+    Steps,
+    /// Tokens charged by the server (or conservatively estimated from the
+    /// prompt and reply bytes when the server reports none).
+    Tokens,
+    /// Wall-clock time spent working. Approval waits do NOT tick this: the
+    /// loop simply does not charge while a human decision is pending.
+    Wall,
+    /// Money spent, derived from tokens × the profile's pricing. A local
+    /// model with no pricing costs nothing.
+    Cost,
+    /// Consecutive unparseable model replies.
+    FormatErrors,
+    /// Verification repair rounds (design §2.7: after failed checks, the
+    /// model sees the visible diagnostics and may try again). Exhaustion is
+    /// not a stop: the verdict stands. Format repair is separate (§2.2).
+    RepairRounds,
+}
+
+impl fmt::Display for BudgetDim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            BudgetDim::Steps => "steps",
+            BudgetDim::Tokens => "tokens",
+            BudgetDim::Wall => "wall",
+            BudgetDim::Cost => "cost",
+            BudgetDim::FormatErrors => "format_errors",
+            BudgetDim::RepairRounds => "repair_rounds",
+        };
+        f.write_str(name)
+    }
+}
+
+/// Typed exhaustion record: `{dimension, spent, limit}` (design §2.4).
+///
+/// `spent` is measured by the meter, never caller-asserted (F3 lesson).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Budget {
-    remaining_steps: u32,
+pub struct Exhausted {
+    /// Which dimension ran out.
+    pub dimension: BudgetDim,
+    /// How much was actually spent when the latch fired.
+    pub spent: u64,
+    /// The limit that was exceeded.
+    pub limit: u64,
+}
+
+/// Token usage as reported by a model server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenUsage {
+    /// Prompt tokens.
+    pub input: u64,
+    /// Completion tokens.
+    pub output: u64,
+}
+
+/// Price entry bound to a [`Meter`] when it is created (design §2.4: cost is
+/// derived, never asserted per call).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pricing {
+    /// Micro-currency units per input token.
+    pub input_micros_per_token: u64,
+    /// Micro-currency units per output token.
+    pub output_micros_per_token: u64,
+}
+
+/// Limits for all six dimensions, all explicit (design §2.4 defaults in the
+/// doc comments; tokens/cost limits are profile-derived, so there is no
+/// `Default` — a profile must decide).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeterLimits {
+    /// Max model/tool steps. Design default 50.
+    pub steps: u32,
+    /// Max tokens (input + output). Profile-derived.
+    pub tokens: u64,
+    /// Max wall-clock time spent working (excludes approval waits). Design
+    /// default 30 minutes.
+    pub wall: Duration,
+    /// Max cost in micro-currency units. Profile-derived; 0 for local models.
+    pub cost_micros: u64,
+    /// Max consecutive format errors. Design default 3.
+    pub format_errors: u32,
+    /// Max verification repair rounds (§2.7). Design default 1.
+    pub repair_rounds: u32,
+}
+
+/// Why a run loop ended (design §2.5).
+///
+/// NOT a verdict: verdicts are `gate_outcome::GateOutcome`. A stop cause is
+/// about the LOOP; INV-14 requires every budget stop to carry its typed
+/// cause, and a loop can never outlive its wall-clock budget because only
+/// [`Meter::tick_wall`] advances time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopCause {
+    /// The task was submitted; the run produced its deliverable.
+    Submitted,
+    /// A budget dimension was exhausted (never FormatErrors: that has its
+    /// own variant below, per §2.4).
+    Budget(BudgetDim),
+    /// Three consecutive unparseable replies.
+    FormatErrors,
+    /// A loop detector fired; see [`LoopKind`].
+    Loop(LoopKind),
+    /// The context window filled.
+    ContextExhausted,
+    /// Policy aborted the run.
+    PolicyAbort,
+    /// The model backend is unavailable.
+    ModelUnavailable,
+    /// A human cancelled.
+    Cancelled,
+    /// The sandbox was lost.
+    SandboxLost,
+    /// The journal rejected an operation.
+    JournalUnavailable {
+        /// Which journal operation failed.
+        op: String,
+        /// Why it failed.
+        error: String,
+    },
+}
+
+/// How the meter turns a latched [`Exhausted`] into a typed [`StopCause`]
+/// (INV-14): FormatErrors is its own variant, everything else is
+/// `StopCause::Budget(dim)`.
+fn stop_cause(exhausted: &Exhausted) -> StopCause {
+    match exhausted.dimension {
+        BudgetDim::FormatErrors => StopCause::FormatErrors,
+        dim => StopCause::Budget(dim),
+    }
+}
+
+/// Six-dimension run budget, self-measured (design §1.3/§2.4).
+///
+/// Replaces the scaffold steps-only `Budget`. Invariants:
+///
+/// - Spend is recorded by the meter; no caller can assert how much was spent.
+/// - The FIRST exhaustion latches a typed [`Exhausted`] record; budgets are
+///   never extended silently, and every later charge returns the SAME typed
+///   cause (INV-14).
+/// - Time enters only through [`Meter::tick_wall`]: approval waits are
+///   excluded by not ticking (§2.4), and the loop cannot outlive its
+///   wall-clock budget because there is no other clock.
+pub struct Meter {
+    limits: MeterLimits,
+    pricing: Option<Pricing>,
     spent_steps: u32,
+    tokens_input: u64,
+    tokens_output: u64,
+    tokens_estimated: bool,
+    elapsed: Duration,
+    cost_micros: u64,
+    consecutive_format_errors: u32,
+    format_errors_total: u64,
+    repair_rounds_used: u32,
+    exhaustion: Option<Exhausted>,
 }
 
-/// Returned when a budget is exhausted.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("budget exhausted after {spent} step(s)")]
-pub struct BudgetExhausted {
-    /// Steps spent before exhaustion.
-    pub spent: u32,
+impl fmt::Debug for Meter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Meter")
+            .field("limits", &self.limits)
+            .field("pricing", &self.pricing)
+            .field("steps_spent", &self.spent_steps)
+            .field("tokens_input", &self.tokens_input)
+            .field("tokens_output", &self.tokens_output)
+            .field("tokens_estimated", &self.tokens_estimated)
+            .field("elapsed", &self.elapsed)
+            .field("cost_micros", &self.cost_micros)
+            .field("consecutive_format_errors", &self.consecutive_format_errors)
+            .field("format_errors_total", &self.format_errors_total)
+            .field("repair_rounds_used", &self.repair_rounds_used)
+            .field("exhaustion", &self.exhaustion)
+            .finish()
+    }
 }
 
-impl Budget {
-    /// A budget of `steps` model/tool steps.
-    pub fn steps(steps: u32) -> Self {
+impl Meter {
+    /// A meter with explicit limits for all six dimensions and the profile's
+    /// price table, bound once here so no later call can declare an exchange
+    /// free. `None` means a local model that costs nothing.
+    pub fn new(limits: MeterLimits, pricing: Option<Pricing>) -> Self {
         Self {
-            remaining_steps: steps,
+            limits,
+            pricing,
             spent_steps: 0,
+            tokens_input: 0,
+            tokens_output: 0,
+            tokens_estimated: false,
+            elapsed: Duration::ZERO,
+            cost_micros: 0,
+            consecutive_format_errors: 0,
+            format_errors_total: 0,
+            repair_rounds_used: 0,
+            exhaustion: None,
         }
     }
 
-    /// Steps spent so far, as measured by the budget itself.
-    pub fn spent(&self) -> u32 {
+    fn latched(&self) -> Option<StopCause> {
+        self.exhaustion.as_ref().map(stop_cause)
+    }
+
+    fn latch(&mut self, exhausted: Exhausted) -> StopCause {
+        if self.exhaustion.is_none() {
+            self.exhaustion = Some(exhausted.clone());
+        }
+        stop_cause(self.exhaustion.as_ref().unwrap_or(&exhausted))
+    }
+
+    /// Spend one model/tool step, or refuse with the typed stop cause.
+    ///
+    /// Design §2.4 default limit: 50 steps.
+    pub fn charge_step(&mut self) -> Result<(), StopCause> {
+        if let Some(cause) = self.latched() {
+            return Err(cause);
+        }
+        if self.spent_steps >= self.limits.steps {
+            return Err(self.latch(Exhausted {
+                dimension: BudgetDim::Steps,
+                spent: u64::from(self.spent_steps),
+                limit: u64::from(self.limits.steps),
+            }));
+        }
+        self.spent_steps += 1;
+        Ok(())
+    }
+
+    /// Record a model exchange (design §2.4).
+    ///
+    /// `usage` is what the server reported. `None` means the server reported
+    /// nothing, and the meter falls back to the conservative estimate on
+    /// BOTH sides, rounding up: `input = ceil(prompt_bytes / 3)`,
+    /// `output = ceil(reply_bytes / 3)`, marking the meter
+    /// [`Meter::tokens_were_estimated`]. Cost is always DERIVED from the
+    /// pricing bound in [`Meter::new`] (tokens × price, saturating) — never
+    /// caller-asserted.
+    pub fn record_tokens(
+        &mut self,
+        usage: Option<TokenUsage>,
+        prompt_bytes: u64,
+        reply_bytes: u64,
+    ) -> Result<(), StopCause> {
+        if let Some(cause) = self.latched() {
+            return Err(cause);
+        }
+        let (input, output, estimated) = match usage {
+            Some(usage) => (usage.input, usage.output, false),
+            None => (prompt_bytes.div_ceil(3), reply_bytes.div_ceil(3), true),
+        };
+        self.tokens_input = self.tokens_input.saturating_add(input);
+        self.tokens_output = self.tokens_output.saturating_add(output);
+        self.tokens_estimated |= estimated;
+        if let Some(price) = self.pricing {
+            let cost = input
+                .saturating_mul(price.input_micros_per_token)
+                .saturating_add(output.saturating_mul(price.output_micros_per_token));
+            self.cost_micros = self.cost_micros.saturating_add(cost);
+        }
+        self.check_renewable_exhaustion()
+    }
+
+    /// Charge wall-clock time spent WORKING (design §2.4).
+    ///
+    /// Approval waits are excluded by NOT ticking through them. Saturates at
+    /// [`Duration::MAX`] rather than panicking; the wall check below still
+    /// trips.
+    pub fn tick_wall(&mut self, dt: Duration) -> Result<(), StopCause> {
+        if let Some(cause) = self.latched() {
+            return Err(cause);
+        }
+        self.elapsed = self.elapsed.checked_add(dt).unwrap_or(Duration::MAX);
+        self.check_renewable_exhaustion()
+    }
+
+    /// Re-check the renewable dimensions in §2.4 table order
+    /// (tokens → wall → cost) after any spend.
+    fn check_renewable_exhaustion(&mut self) -> Result<(), StopCause> {
+        let tokens = self.tokens_input.saturating_add(self.tokens_output);
+        if tokens > self.limits.tokens {
+            return Err(self.latch(Exhausted {
+                dimension: BudgetDim::Tokens,
+                spent: tokens,
+                limit: self.limits.tokens,
+            }));
+        }
+        if self.elapsed >= self.limits.wall {
+            return Err(self.latch(Exhausted {
+                dimension: BudgetDim::Wall,
+                spent: u64::try_from(self.elapsed.as_micros()).unwrap_or(u64::MAX),
+                limit: u64::try_from(self.limits.wall.as_micros()).unwrap_or(u64::MAX),
+            }));
+        }
+        if self.cost_micros > self.limits.cost_micros {
+            return Err(self.latch(Exhausted {
+                dimension: BudgetDim::Cost,
+                spent: self.cost_micros,
+                limit: self.limits.cost_micros,
+            }));
+        }
+        Ok(())
+    }
+
+    /// A model reply failed to parse. Three CONSECUTIVE failures latch
+    /// [`StopCause::FormatErrors`] (§2.4); a good reply resets the streak via
+    /// [`Meter::record_format_ok`].
+    pub fn record_format_error(&mut self) -> Result<(), StopCause> {
+        if let Some(cause) = self.latched() {
+            return Err(cause);
+        }
+        self.consecutive_format_errors = self.consecutive_format_errors.saturating_add(1);
+        self.format_errors_total = self.format_errors_total.saturating_add(1);
+        if self.consecutive_format_errors >= self.limits.format_errors {
+            return Err(self.latch(Exhausted {
+                dimension: BudgetDim::FormatErrors,
+                spent: u64::from(self.consecutive_format_errors),
+                limit: u64::from(self.limits.format_errors),
+            }));
+        }
+        Ok(())
+    }
+
+    /// A model reply parsed; resets the consecutive-error streak.
+    pub fn record_format_ok(&mut self) {
+        self.consecutive_format_errors = 0;
+    }
+
+    /// Ask for one verification repair round (§2.7; §2.4 default: 1 round).
+    ///
+    /// Exhausted repair rounds is NOT a stop: the verdict simply stands and
+    /// no further repair is attempted. `false` means "no more repair".
+    pub fn take_repair_round(&mut self) -> bool {
+        if self.repair_rounds_used >= self.limits.repair_rounds {
+            return false;
+        }
+        self.repair_rounds_used += 1;
+        true
+    }
+
+    /// Steps spent, as measured here.
+    pub fn steps_spent(&self) -> u32 {
         self.spent_steps
     }
 
-    /// Spend one step, or refuse if none remain.
-    ///
-    /// The budget measures its own spend: the reported number in
-    /// [`BudgetExhausted`] can never be asserted by a caller.
-    pub fn charge(&mut self) -> Result<(), BudgetExhausted> {
-        if self.remaining_steps == 0 {
-            return Err(BudgetExhausted {
-                spent: self.spent_steps,
-            });
+    /// (input, output) tokens recorded, as measured here.
+    pub fn tokens_spent(&self) -> (u64, u64) {
+        (self.tokens_input, self.tokens_output)
+    }
+
+    /// Whether any token figure was an estimate rather than server-reported.
+    pub fn tokens_were_estimated(&self) -> bool {
+        self.tokens_estimated
+    }
+
+    /// Working wall-clock time charged so far.
+    pub fn elapsed(&self) -> Duration {
+        self.elapsed
+    }
+
+    /// Derived cost so far in micro-currency units.
+    pub fn cost_spent(&self) -> u64 {
+        self.cost_micros
+    }
+
+    /// Current consecutive format-error streak.
+    pub fn consecutive_format_errors(&self) -> u32 {
+        self.consecutive_format_errors
+    }
+
+    /// Total format errors this run.
+    pub fn format_errors_total(&self) -> u64 {
+        self.format_errors_total
+    }
+
+    /// Repair rounds taken.
+    pub fn repair_rounds_used(&self) -> u32 {
+        self.repair_rounds_used
+    }
+
+    /// The latched exhaustion record, if any (§2.4:
+    /// `{dimension, spent, limit}`).
+    pub fn first_exhaustion(&self) -> Option<&Exhausted> {
+        self.exhaustion.as_ref()
+    }
+
+    /// The typed stop cause for a latched exhaustion (INV-14), if any.
+    pub fn stop_cause(&self) -> Option<StopCause> {
+        self.latched()
+    }
+}
+
+/// Why a loop was detected (design §2.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LoopKind {
+    /// The same action, three times in the last six steps.
+    Repeat,
+    /// More than eight successful edits to one file.
+    EditChurn,
+    /// Ten steps with no new observation and no workspace change.
+    NoProgress,
+    /// Three policy denials of the same capability.
+    Denied,
+}
+
+impl fmt::Display for LoopKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            LoopKind::Repeat => "repeat",
+            LoopKind::EditChurn => "edit-churn",
+            LoopKind::NoProgress => "no-progress",
+            LoopKind::Denied => "denied",
+        };
+        f.write_str(name)
+    }
+}
+
+/// Events the run loop feeds the detector (design §2.6). All pure data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoopEvent {
+    /// A plain loop step was taken.
+    Step,
+    /// A tool was invoked; `args_digest` identifies the arguments.
+    Action {
+        /// Tool/capability id.
+        tool: String,
+        /// Digest over the serialized arguments.
+        args_digest: Digest,
+    },
+    /// An edit to a file SUCCEEDED.
+    EditApplied {
+        /// Workspace-relative file path.
+        file: String,
+    },
+    /// A new observation was made; `digest` identifies its content.
+    Observation {
+        /// Digest over the observation content.
+        digest: Digest,
+    },
+    /// The workspace tree digest changed (or was re-observed).
+    WorkspaceChanged {
+        /// Digest over the workspace tree.
+        tree_digest: Digest,
+    },
+    /// Policy denied a capability.
+    PolicyDenied {
+        /// Capability id that was denied.
+        capability: String,
+    },
+}
+
+/// First-notice payload for a standing loop condition (§2.6: the first hit
+/// is a Notice; only a SECOND hit stops the run).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoopNotice {
+    /// The same action has now hit the repeat threshold once.
+    IdenticalAction {
+        /// The repeated tool.
+        tool: String,
+    },
+}
+
+/// Edge-triggered detector output: `Quiet` most steps; `Notice` the first
+/// time a standing condition appears; `Stop` when it must end the run
+/// (§2.6: standing conditions are signalled once per state change).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoopSignal {
+    /// Nothing to report.
+    Quiet,
+    /// A standing condition appeared for the first time.
+    Notice(LoopNotice),
+    /// The run must stop with this loop cause.
+    Stop(LoopKind),
+}
+
+/// Identical-action window length (§2.6: "3× within the last 6 steps").
+const IDENTICAL_WINDOW: usize = 6;
+/// Identical-action threshold (§2.6: the 3rd hit is the first signal).
+const IDENTICAL_LIMIT: usize = 3;
+/// Edit-churn threshold (§2.6: ">8 successful edits to one file").
+const EDIT_CHURN_LIMIT: u32 = 8;
+/// No-progress threshold (§2.6: "10 steps with no new observation digest AND
+/// no workspace tree-digest change").
+const NO_PROGRESS_LIMIT: u32 = 10;
+/// Denial-hammering threshold (§2.6: "3 policy denials of the same
+/// capability").
+const DENIAL_LIMIT: u32 = 3;
+
+/// Pure loop detector over the §2.6 conditions.
+///
+/// Feeding events is the ONLY way state changes: no clock, no I/O. Priority
+/// when several conditions fire on the same event follows the §2.6 table
+/// order: `Repeat`/`EditChurn` outrank `NoProgress`, which outranks `Denied`.
+///
+/// Denial hammering additionally names the capabilities to remove from the
+/// active set: after a [`LoopKind::Denied`] stop, [`LoopDetector::removed_capabilities`]
+/// lists every capability that hit the threshold.
+///
+/// Two rules keep the detectors honest against interleaving:
+///
+/// - The identical-action notice is remembered PER `(tool, args digest)`
+///   key, and cleared only when that key falls below the threshold in the
+///   window. Other actions in between do not reset it, so an action repeated
+///   every other step is noticed once and then stopped.
+/// - "New" observation and tree digests mean never seen before in this run,
+///   not merely different from the last one. Alternating between two
+///   already-seen digests is not progress. The seen sets grow by at most one
+///   entry per event, and the step budget bounds the events in a run.
+pub struct LoopDetector {
+    window: VecDeque<(String, Digest)>,
+    repeat_noticed: HashSet<(String, Digest)>,
+    edits_per_file: HashMap<String, u32>,
+    steps_without_progress: u32,
+    seen_observations: HashSet<Digest>,
+    seen_trees: HashSet<Digest>,
+    denial_counts: HashMap<String, u32>,
+    removed: Vec<String>,
+}
+
+impl Default for LoopDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LoopDetector {
+    /// A fresh detector.
+    pub fn new() -> Self {
+        Self {
+            window: VecDeque::new(),
+            repeat_noticed: HashSet::new(),
+            edits_per_file: HashMap::new(),
+            steps_without_progress: 0,
+            seen_observations: HashSet::new(),
+            seen_trees: HashSet::new(),
+            denial_counts: HashMap::new(),
+            removed: Vec::new(),
         }
-        self.remaining_steps -= 1;
-        self.spent_steps += 1;
-        Ok(())
+    }
+
+    /// Feed one event; get the (edge-triggered) signal.
+    pub fn observe(&mut self, event: LoopEvent) -> LoopSignal {
+        let signal = match event {
+            LoopEvent::Step => {
+                self.bump_stall();
+                LoopSignal::Quiet
+            }
+            LoopEvent::Action { tool, args_digest } => {
+                self.bump_stall();
+                self.observe_action(tool, args_digest)
+            }
+            LoopEvent::EditApplied { file } => {
+                let count = self.edits_per_file.entry(file).or_insert(0);
+                *count = count.saturating_add(1);
+                if *count > EDIT_CHURN_LIMIT {
+                    LoopSignal::Stop(LoopKind::EditChurn)
+                } else {
+                    LoopSignal::Quiet
+                }
+            }
+            LoopEvent::Observation { digest } => {
+                if self.seen_observations.insert(digest) {
+                    // A never-seen observation is progress.
+                    self.steps_without_progress = 0;
+                }
+                LoopSignal::Quiet
+            }
+            LoopEvent::WorkspaceChanged { tree_digest } => {
+                if self.seen_trees.insert(tree_digest) {
+                    // A never-seen tree digest is progress.
+                    self.steps_without_progress = 0;
+                }
+                LoopSignal::Quiet
+            }
+            LoopEvent::PolicyDenied { capability } => {
+                let count = self.denial_counts.entry(capability.clone()).or_insert(0);
+                *count = count.saturating_add(1);
+                if *count >= DENIAL_LIMIT {
+                    if !self.removed.contains(&capability) {
+                        self.removed.push(capability);
+                    }
+                    LoopSignal::Stop(LoopKind::Denied)
+                } else {
+                    LoopSignal::Quiet
+                }
+            }
+        };
+        // §2.6 table order: the earlier detectors (Repeat, EditChurn) win
+        // their Stop; NoProgress outranks Denied.
+        if !matches!(signal, LoopSignal::Stop(_))
+            && self.steps_without_progress >= NO_PROGRESS_LIMIT
+        {
+            return LoopSignal::Stop(LoopKind::NoProgress);
+        }
+        signal
+    }
+
+    fn bump_stall(&mut self) {
+        self.steps_without_progress = self.steps_without_progress.saturating_add(1);
+    }
+
+    fn observe_action(&mut self, tool: String, args_digest: Digest) -> LoopSignal {
+        self.window.push_back((tool.clone(), args_digest));
+        while self.window.len() > IDENTICAL_WINDOW {
+            self.window.pop_front();
+        }
+        // A key whose repeats have left the window has cleared: a future
+        // episode of THAT key may Notice again. Other keys keep their state.
+        let window = &self.window;
+        self.repeat_noticed
+            .retain(|noticed| window.iter().filter(|e| *e == noticed).count() >= IDENTICAL_LIMIT);
+        let key = (tool, args_digest);
+        let count = self.window.iter().filter(|entry| *entry == &key).count();
+        if count < IDENTICAL_LIMIT {
+            return LoopSignal::Quiet;
+        }
+        if self.repeat_noticed.contains(&key) {
+            return LoopSignal::Stop(LoopKind::Repeat);
+        }
+        let tool = key.0.clone();
+        self.repeat_noticed.insert(key);
+        LoopSignal::Notice(LoopNotice::IdenticalAction { tool })
+    }
+
+    /// Capabilities that hit the denial threshold and must leave the active
+    /// set (§2.6).
+    pub fn removed_capabilities(&self) -> &[String] {
+        &self.removed
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gate_outcome::Digest;
+
+    // Digest has private fields: build via from_bytes (its only public
+    // constructor) in const position.
+    const D1: Digest = Digest::from_bytes([1u8; 32]);
+    const D2: Digest = Digest::from_bytes([2u8; 32]);
+    const D3: Digest = Digest::from_bytes([3u8; 32]);
 
     #[test]
     fn untrusted_debug_never_prints_content() {
@@ -136,25 +742,585 @@ mod tests {
     }
 
     #[test]
-    fn budget_refuses_when_exhausted() {
-        let mut b = Budget::steps(2);
-        assert!(b.charge().is_ok());
-        assert!(b.charge().is_ok());
-        assert_eq!(b.charge(), Err(BudgetExhausted { spent: 2 }));
+    fn meter_steps_budget_is_self_measured() {
+        let mut m = Meter::new(
+            MeterLimits {
+                steps: 2,
+                tokens: u64::MAX,
+                wall: Duration::MAX,
+                cost_micros: u64::MAX,
+                format_errors: 3,
+                repair_rounds: 1,
+            },
+            None,
+        );
+        assert!(m.charge_step().is_ok());
+        assert!(m.charge_step().is_ok());
+        // The 3rd charge latches Budget(Steps) with meter-measured spend.
+        assert_eq!(m.charge_step(), Err(StopCause::Budget(BudgetDim::Steps)));
+        assert_eq!(
+            m.first_exhaustion(),
+            Some(&Exhausted {
+                dimension: BudgetDim::Steps,
+                spent: 2,
+                limit: 2,
+            })
+        );
+        assert_eq!(m.steps_spent(), 2);
+        // Latched: every later charge returns the SAME typed cause, and the
+        // budget is never extended silently.
+        assert_eq!(m.charge_step(), Err(StopCause::Budget(BudgetDim::Steps)));
+        assert_eq!(m.stop_cause(), Some(StopCause::Budget(BudgetDim::Steps)));
+    }
+
+    fn limits(tokens: u64, cost_micros: u64) -> MeterLimits {
+        MeterLimits {
+            steps: 50,
+            tokens,
+            wall: Duration::MAX,
+            cost_micros,
+            format_errors: 3,
+            repair_rounds: 1,
+        }
     }
 
     #[test]
-    fn budget_reports_measured_spent() {
-        // Review fix (2026-09-23): `spent` is measured by the budget, never
-        // caller-asserted — a run that was refused reports what actually ran.
-        let mut b = Budget::steps(0);
-        assert_eq!(b.charge(), Err(BudgetExhausted { spent: 0 }));
-        assert_eq!(b.spent(), 0);
+    fn meter_tokens_falls_back_to_byte_estimate_and_marks_it() {
+        let mut m = Meter::new(limits(u64::MAX, u64::MAX), None);
+        // No server usage: 300 prompt bytes → 100 input tokens, 900 reply
+        // bytes → 300 output tokens.
+        assert!(m.record_tokens(None, 300, 900).is_ok());
+        assert_eq!(m.tokens_spent(), (100, 300));
+        assert!(m.tokens_were_estimated());
 
-        let mut b = Budget::steps(2);
-        assert!(b.charge().is_ok());
-        assert!(b.charge().is_ok());
-        assert_eq!(b.charge(), Err(BudgetExhausted { spent: 2 }));
-        assert_eq!(b.spent(), 2);
+        // Server-reported usage is recorded as-is; the estimate flag stays
+        // set for the run (part of the total WAS an estimate — sticky by
+        // design, so a report never loses that fact).
+        assert!(m
+            .record_tokens(
+                Some(TokenUsage {
+                    input: 10,
+                    output: 20
+                }),
+                0,
+                0,
+            )
+            .is_ok());
+        assert_eq!(m.tokens_spent(), (110, 320));
+        assert!(m.tokens_were_estimated());
+    }
+
+    #[test]
+    fn meter_token_estimate_counts_the_prompt_and_rounds_up() {
+        let mut m = Meter::new(limits(u64::MAX, u64::MAX), None);
+        // 1 and 2 bytes are one token each, never zero.
+        assert!(m.record_tokens(None, 1, 2).is_ok());
+        assert_eq!(m.tokens_spent(), (1, 1));
+        assert!(m.record_tokens(None, 4, 0).is_ok());
+        assert_eq!(m.tokens_spent(), (3, 1));
+    }
+
+    #[test]
+    fn meter_tokens_budget_stops_a_server_that_omits_usage() {
+        // A server that never reports usage cannot run past the Tokens
+        // budget: the prompt is charged, and tiny replies are not rounded
+        // away.
+        let mut m = Meter::new(limits(1000, u64::MAX), None);
+        let mut accepted = 0;
+        let mut stop = None;
+        for _ in 0..40 {
+            match m.record_tokens(None, 100, 2) {
+                Ok(()) => accepted += 1,
+                Err(cause) => {
+                    stop = Some(cause);
+                    break;
+                }
+            }
+        }
+        // 34 input + 1 output = 35 tokens per exchange: the 29th crosses 1000.
+        assert_eq!(accepted, 28);
+        assert_eq!(stop, Some(StopCause::Budget(BudgetDim::Tokens)));
+        assert_eq!(
+            m.first_exhaustion(),
+            Some(&Exhausted {
+                dimension: BudgetDim::Tokens,
+                spent: 29 * 35,
+                limit: 1000,
+            })
+        );
+    }
+
+    #[test]
+    fn meter_tokens_budget_latches_on_reported_usage() {
+        let mut m = Meter::new(limits(100, u64::MAX), None);
+        let usage = TokenUsage {
+            input: 60,
+            output: 40,
+        };
+        // Exactly at the limit is still within budget.
+        assert!(m.record_tokens(Some(usage), 0, 0).is_ok());
+        assert_eq!(
+            m.record_tokens(
+                Some(TokenUsage {
+                    input: 1,
+                    output: 0
+                }),
+                0,
+                0
+            ),
+            Err(StopCause::Budget(BudgetDim::Tokens))
+        );
+        assert_eq!(
+            m.first_exhaustion(),
+            Some(&Exhausted {
+                dimension: BudgetDim::Tokens,
+                spent: 101,
+                limit: 100,
+            })
+        );
+        // Latched: every later charge of any kind returns the same cause.
+        assert_eq!(m.charge_step(), Err(StopCause::Budget(BudgetDim::Tokens)));
+        assert_eq!(
+            m.tick_wall(Duration::from_secs(1)),
+            Err(StopCause::Budget(BudgetDim::Tokens))
+        );
+    }
+
+    #[test]
+    fn meter_cost_is_derived_from_tokens_times_bound_price() {
+        let pricing = Pricing {
+            input_micros_per_token: 5,
+            output_micros_per_token: 7,
+        };
+        let mut m = Meter::new(limits(u64::MAX, 150), Some(pricing));
+        // 10 input × 5 + 20 output × 7 = 190 > 150 → Budget(Cost).
+        assert_eq!(
+            m.record_tokens(
+                Some(TokenUsage {
+                    input: 10,
+                    output: 20
+                }),
+                0,
+                0,
+            ),
+            Err(StopCause::Budget(BudgetDim::Cost))
+        );
+        assert_eq!(m.cost_spent(), 190);
+        // Estimated tokens are priced too: 3 prompt bytes + 3 reply bytes =
+        // 1 + 1 tokens = 12 micros.
+        let mut est = Meter::new(limits(u64::MAX, u64::MAX), Some(pricing));
+        assert!(est.record_tokens(None, 3, 3).is_ok());
+        assert_eq!(est.cost_spent(), 12);
+        // No pricing = local model: cost stays 0, no latch.
+        let mut local = Meter::new(limits(u64::MAX, 0), None);
+        assert!(local
+            .record_tokens(
+                Some(TokenUsage {
+                    input: 100,
+                    output: 100
+                }),
+                0,
+                0,
+            )
+            .is_ok());
+        assert_eq!(local.cost_spent(), 0);
+    }
+
+    #[test]
+    fn meter_wall_is_only_advanced_by_tick_wall() {
+        let mut m = Meter::new(
+            MeterLimits {
+                steps: 50,
+                tokens: u64::MAX,
+                wall: Duration::from_secs(10),
+                cost_micros: u64::MAX,
+                format_errors: 3,
+                repair_rounds: 1,
+            },
+            None,
+        );
+        // Approval waits never tick: nothing else can advance time (INV-14).
+        assert!(m.tick_wall(Duration::from_secs(4)).is_ok());
+        assert!(m.tick_wall(Duration::from_secs(4)).is_ok());
+        assert_eq!(
+            m.tick_wall(Duration::from_secs(4)),
+            Err(StopCause::Budget(BudgetDim::Wall))
+        );
+        assert_eq!(
+            m.first_exhaustion(),
+            Some(&Exhausted {
+                dimension: BudgetDim::Wall,
+                spent: 12_000_000,
+                limit: 10_000_000,
+            })
+        );
+    }
+
+    #[test]
+    fn meter_format_errors_stop_on_three_consecutive() {
+        let mut m = Meter::new(
+            MeterLimits {
+                steps: 50,
+                tokens: u64::MAX,
+                wall: Duration::MAX,
+                cost_micros: u64::MAX,
+                format_errors: 3,
+                repair_rounds: 1,
+            },
+            None,
+        );
+        assert!(m.record_format_error().is_ok());
+        assert!(m.record_format_error().is_ok());
+        m.record_format_ok();
+        assert_eq!(m.consecutive_format_errors(), 0);
+        assert_eq!(m.format_errors_total(), 2);
+        assert!(m.record_format_error().is_ok());
+        // The reset cleared the streak; the THIRD consecutive failure latches
+        // (§2.4) and FormatErrors is its OWN stop cause, not Budget(dim).
+        assert!(m.record_format_error().is_ok());
+        assert_eq!(m.record_format_error(), Err(StopCause::FormatErrors));
+        assert_eq!(m.stop_cause(), Some(StopCause::FormatErrors));
+    }
+
+    #[test]
+    fn meter_repair_rounds_exhaustion_is_not_a_stop() {
+        let mut m = Meter::new(
+            MeterLimits {
+                steps: 50,
+                tokens: u64::MAX,
+                wall: Duration::MAX,
+                cost_micros: u64::MAX,
+                format_errors: 3,
+                repair_rounds: 1,
+            },
+            None,
+        );
+        assert!(m.take_repair_round());
+        // No further repair; the verdict stands. NOT a StopCause.
+        assert!(!m.take_repair_round());
+        assert!(!m.take_repair_round());
+        assert_eq!(m.repair_rounds_used(), 1);
+        assert!(m.stop_cause().is_none());
+    }
+
+    #[test]
+    fn detector_identical_action_notices_once_then_stops() {
+        let mut d = LoopDetector::new();
+        let action = || LoopEvent::Action {
+            tool: "fs.write".to_string(),
+            args_digest: D1,
+        };
+        assert_eq!(d.observe(LoopEvent::Step), LoopSignal::Quiet);
+        assert_eq!(d.observe(action()), LoopSignal::Quiet);
+        assert_eq!(d.observe(action()), LoopSignal::Quiet);
+        // 3rd identical action in the window: first hit is a Notice.
+        assert_eq!(
+            d.observe(action()),
+            LoopSignal::Notice(LoopNotice::IdenticalAction {
+                tool: "fs.write".to_string()
+            })
+        );
+        // Same condition still standing: the NEXT hit stops the run.
+        assert_eq!(d.observe(action()), LoopSignal::Stop(LoopKind::Repeat));
+    }
+
+    #[test]
+    fn detector_repeat_window_expires_after_six_steps() {
+        let mut d = LoopDetector::new();
+        let action = || LoopEvent::Action {
+            tool: "fs.write".to_string(),
+            args_digest: D1,
+        };
+        for _ in 0..3 {
+            d.observe(action());
+        }
+        // 6 varied steps flush the identical actions out of the window...
+        for i in 0..6 {
+            d.observe(LoopEvent::Action {
+                tool: format!("tool{i}"),
+                args_digest: D2,
+            });
+        }
+        // ...and a NEW observation keeps the no-progress counter quiet so the
+        // repeat machinery is the thing under test.
+        d.observe(LoopEvent::Observation { digest: D3 });
+        // Three more identical hits are a fresh episode: Notice first.
+        assert_eq!(d.observe(action()), LoopSignal::Quiet);
+        assert_eq!(d.observe(action()), LoopSignal::Quiet);
+        assert_eq!(
+            d.observe(action()),
+            LoopSignal::Notice(LoopNotice::IdenticalAction {
+                tool: "fs.write".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn detector_edit_churn_fires_past_eight_edits() {
+        let mut d = LoopDetector::new();
+        for _ in 0..8 {
+            assert_eq!(
+                d.observe(LoopEvent::EditApplied {
+                    file: "a.rs".to_string()
+                }),
+                LoopSignal::Quiet
+            );
+        }
+        assert_eq!(
+            d.observe(LoopEvent::EditApplied {
+                file: "a.rs".to_string()
+            }),
+            LoopSignal::Stop(LoopKind::EditChurn)
+        );
+        // Other files are counted separately.
+        let mut d = LoopDetector::new();
+        for _ in 0..8 {
+            d.observe(LoopEvent::EditApplied {
+                file: "a.rs".to_string(),
+            });
+        }
+        assert_eq!(
+            d.observe(LoopEvent::EditApplied {
+                file: "b.rs".to_string()
+            }),
+            LoopSignal::Quiet
+        );
+    }
+
+    #[test]
+    fn detector_no_progress_needs_ten_barren_steps() {
+        let mut d = LoopDetector::new();
+        for _ in 0..9 {
+            assert_eq!(d.observe(LoopEvent::Step), LoopSignal::Quiet);
+        }
+        assert_eq!(
+            d.observe(LoopEvent::Step),
+            LoopSignal::Stop(LoopKind::NoProgress)
+        );
+    }
+
+    #[test]
+    fn detector_new_observation_or_tree_change_resets_stall() {
+        let mut d = LoopDetector::new();
+        // Nine barren steps stay quiet.
+        for _ in 0..9 {
+            assert_eq!(d.observe(LoopEvent::Step), LoopSignal::Quiet);
+        }
+        // A NEW observation digest is progress: the counter resets.
+        d.observe(LoopEvent::Observation { digest: D1 });
+        assert_eq!(d.observe(LoopEvent::Step), LoopSignal::Quiet);
+        // Barren again...
+        for _ in 0..8 {
+            d.observe(LoopEvent::Step);
+        }
+        // ...but a NEW tree digest is progress too.
+        d.observe(LoopEvent::WorkspaceChanged { tree_digest: D2 });
+        assert_eq!(d.observe(LoopEvent::Step), LoopSignal::Quiet);
+        // Repeating the SAME digests is NOT progress: no reset.
+        d.observe(LoopEvent::Observation { digest: D1 });
+        d.observe(LoopEvent::WorkspaceChanged { tree_digest: D2 });
+        for _ in 0..8 {
+            assert_eq!(d.observe(LoopEvent::Step), LoopSignal::Quiet);
+        }
+        // The tenth barren step since the last progress stops the run.
+        assert_eq!(
+            d.observe(LoopEvent::Step),
+            LoopSignal::Stop(LoopKind::NoProgress)
+        );
+    }
+
+    #[test]
+    fn detector_denial_hammering_stops_and_names_capability() {
+        let mut d = LoopDetector::new();
+        let deny = || LoopEvent::PolicyDenied {
+            capability: "net.fetch".to_string(),
+        };
+        assert_eq!(d.observe(deny()), LoopSignal::Quiet);
+        assert_eq!(d.observe(deny()), LoopSignal::Quiet);
+        assert_eq!(d.observe(deny()), LoopSignal::Stop(LoopKind::Denied));
+        assert_eq!(d.removed_capabilities(), ["net.fetch"]);
+    }
+
+    #[test]
+    fn detector_priority_repeat_outranks_no_progress() {
+        // Reach the noticed repeat state while fresh observations keep the
+        // no-progress counter quiet...
+        let mut d = LoopDetector::new();
+        let action = || LoopEvent::Action {
+            tool: "fs.write".to_string(),
+            args_digest: D1,
+        };
+        assert_eq!(d.observe(action()), LoopSignal::Quiet);
+        assert_eq!(d.observe(action()), LoopSignal::Quiet);
+        assert_eq!(
+            d.observe(action()),
+            LoopSignal::Notice(LoopNotice::IdenticalAction {
+                tool: "fs.write".to_string()
+            })
+        );
+        // ...then let the stall cross its threshold on barren steps...
+        for _ in 0..9 {
+            d.observe(LoopEvent::Step);
+        }
+        // ...so the next identical action is BOTH a repeat hit and barren:
+        // Repeat wins (§2.6 table order: Repeat/EditChurn > NoProgress).
+        assert_eq!(d.observe(action()), LoopSignal::Stop(LoopKind::Repeat));
+    }
+
+    #[test]
+    fn detector_repeat_survives_interleaved_filler_actions() {
+        // The same read every other step, a DIFFERENT filler action in
+        // between, and observations alternating between two digests. The
+        // repeated action is noticed once and then stops the run.
+        let mut d = LoopDetector::new();
+        let mut signals = Vec::new();
+        for i in 0..200u32 {
+            let event = if i % 2 == 0 {
+                LoopEvent::Action {
+                    tool: "fs.read".to_string(),
+                    args_digest: D1,
+                }
+            } else {
+                LoopEvent::Action {
+                    tool: format!("filler{i}"),
+                    args_digest: D2,
+                }
+            };
+            let signal = d.observe(event);
+            d.observe(LoopEvent::Observation {
+                digest: if i % 2 == 0 { D2 } else { D3 },
+            });
+            if signal != LoopSignal::Quiet {
+                signals.push((i, signal));
+            }
+            if matches!(signals.last(), Some((_, LoopSignal::Stop(_)))) {
+                break;
+            }
+        }
+        assert_eq!(
+            signals,
+            vec![
+                (
+                    4,
+                    LoopSignal::Notice(LoopNotice::IdenticalAction {
+                        tool: "fs.read".to_string()
+                    })
+                ),
+                (6, LoopSignal::Stop(LoopKind::Repeat)),
+            ]
+        );
+    }
+
+    #[test]
+    fn detector_repeat_state_is_per_action() {
+        // Two actions, each repeated in alternation: each key has its own
+        // notice, and the second hit of either key stops.
+        let mut d = LoopDetector::new();
+        let a = || LoopEvent::Action {
+            tool: "a".to_string(),
+            args_digest: D1,
+        };
+        let b = || LoopEvent::Action {
+            tool: "b".to_string(),
+            args_digest: D1,
+        };
+        assert_eq!(d.observe(a()), LoopSignal::Quiet);
+        assert_eq!(d.observe(b()), LoopSignal::Quiet);
+        assert_eq!(d.observe(a()), LoopSignal::Quiet);
+        assert_eq!(d.observe(b()), LoopSignal::Quiet);
+        assert_eq!(
+            d.observe(a()),
+            LoopSignal::Notice(LoopNotice::IdenticalAction {
+                tool: "a".to_string()
+            })
+        );
+        assert_eq!(
+            d.observe(b()),
+            LoopSignal::Notice(LoopNotice::IdenticalAction {
+                tool: "b".to_string()
+            })
+        );
+        assert_eq!(d.observe(a()), LoopSignal::Stop(LoopKind::Repeat));
+    }
+
+    #[test]
+    fn detector_alternating_old_observations_are_not_progress() {
+        // Distinct actions (no repeat), observations and trees alternating
+        // between two digests already seen: only the first sighting of each
+        // digest is progress, so NoProgress still fires.
+        let mut d = LoopDetector::new();
+        let mut stop_at = None;
+        for i in 0..40u8 {
+            let signal = d.observe(LoopEvent::Action {
+                tool: format!("t{i}"),
+                args_digest: Digest::from_bytes([i; 32]),
+            });
+            d.observe(LoopEvent::Observation {
+                digest: if i % 2 == 0 { D1 } else { D2 },
+            });
+            d.observe(LoopEvent::WorkspaceChanged {
+                tree_digest: if i % 2 == 0 { D2 } else { D3 },
+            });
+            if signal == LoopSignal::Stop(LoopKind::NoProgress) {
+                stop_at = Some(i);
+                break;
+            }
+        }
+        // Progress was last made at i = 1 (first sighting of D2 / D3): ten
+        // barren actions later (i = 2..=11) the run stops.
+        assert_eq!(stop_at, Some(11));
+    }
+
+    #[test]
+    fn detector_denial_keeps_stopping_past_the_threshold() {
+        let mut d = LoopDetector::new();
+        let deny = || LoopEvent::PolicyDenied {
+            capability: "net.fetch".to_string(),
+        };
+        d.observe(deny());
+        d.observe(deny());
+        assert_eq!(d.observe(deny()), LoopSignal::Stop(LoopKind::Denied));
+        assert_eq!(d.observe(deny()), LoopSignal::Stop(LoopKind::Denied));
+        assert_eq!(d.removed_capabilities(), ["net.fetch"]);
+    }
+
+    #[test]
+    fn scripted_model_that_always_wants_another_step_hits_budget_steps() {
+        // The §1.3 proof-of-life: a run loop bounded by Meter, not by trust.
+        let mut meter = Meter::new(
+            MeterLimits {
+                steps: 5,
+                tokens: u64::MAX,
+                wall: Duration::MAX,
+                cost_micros: u64::MAX,
+                format_errors: 3,
+                repair_rounds: 1,
+            },
+            None,
+        );
+        let mut detector = LoopDetector::new();
+        let mut stops: Vec<StopCause> = Vec::new();
+        loop {
+            match meter.charge_step() {
+                Ok(()) => {}
+                Err(cause) => {
+                    // INV-14: the loop ends on the meter's typed cause.
+                    stops.push(cause);
+                    break;
+                }
+            }
+            let step = u8::try_from(meter.steps_spent()).unwrap_or(255);
+            // Distinct digests each step keep the loop detectors quiet:
+            // only the budget can stop this run.
+            detector.observe(LoopEvent::Action {
+                tool: "model.turn".to_string(),
+                args_digest: Digest::from_bytes([step; 32]),
+            });
+            detector.observe(LoopEvent::Observation {
+                digest: Digest::from_bytes([step.wrapping_add(100); 32]),
+            });
+        }
+        assert_eq!(stops, vec![StopCause::Budget(BudgetDim::Steps)]);
+        assert_eq!(meter.steps_spent(), 5);
     }
 }

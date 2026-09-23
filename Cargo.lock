@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "gate-outcome"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "harness-cli"
 version = "0.0.1"
 dependencies = [
@@ -15,7 +23,7 @@ dependencies = [
 name = "harness-core"
 version = "0.0.1"
 dependencies = [
- "thiserror",
+ "gate-outcome",
 ]
 
 [[package]]

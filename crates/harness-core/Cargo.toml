@@ -1,6 +1,6 @@
 [package]
 name = "harness-core"
-description = "rustyharness core types: untrusted data, budgets. Pure, no I/O."
+description = "rustyharness core types: untrusted data, run budgets, loop detection. Pure, no I/O."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,4 +11,5 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-thiserror.workspace = true
+# The ONE outcome type (design §1.2: harness-core depends only on gate-outcome).
+gate-outcome = { path = "../gate-outcome" }

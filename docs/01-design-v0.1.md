@@ -892,6 +892,13 @@ The **verification plan** (task spec, trust base) is a list of checks. Each chec
 | any other exit, signal, timeout, missing program | `Indeterminate { CouldNotRun }` |
 | no conformed sandbox for the check | `Indeterminate { UnsupportedOs }` or `{ CouldNotRun }` (§6.1) |
 
+Clarifications of this table (recorded during H1; `gate-outcome` implements them):
+- **Run-level facts first.** A timeout or a signal is `CouldNotRun` even when the last line is a well-formed passing report.
+- **Gate id.** A report whose `gate` differs from the check the harness launched is `Indeterminate { UnreadableEvidence }`: contradictory evidence, never re-attributed.
+- **Wire form.** The report line is exactly the JSON that `GateReport`'s `Serialize` writes. Unknown fields at any level are refused (`UnreadableEvidence`). The parent re-checks the report laws and INV-18 (`checked: 0` gives `NothingChecked`) and never upgrades a declared non-pass.
+- **Exit agreement.** A declared `Passed` needs exit 0 and a declared `Failed` needs exit 1. A declared `Indeterminate` needs any other code. Disagreement is `UnreadableEvidence`.
+- **Marker content.** The marker counts only when the file reads exactly `ok <gate-id>` for this check (one trailing newline allowed). Any other content is `UnreadableEvidence`.
+
 **Built-in check adapters** cover common tools that do not speak the protocol, such as `cargo test` and `pytest`. Each implements `gate_outcome::Check` over captured output. For example, `cargo test` passes with `N` > 0 tests executed and 0 failed, and `N = 0` gives `NothingChecked`. The adapters are part of the trust base, reviewed like gates, and each carries a **refusal witness** test: a fixture where it must refuse (R3 H-04).
 
 **Artifact checks** are always run:
