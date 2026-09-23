@@ -1,6 +1,6 @@
 # 01 — rustyharness design v0.1
 
-**Status:** DRAFT v0.2, 2026-09-23 — reworked after first review (REVIEW-rustyharness-design-v01, NEEDS-FIXES); confirming review pending.
+**Status:** v0.2, 2026-09-23 — reviewed **SOUND** (first review NEEDS-FIXES; rework; confirming review SOUND with two LOW clarifications, applied). Not yet built; next: H1 read-only agent.
 
 Supersedes nothing yet. It answers the questions the overview framed
 ([00-overview.md](00-overview.md)) and most of [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md). Where a
@@ -340,7 +340,7 @@ workspace is restored from that step's snapshot, and a trailing intent with no r
 re-decided, not re-executed blindly (policy re-runs; approval is re-asked where required).
 
 Two further rules:
-- **Verification is all-or-nothing across a resume.** Suppose the old attempt's journal holds a `VerificationStarted` with no matching `VerificationFinished` (a crash or kill mid-verification). Its check reports are never reused. The new attempt rebuilds the grading worktree and re-runs the **full** plan (§7.3).
+- **Verification is all-or-nothing across a resume.** Suppose the old attempt's journal holds a `VerificationStarted` with no matching `VerificationFinished` (a crash or kill mid-verification). Its check reports are never reused. The new attempt rebuilds the grading worktree and re-runs the **full** plan (§7.3). The adjacent window (`VerificationFinished` durable but `RunStopped` absent) is handled the same way: the new attempt re-runs the full plan, and reports are never reused across attempts, whatever state the old journal is in (review r65 L-02).
 - **Resume after a journal failure** opens a new journal file for the new attempt; it never appends to the poisoned one. If the new journal's header cannot be written either, the resume refuses (`Indeterminate { CouldNotRun }`).
 
 ## 3. Model layer
@@ -836,7 +836,7 @@ from the last good line (§2.10). The writer fsyncs after every intent event (be
 - **No execution.** A poisoned writer mints no `Journaled` value, so no provider can be invoked (§2.2 step 7, §4.5).
 - **No egress.** The egress proxy appends its per-request `Egress` event **before** forwarding. If that append fails, the request is refused.
 - **The run stops.** `harness-run` checks the poison flag before every step and before every check. It stops with `StopCause::JournalUnavailable`, and the outcome is `Indeterminate { UnreadableEvidence }` (§2.5). Verification does not start, or stops where it is.
-- **Commit point.** The run's outcome is released only after `RunStopped` (carrying that outcome) is appended and fsynced. The order is: `RunStopped` durable, then the last stdout line (the `GateReport`), then the `GATE_OK_FILE` marker (only for `Passed`), then exit. If the `RunStopped` append fails, `harness-run` replaces whatever `verdict()` returned with `Indeterminate { UnreadableEvidence }`. Downgrading needs no witness; only `Passed` does. It writes no marker and exits 5. A `Passed` outcome therefore exists only for a run whose whole record is durable.
+- **Commit point.** The run's outcome is released only after `RunStopped` (carrying that outcome) is appended and fsynced. The order is: `RunStopped` durable, then the last stdout line (the `GateReport`), then the `GATE_OK_FILE` marker (only for `Passed`), then exit. If the `RunStopped` append fails, `harness-run` replaces whatever `verdict()` returned with `Indeterminate { UnreadableEvidence }`. Downgrading needs no witness; only `Passed` does. It writes no marker and exits 5. A `Passed` outcome therefore exists only for a run whose whole record is durable. If the stdout write or the marker write fails after a durable `Passed` `RunStopped`, the process exits 5, never 0: the CLI never gives a green exit without the marker it promised (review r65 L-01).
 - **Where the failure is reported.** It goes to stderr and to the run report. It cannot go to the broken journal.
 - **Testing.** `JournalWriter` is generic over a small `JournalFile` seam (`write_all`, `sync_data`). The real implementation wraps `std::fs::File`, and the fault-injecting implementation used by INV-33 fails the Nth write or fsync.
 
