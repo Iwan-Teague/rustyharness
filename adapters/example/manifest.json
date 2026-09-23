@@ -1,0 +1,9 @@
+{
+  "schema_version": 0,
+  "app": "example",
+  "app_version": "0.0.1",
+  "capabilities": [
+    { "id": "example.status.read", "summary": "Report the app's health", "effect": "read" },
+    { "id": "example.config.set", "summary": "Change one config value", "effect": "write" }
+  ]
+}

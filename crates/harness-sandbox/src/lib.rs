@@ -1,0 +1,66 @@
+//! rustyharness execution confinement.
+//!
+//! SCAFFOLD (2026-09-23). The one rule settled before any backend exists:
+//! **no containment, no execution.** When this platform cannot establish the
+//! full confinement a policy asks for, [`require`] refuses — there is no
+//! "run it anyway and record that it was unsandboxed" path. rustybenchmark
+//! has exactly that fail-open path today (suite AQ-194); this crate must not
+//! repeat it.
+//!
+//! Backends (macOS seatbelt, Linux landlock + seccomp + namespaces, Windows
+//! Job Objects + AppContainer) are designed in the suite's cross-platform
+//! sandbox work (lane d27) and the rustyharness design; none is built yet, so
+//! [`available`] reports `Unavailable` on every platform and [`require`]
+//! refuses everywhere. That is the correct scaffold behaviour.
+
+#![forbid(unsafe_code)]
+
+/// What confinement this platform can establish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Containment {
+    /// A backend that has passed the shared hostile-task conformance suite.
+    Available(Backend),
+    /// No conforming backend; the reason is recorded, never ignored.
+    Unavailable(&'static str),
+}
+
+/// A confinement backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// macOS seatbelt profile.
+    Seatbelt,
+    /// Linux landlock + seccomp + namespaces.
+    Landlock,
+    /// Windows Job Objects + AppContainer.
+    AppContainer,
+}
+
+/// Returned when execution is refused because confinement is unavailable.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("refusing to execute: no confinement on this platform ({0})")]
+pub struct Refused(pub &'static str);
+
+/// The confinement this platform can establish. Pure; safe for reporting.
+pub fn available() -> Containment {
+    Containment::Unavailable("no backend has passed conformance yet (scaffold)")
+}
+
+/// Obtain a backend or refuse. Every execution path goes through here; there
+/// is no API that runs a command without a [`Backend`] in hand.
+pub fn require() -> Result<Backend, Refused> {
+    match available() {
+        Containment::Available(b) => Ok(b),
+        Containment::Unavailable(why) => Err(Refused(why)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scaffold_refuses_everywhere() {
+        assert!(matches!(available(), Containment::Unavailable(_)));
+        assert!(require().is_err());
+    }
+}
