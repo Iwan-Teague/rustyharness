@@ -17,9 +17,9 @@ printf '=== 2/4 cargo deny check advisories bans sources ===\n'
 cargo deny check advisories bans sources
 
 printf '=== 3/4 cargo clippy --workspace --all-targets -- -D warnings ===\n'
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --locked --workspace --all-targets -- -D warnings
 
 printf '=== 4/4 cargo test --workspace ===\n'
-cargo test --workspace
+cargo test --locked --workspace
 
 printf 'All 4 rustyharness gates passed.\n'
