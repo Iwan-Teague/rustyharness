@@ -7,8 +7,9 @@ version = "0.0.1"
 edition = "2021"
 rust-version = "1.85"
 publish = false
-# Licence deliberately unset: the suite-wide licence stance is owner decision
-# OI-05 (charter/governance/owner-inbox.md). Choosing one here would invent it.
+# Source-available, noncommercial (docs/adr/0003-licence.md): free for any
+# noncommercial use; commercial use needs a separate licence from the author.
+license = "PolyForm-Noncommercial-1.0.0"
 repository = "https://github.com/Iwan-Teague/rustyharness"
 
 [workspace.dependencies]

@@ -10,7 +10,7 @@ research pipeline and v0.1 design must answer.
 5. **Shared crates with rustybenchmark:** the sandbox and the model client exist there. Shared crate, dependency, or copy?
 6. **Hosted models (owner):** allowed at all? Opt-in per run? Never for some apps (the personal-data app)?
 7. ~~**Membership (owner)**~~ — **decided 2026-09-23:** present-non-member dev/ops tool until the design is SOUND (ADR-0002).
-8. **Licence (owner):** follows the suite ruling OI-05.
+8. ~~**Licence (owner)**~~ — **decided 2026-09-23:** PolyForm Noncommercial 1.0.0, source-available (ADR-0003).
 9. **Where the admin assistant ends:** which operations are ever automatic, and which always need a human yes?
 10. **Remote model hosts over rustynet:** a GPU box on the mesh serving the model to a laptop — in scope for v1?
 11. ~~**rustyharness vs the charter's "rustyai" (owner)**~~ — **decided 2026-09-23: separate, standalone-first** (ADR-0002). Original question: the charter already names rustyai as the confined AI over personal data (the personal-data app's router, maximal-sensitivity floor). Is rustyharness the runtime rustyai is built on, or a separate dev/ops tool that never touches personal data? The answer decides which security floor applies to which parts.

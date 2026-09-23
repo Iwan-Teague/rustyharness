@@ -1,13 +1,15 @@
 # cargo-deny configuration — rustyharness.
 # Gate: `cargo deny check advisories bans sources` (scripts/ci/gates.sh, CI).
-# `licenses` is not gated pending the suite licence ruling (OI-05).
+# `licenses` is gated too: this project's licence is decided (docs/adr/0003-licence.md).
 
 [graph]
 all-features = true
 
 [licenses]
 version = 2
-allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+# The workspace's own crates are PolyForm-Noncommercial-1.0.0 (docs/adr/0003-licence.md);
+# third-party dependencies must stay on permissive licences.
+allow = ["Apache-2.0", "MIT", "Unicode-3.0", "PolyForm-Noncommercial-1.0.0"]
 confidence-threshold = 1.0
 
 [bans]

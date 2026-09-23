@@ -45,8 +45,18 @@ cargo run -p harness-cli -- sandbox
 ## Read order
 
 1. [docs/00-overview.md](docs/00-overview.md) — what it is, where it is used, what it must do, how apps slot in
-2. [docs/adr/0001-name-and-placement.md](docs/adr/0001-name-and-placement.md), [docs/adr/0002-standalone-first.md](docs/adr/0002-standalone-first.md)
+2. [ADR-0001 name and placement](docs/adr/0001-name-and-placement.md), [ADR-0002 standalone first](docs/adr/0002-standalone-first.md), [ADR-0003 licence](docs/adr/0003-licence.md)
 3. [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md)
 4. [docs/research/README.md](docs/research/README.md) — the research pipeline feeding the v0.1 design
 
 Portable by design: CI runs every gate on macOS, Linux and Windows.
+
+## Licence
+
+**Source-available, noncommercial.** rustyharness is licensed under the
+[PolyForm Noncommercial License 1.0.0](LICENSE.md): free to use, modify and share for
+any noncommercial purpose — personal, hobby, research, education, charities, public
+bodies. **Commercial use requires a separate licence from the author**; ask through
+the GitHub profile that owns this repository. See
+[ADR-0003](docs/adr/0003-licence.md) for why this is not an OSI open-source licence.
+
