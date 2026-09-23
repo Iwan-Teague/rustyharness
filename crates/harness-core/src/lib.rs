@@ -9,7 +9,9 @@
 //! `GateOutcome { Passed(Witness), Failed, Indeterminate { why } }`), to be built
 //! as the shared `gate-outcome` crate. Defining a private one here would repeat
 //! the supersession-drift defect the suite has already fixed twice (AQ-151,
-//! AQ-189). The harness will depend on that crate once it exists.
+//! AQ-189). rustyharness is standalone-first (docs/adr/0002-standalone-first.md),
+//! so it must not depend on the suite: that type has to live in a small
+//! standalone crate both can depend on. The v0.1 design settles how.
 
 #![forbid(unsafe_code)]
 

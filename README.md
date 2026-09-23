@@ -1,9 +1,13 @@
 # rustyharness
 
-The rustysuite **agent harness**: the runtime that drives a language model through
-tools to do real work — developing the suite, reviewing designs, operating suite
-apps, and powering assistants inside them — with confinement that fails closed and
-results decided by evidence, never by the agent's own say-so.
+A standalone **agent harness**: the runtime that drives a language model through
+tools to do real work, with confinement that fails closed and results decided by
+evidence, never by the agent's own say-so. Bring your own agent and model; nothing
+else is required.
+
+Built alongside [rustysuite](https://github.com/Iwan-Teague), whose capabilities —
+developing and reviewing its code, operating its apps, assistants inside them —
+ship as optional add-ons, off unless enabled ([ADR-0002](docs/adr/0002-standalone-first.md)).
 
 The model is a swappable part. The harness is what makes an agent reliable.
 
@@ -41,7 +45,7 @@ cargo run -p harness-cli -- sandbox
 ## Read order
 
 1. [docs/00-overview.md](docs/00-overview.md) — what it is, where it is used, what it must do, how apps slot in
-2. [docs/adr/0001-name-and-placement.md](docs/adr/0001-name-and-placement.md)
+2. [docs/adr/0001-name-and-placement.md](docs/adr/0001-name-and-placement.md), [docs/adr/0002-standalone-first.md](docs/adr/0002-standalone-first.md)
 3. [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md)
 4. [docs/research/README.md](docs/research/README.md) — the research pipeline feeding the v0.1 design
 

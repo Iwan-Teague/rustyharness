@@ -8,8 +8,8 @@ rework → confirming review → SOUND).
 
 ## 1. What it is
 
-rustyharness is the suite's **agent harness**: the runtime that drives a language
-model through a loop of reasoning and tool calls to do real work, inside
+rustyharness is a standalone **agent harness**, built alongside rustysuite: the
+runtime that drives a language model through a loop of reasoning and tool calls to do real work, inside
 confinement, with every result backed by evidence.
 
 The model is a swappable part. The harness owns everything around it — the
@@ -21,7 +21,11 @@ harness effects are the same order of size as model effects:
 
 Name and placement: [ADR-0001](adr/0001-name-and-placement.md).
 
+**Standalone first** ([ADR-0002](adr/0002-standalone-first.md), owner-decided): anyone can use rustyharness with their own agent and model and nothing else from rustysuite. Everything rustysuite-specific in this document (§2's suite uses, suite app adapters, suitectl, gates, the mesh) is an optional add-on, off unless enabled. The security defaults in §3 apply to every user.
+
 ## 2. Where it is used in the suite (candidates — to be confirmed by research)
+
+These are the suite's uses. The first user is anyone with an agent and a model, using none of them.
 
 | # | Use | What the agent does | Seed material |
 |---|---|---|---|
@@ -42,17 +46,17 @@ Constraint on U5: the personal-data app currently makes ask-model un-grantable b
 4. **Policy and approval.** Reads can be automatic; writes are scoped; execution is confined; anything irreversible (delete, push, publish, send) needs a human yes, every time.
 5. **Confinement that fails closed.** No sandbox, no execution (`crates/harness-sandbox`). Must work on macOS, Linux and Windows.
 6. **Tool output is data.** File contents, test logs, web pages and model output are `Untrusted` (`crates/harness-core`); instructions found in them are never followed.
-7. **Evidence, not claims.** "Done" is decided by checks the harness runs (member gates, tests, the suite's single gate-outcome type), recorded in an append-only journal — never by the agent saying so.
+7. **Evidence, not claims.** "Done" is decided by checks the harness runs (tests, and in the suite the members' gates), expressed in one outcome type shared with rustysuite (ADR-0002: a standalone crate, not a suite dependency) and recorded in an append-only journal — never by the agent saying so.
 8. **Two pairs of eyes built in.** A reviewer agent that did not author the work, with its own context, whose verdict is extracted from its artifact.
 9. **Isolation per run.** Separate state, worktree and scratch space per run, so concurrent runs cannot corrupt each other.
-10. **Secrets stay out of the model's context.** Key material reaches tools through the vault consumer seam, never the prompt (`charter/design/vault-consumer-seam-rust-v0.1.md`).
+10. **Secrets stay out of the model's context.** Key material reaches tools, never the prompt. Standalone, through the harness's own secret handling; with the suite add-on, through rustyvault's consumer seam (`charter/design/vault-consumer-seam-rust-v0.1.md`).
 11. **Resumable and replayable** from the journal.
 
 ## 4. Modularity: how future apps slot in without a redesign
 
 The working idea (implemented only as a schema in `crates/harness-tools`):
 
-- **Each app ships a versioned capability manifest** (`adapters/<app>/manifest.json`): capability ids namespaced under the app (`rustydns.zone.read`), a human summary, and an **effect class** (`read`, `write`, `execute`, `irreversible`).
+- **Each tool provider ships a versioned capability manifest** — rustysuite apps are the first providers, not the only ones (`adapters/<app>/manifest.json`): capability ids namespaced under the app (`rustydns.zone.read`), a human summary, and an **effect class** (`read`, `write`, `execute`, `irreversible`).
 - **The core knows effect classes, never apps.** Policy, approval and confinement are written against effect classes, so adding an app adds a manifest and an adapter — no core change.
 - **Unknown means refused.** Unknown fields, future schema versions, foreign namespaces and empty manifests are rejected, not skipped.
 - **Versioned schema** with explicit negotiation, so old apps keep working when the schema grows.
