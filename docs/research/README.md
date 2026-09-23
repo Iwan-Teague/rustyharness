@@ -12,4 +12,4 @@ design is reviewed independently before it is called SOUND.
 | R5 integration map | Per app: what an agent would do with it, effect classes, the capabilities it would declare | **done** — rustysuite-specific, so it lives in the (private) suite repo, not here |
 | R6 threat model | The harness's own threat model — standalone and in-suite deployments | **done** — kept in the suite repo for now; its generic parts move into the v0.1 design |
 
-Then: v0.1 design → adversarial review → rework → confirming review → SOUND.
+Then: v0.1 design ([01-design-v0.1.md](../01-design-v0.1.md), 2026-09-23) → adversarial review → rework → confirming review → SOUND.

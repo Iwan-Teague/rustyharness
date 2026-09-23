@@ -45,9 +45,10 @@ cargo run -p harness-cli -- sandbox
 ## Read order
 
 1. [docs/00-overview.md](docs/00-overview.md) — what it is, where it is used, what it must do, how apps slot in
-2. [ADR-0001 name and placement](docs/adr/0001-name-and-placement.md), [ADR-0002 standalone first](docs/adr/0002-standalone-first.md), [ADR-0003 licence](docs/adr/0003-licence.md)
-3. [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md)
-4. [docs/research/README.md](docs/research/README.md) — the research pipeline feeding the v0.1 design
+2. [docs/01-design-v0.1.md](docs/01-design-v0.1.md) — the v0.1 design (draft, under review)
+3. [ADR-0001 name and placement](docs/adr/0001-name-and-placement.md), [ADR-0002 standalone first](docs/adr/0002-standalone-first.md), [ADR-0003 licence](docs/adr/0003-licence.md)
+4. [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md)
+5. [docs/research/README.md](docs/research/README.md) — the research pipeline feeding the v0.1 design
 
 Portable by design: CI runs every gate on macOS, Linux and Windows.
 
