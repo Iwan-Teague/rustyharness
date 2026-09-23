@@ -28,7 +28,7 @@ data (the personal-data app's typed-function router), on the suite's maximal-sen
 rustyAI would have either pulled that floor onto a dev tool or blurred two trust
 domains. rustyharness keeps them distinct; how the two relate (is rustyharness the
 runtime under rustyai, or separate?) is an open question, not assumed.
-(docs/research/R2-suite-inventory-2026-09-23.md, section (d).)
+(From the rustysuite inventory, which is kept in the rustysuite repository.)
 
 ## Consequences
 
