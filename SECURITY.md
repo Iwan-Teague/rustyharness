@@ -9,5 +9,6 @@ these is a security bug.
 
 **Reporting:** do not open a public issue. Contact the maintainer privately
 (Iwan Teague, via the GitHub profile that owns this repository) with a description
-and, if possible, a reproduction. You will get an acknowledgement; fixes land with
-a regression test.
+and, if possible, a reproduction. **Service levels (T2-A8):** acknowledgement
+within 72 hours of a report; fixes targeted within 48 hours for critical,
+7 days for high, 30 days for medium/low. Fixes land with a regression test.

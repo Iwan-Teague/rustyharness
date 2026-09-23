@@ -22,4 +22,9 @@ unsafe_code = "forbid"
 missing_docs = "warn"
 
 [workspace.lints.clippy]
+# T2-A4 panic set, ratchet posture: warn + `-D warnings` in gates = denied
+# outside test code; crate roots cfg_attr(test)-allow loose asserts in tests.
 unwrap_used = "warn"
+expect_used = "warn"
+indexing_slicing = "warn"
+panic = "warn"

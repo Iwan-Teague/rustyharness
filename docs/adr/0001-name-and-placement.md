@@ -34,4 +34,4 @@ runtime under rustyai, or separate?) is an open question, not assumed.
 
 - Publishing the repo (creating the GitHub remote and pushing) is the owner's action; until then the submodule URL names the intended remote and fresh clones cannot fetch it.
 - The suite's member lists and membership gates must learn about the new project (tracked in the suite action queue).
-- The suite's readiness bar (owner decision OI-29) blocks product code before designs meet the bar. This scaffold contains no behaviour — only the settled invariants, as types and refusals — and was started on the owner's explicit instruction; harness behaviour waits for the reviewed design.
+- The suite's readiness bar (owner decision OI-29) blocks product code before designs meet the bar. This scaffold contains no product behaviour — only the settled invariants, as types and refusals — and was started on the owner's explicit instruction; harness behaviour waits for the reviewed design.

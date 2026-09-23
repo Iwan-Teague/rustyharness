@@ -1,5 +1,5 @@
 # cargo-deny configuration — rustyharness.
-# Gate: `cargo deny check advisories bans sources` (scripts/ci/gates.sh, CI).
+# Gate: `cargo deny check advisories bans licenses sources` (scripts/ci/gates.sh, CI).
 # `licenses` is gated too: this project's licence is decided (docs/adr/0003-licence.md).
 
 [graph]

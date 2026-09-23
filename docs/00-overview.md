@@ -29,7 +29,7 @@ These are the suite's uses. The first user is anyone with an agent and a model, 
 
 | # | Use | What the agent does | Seed material |
 |---|---|---|---|
-| U1 | **Suite development** | Takes a task (an action-queue row, a review finding), works in an isolated worktree, runs the member's gates through `suitectl`, delivers a patch with evidence | `charter/design/component-d-agent-harness-DRAFT.md`, `suite-dev-engine-plan-v1.md` §D, `suite-engine-v2-rust.md` |
+| U1 | **Suite development** | Takes a task (an action-queue row, a review finding), works in an isolated worktree, runs the member's gates through `suitectl`, delivers a patch with evidence | `charter/design/component-d-agent-harness-DRAFT.md`, `suite-dev-engine-plan-v1.md` §6 (component D), `suite-engine-v2-rust.md` |
 | U2 | **Design and review fleet** | Authors designs and — as a *separate, independent* agent — reviews them. Replaces today's opencode + bash supervisor fleet | the fleet's own failure history (docs/research, lane ah02) |
 | U3 | **rustybenchmark Agentic board** | Enters as one pinned, versioned harness so the benchmark measures which model works best in the suite's own harness on each machine | `projects/rustybenchmark/docs/15-profiles-and-divisions.md` §3.4 |
 | U4 | **Operating the suite** | A local admin assistant: check a rustynet node, read a rustydns zone, verify backups — through each app's declared capabilities | owner direction (local admin-assistant model) |

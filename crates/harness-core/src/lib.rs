@@ -14,6 +14,11 @@
 //! standalone crate both can depend on. The v0.1 design settles how.
 
 #![forbid(unsafe_code)]
+// The panic-set lints ratchet production code; unit tests may assert loosely.
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
+)]
 
 use std::fmt;
 
@@ -74,6 +79,7 @@ impl<T> fmt::Debug for Untrusted<T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Budget {
     remaining_steps: u32,
+    spent_steps: u32,
 }
 
 /// Returned when a budget is exhausted.
@@ -89,17 +95,27 @@ impl Budget {
     pub fn steps(steps: u32) -> Self {
         Self {
             remaining_steps: steps,
+            spent_steps: 0,
         }
     }
 
+    /// Steps spent so far, as measured by the budget itself.
+    pub fn spent(&self) -> u32 {
+        self.spent_steps
+    }
+
     /// Spend one step, or refuse if none remain.
-    pub fn charge(&mut self, spent_so_far: u32) -> Result<(), BudgetExhausted> {
+    ///
+    /// The budget measures its own spend: the reported number in
+    /// [`BudgetExhausted`] can never be asserted by a caller.
+    pub fn charge(&mut self) -> Result<(), BudgetExhausted> {
         if self.remaining_steps == 0 {
             return Err(BudgetExhausted {
-                spent: spent_so_far,
+                spent: self.spent_steps,
             });
         }
         self.remaining_steps -= 1;
+        self.spent_steps += 1;
         Ok(())
     }
 }
@@ -122,8 +138,23 @@ mod tests {
     #[test]
     fn budget_refuses_when_exhausted() {
         let mut b = Budget::steps(2);
-        assert!(b.charge(0).is_ok());
-        assert!(b.charge(1).is_ok());
-        assert_eq!(b.charge(2), Err(BudgetExhausted { spent: 2 }));
+        assert!(b.charge().is_ok());
+        assert!(b.charge().is_ok());
+        assert_eq!(b.charge(), Err(BudgetExhausted { spent: 2 }));
+    }
+
+    #[test]
+    fn budget_reports_measured_spent() {
+        // Review fix (2026-09-23): `spent` is measured by the budget, never
+        // caller-asserted — a run that was refused reports what actually ran.
+        let mut b = Budget::steps(0);
+        assert_eq!(b.charge(), Err(BudgetExhausted { spent: 0 }));
+        assert_eq!(b.spent(), 0);
+
+        let mut b = Budget::steps(2);
+        assert!(b.charge().is_ok());
+        assert!(b.charge().is_ok());
+        assert_eq!(b.charge(), Err(BudgetExhausted { spent: 2 }));
+        assert_eq!(b.spent(), 2);
     }
 }
