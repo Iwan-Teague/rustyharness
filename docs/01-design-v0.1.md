@@ -1,6 +1,6 @@
 # 01 — rustyharness design v0.1
 
-**Status:** DRAFT v0.1, 2026-09-23 — unreviewed; next: independent adversarial review.
+**Status:** DRAFT v0.2, 2026-09-23 — reworked after first review (REVIEW-rustyharness-design-v01, NEEDS-FIXES); confirming review pending.
 
 Supersedes nothing yet. It answers the questions the overview framed
 ([00-overview.md](00-overview.md)) and most of [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md). Where a
@@ -16,16 +16,37 @@ scaffold review's design notes F4, F5, F10, F11 and F13 are carried forward as r
 
 **Conventions.**
 - Research is cited by document and section: "R1 §2", "R3 H-07", "R6 TH-7".
-- Code is cited as `file:line` in this repository, at commit `54530c6`.
+- Code is cited as `file:line` in this repository, at commit `3891636` on `main`: the last commit that touched `crates/` or `Cargo.toml`. Every later commit on `main` up to this revision changed documentation only, so the citations read the same at the tip of `main`.
 - "UNVERIFIED" marks a claim this document has not checked against a primary source or a build.
 - Any sketch in `rust` fences is a signature-level design, not code.
-- The one outcome type is always written `GateOutcome { Passed(Witness), Failed, Indeterminate { why } }`. That is the suite's UNIFIED gate-outcome design, whose v0.3 content passed its confirming review as SOUND (R2 §4). **This design defines no other verdict or outcome type (§1.4).**
+- The one outcome type is always written `GateOutcome { Passed(Witness), Failed, Indeterminate { why } }`. That is the suite's UNIFIED gate-outcome design (v0.3 content). Its SOUND verdict is recorded by its own confirming review, named in the UNIFIED document's status header; R2 §4 only summarises the type and is not the source of that verdict. **This design defines no other verdict or outcome type (§1.4).**
 
 **Hard constraints (owner decisions, not reopened):** standalone first (ADR-0002); public,
 source-available (ADR-0003); fail-closed (no sandbox, no execution); tool and model output is
 untrusted; irreversible effects need a human yes every time; "done" comes from evidence; the agent
 never modifies its own trust base; no lethal trifecta; one outcome type; Rust only, no new C;
 portable to macOS, Linux and Windows; local models first.
+
+## Changes since v0.1
+
+v0.2 answers the first independent review (REVIEW-rustyharness-design-v01, verdict NEEDS-FIXES). No architecture changed. Every fix is a mechanism with a stated failure path, and every failure path ends in a refusal or `Indeterminate`.
+
+| Finding | Severity | What changed | Where |
+|---|---|---|---|
+| F-01 | HIGH | Write-ahead enforced by type (`Journaled<Authorized<Call>>`, minted only after a durable intent append). Any append or fsync failure poisons the writer, stops the run with `JournalUnavailable` and gives `Indeterminate { UnreadableEvidence }`. The outcome is released only after `RunStopped` is durable. Falsifying test INV-33. | §2.2 steps 7-10, §2.5, §4.5, §7.1 "Write failure", §7.7, INV-33 |
+| F-02 | HIGH | `verdict()` runs only over a complete, pre-fixed check plan (`finalize`). A missing report gives `Indeterminate { CouldNotRun }`, never a verdict over the subset. A separate verification budget. Resume re-runs the whole plan. Falsifying test INV-34. | §2.4, §2.5, §2.10, §7.2, §7.3 "Completeness", INV-34 |
+| F-03 | LOW | `Digest` is opaque caller-supplied bytes; `gate-outcome` stays zero-dependency. The crates that compute digests are named, and the trust assumption is stated. | §1.2 purity allowlist, §1.4 "Where digests come from" |
+| F-04 | LOW | `RESERVED_NAMESPACES = ["harness", "rustyvault"]` is a core constant. Config may only add names. | §4.1, §4.3 "Reserved namespaces", INV-1 |
+| F-05 | LOW | Filesystem-locality check as an allowlist, with a mechanism per OS, spike S-F1 and refusal as the default; the residual is named. | §2.8, §11 residuals, INV-35 |
+| F-06 | LOW | Reviewer identity is re-checked before every attempt, fallbacks included. A valid `Failed` review is final. | §7.5, INV-19 |
+| F-07 | LOW | No `Conformed` ⇒ no mcp-stdio process, and no in-process adapter with an execute-class capability. The session is refused, with no unconfined fallback. | §4.1, §4.5, §5.2, §7.7, INV-6 |
+| F-08 | LOW | The loopback model server is named as an egress residual outside the trifecta computation. | §5.4, §11 residuals |
+| F-09 | INFO | Code is cited at `3891636` on `main`. The SOUND claim now points at UNIFIED's own confirming review, not R2 §4. | Conventions |
+| F-10 | INFO | OQ1 is restated as an owner question, with the tension against ADR-0003 explained. The default is unchanged. | §11 OQ1 |
+| R3 H-14 (Partial) | coverage | Standing conditions are journaled once per state change; alerting is declared out of scope. | §2.6, §11, Appendix A |
+| R3 H-17 (Partial) | coverage | An environment sample (load, memory, disk, each with its method) in the header, at verification start and on every timeout, crash or `CouldNotRun`. | §7.1, Appendix A |
+| Review Q7 note | coverage | A read-only Windows session with a verification plan is never `Passed`; this is stated to users. | §11 OQ4 |
+| (editorial) | — | Crate-map cycle removed: `harness-sandbox-windows` now holds Win32 primitives only and depends on `harness-core`, not `harness-sandbox`. The dependency list is redrawn as explicit edges. | §1.2 |
 
 ---
 
@@ -37,7 +58,7 @@ portable to macOS, Linux and Windows; local models first.
 | D2 | Crate map | 13 crates (§1.2). Two scaffold crates are split (tools becomes manifest + tools; sandbox gains a Windows unsafe-isolation crate). New: `gate-outcome` (standalone), `harness-policy`, `harness-mcp`, `harness-run`, `harness-conformance`. | §1.2 |
 | D3 | Outcome type | A standalone, std-only `gate-outcome` crate carries UNIFIED verbatim. The harness and the suite both depend on it; neither defines another. | §1.4 |
 | D4 | Context | Rebuilt every turn from run state, with a stable prefix. Older observations collapse to pointers (path, digest, size), never to model-written summaries. | §2.3 |
-| D5 | "Done" | The agent's `task.submit` is a request for verification. The run's result is `verdict()` over harness-run check reports plus the reviewer report. A task with no checks can never be `Passed`. | §2.5, §7.3 |
+| D5 | "Done" | The agent's `task.submit` is a request for verification. The run's result is `verdict()` over harness-run check reports plus the reviewer report, and only over a **complete** plan: verification that does not finish every planned check is `Indeterminate`. A task with no checks can never be `Passed`. | §2.5, §7.3 |
 | D6 | Model layer | One async `ModelBackend` trait. Our own thin OpenAI-compatible client: plain HTTP to loopback by default, TLS only behind cargo feature `hosted`. Native tool calls **and** a text protocol with a grammar-constrained action block, chosen per model profile. | §3 |
 | D7 | Wire protocol | MCP on the wire (rmcp, stdio child process). A **capability manifest v1** is the trust root: effect plus five closed-set dimensions, pinned description and schema hashes, optional ed25519 signature. Server self-description is ignored for policy. | §4 |
 | D8 | Modularity | A new provider ships a manifest plus an MCP server (or an in-process adapter crate) and is admitted by the user. The core learns nothing app-specific. This is proven by a fixture-provider test with zero core diff. | §4.10 |
@@ -46,7 +67,7 @@ portable to macOS, Linux and Windows; local models first.
 | D11 | Trifecta | Computed at session start from capability labels. Private + untrusted + egress is refused, and v0.1 has no override. | §5.4 |
 | D12 | Confinement | `Available` requires a `Conformed` evidence token. It is minted only by a backend that passed the hostile-task suite in CI **and** a live self-probe on this host. Linux: a self-re-exec helper using namespaces + Landlock + seccomp. macOS: deny-default Seatbelt. Windows: AppContainer + Job Object. Named spikes cover the rest. | §6 |
 | D13 | Network | None by default. When granted, egress goes through an allowlist proxy **outside** the sandbox. | §6.5 |
-| D14 | Journal | Per-attempt, hash-chained JSONL, append-only at the type level, with untrusted payloads in a typed home. Replay re-feeds recorded model outputs. | §7.1, §2.9 |
+| D14 | Journal | Per-attempt, hash-chained JSONL, append-only at the type level, with untrusted payloads in a typed home. Write-ahead is enforced by type: a provider accepts only a `Journaled` call, minted after the intent is durable. Any append or fsync failure stops the run `Indeterminate`. Replay re-feeds recorded model outputs. | §7.1, §2.2, §2.9 |
 | D15 | Two pairs of eyes | A built-in reviewer run: fresh context, read-only tools, distinct identity. Its verdict is extracted from a schema-checked artifact, and it can only add blocking findings. | §7.5 |
 | D16 | Suite integration | Add-ons are providers (runtime-loaded manifests plus MCP servers) and a few cargo features (`addon-*`), all off by default. A standalone build has zero suite dependencies. | §8 |
 
@@ -71,10 +92,10 @@ The only channel from reasoning to action is the parsed action of the **model's 
 | `harness-manifest` | **split** from `harness-tools` (schema half) | yes | `harness-core` | Manifest v1 types, a duplicate-key-refusing parser, validation, hash pinning, signature verification (keys passed in) |
 | `harness-policy` | **new** | yes | `harness-core`, `harness-manifest` | Effective-class computation (max-rule), the decision function, trifecta computation, approval-token verification, the `Authorized<Call>` minting point |
 | `harness-model` | keep, change `Message` (F4) | no | `harness-core` | `ModelBackend`, message types, profiles, text-protocol parser, OpenAI-compatible client (feature `hosted` adds TLS), replay backend |
-| `harness-tools` | **split** (provider half) | no | `harness-core`, `harness-manifest`, `harness-policy`, `harness-sandbox` | `ToolProvider` trait, built-in tools (§4.8), edit engine (§4.9) |
+| `harness-tools` | **split** (provider half) | no | `harness-core`, `harness-manifest`, `harness-policy`, `harness-sandbox`, `harness-journal` | `ToolProvider` trait (accepts only `Journaled<Authorized<Call>>`, §2.2), built-in tools (§4.8), edit engine (§4.9) |
 | `harness-mcp` | **new** | no | `harness-tools`, `rmcp` | MCP stdio client adapter, connect-time manifest comparator, quarantine state |
-| `harness-sandbox` | keep, change `Containment` (F5) | no | `harness-core` | `Backend` trait, `Conformed` token, `ConfinedSpec`, Linux and macOS backends, egress proxy, confined file-op helper |
-| `harness-sandbox-windows` | **new** | no | `harness-sandbox`, `windows` | AppContainer + Job Object backend. The **only** crate allowed `unsafe` (§6.7). |
+| `harness-sandbox` | keep, change `Containment` (F5) | no | `harness-core`, `harness-sandbox-windows` (Windows targets only) | `Backend` trait, `Conformed` token, `ConfinedSpec`, Linux and macOS backends, egress proxy, confined file-op helper, filesystem-locality check (§2.8) |
+| `harness-sandbox-windows` | **new** | no | `harness-core`, `windows` | Win32 primitives only: AppContainer profile, Job Object, restricted spawn, volume-type query. `harness-sandbox` wraps them into the Windows `Backend`, so `Conformed` is still minted only in `harness-sandbox`. The **only** crate allowed `unsafe` (§6.7). |
 | `harness-conformance` | **new** (test crate, `publish = false`) | n/a | `harness-sandbox` | Hostile-task corpus (§6.6) as data plus a runner, and the committed per-OS pass matrix |
 | `harness-journal` | keep, replace `Sink` (F11) | no | `harness-core`, `gate-outcome` | Hash-chained append-only writer, verifying reader, blob store, replay source |
 | `harness-run` | **new** | no | all of the above | The driver: session planning, workspace materialisation, loop, verification, reviewer, run report. The embedding API for apps. |
@@ -82,25 +103,24 @@ The only channel from reasoning to action is the parsed action of the **model's 
 
 **Dependency direction.** Edges only point downward, and there are no cycles:
 
+An arrow `A --> B` means "A depends on B".
+
 ```
-gate-outcome
-    ^
-harness-core  <-- harness-model
-    ^
-harness-manifest
-    ^
-harness-policy                       harness-sandbox <-- harness-sandbox-windows
-    ^                                     ^
-harness-tools ----------------------------+
-    ^
-harness-mcp       harness-journal
-    ^                  ^
-    +---- harness-run -+----> (model, sandbox, conformance[dev])
-                ^
-           harness-cli
+harness-cli --> harness-run
+harness-run --> harness-mcp, harness-tools, harness-model, harness-journal, harness-sandbox
+                (harness-conformance as a dev-dependency only)
+harness-mcp --> harness-tools
+harness-tools --> harness-policy, harness-sandbox, harness-journal
+harness-policy --> harness-manifest --> harness-core --> gate-outcome
+harness-model --> harness-core
+harness-journal --> harness-core, gate-outcome
+harness-sandbox --> harness-core, harness-sandbox-windows (Windows only)
+harness-sandbox-windows --> harness-core
+harness-conformance --> harness-sandbox
+gate-outcome --> (nothing)
 ```
 
-**What is pure, and how that is enforced.** `gate-outcome`, `harness-core`, `harness-manifest` and `harness-policy` do no I/O, have no async, read no clock (time is passed in as a value) and have no global state. A CI gate (H1) runs `cargo tree -e normal` on these four crates and refuses any dependency outside an allowlist (`serde`, `serde_json`, `thiserror`, a SHA-256 and an ed25519 implementation). A grep gate refuses `std::fs`, `std::net`, `std::process`, `std::env` and `SystemTime::now` in their sources. Purity is what makes policy decisions replayable: replay recomputes every decision and must get the recorded one (§2.9).
+**What is pure, and how that is enforced.** `gate-outcome`, `harness-core`, `harness-manifest` and `harness-policy` do no I/O, have no async, read no clock (time is passed in as a value) and have no global state. A CI gate (H1) runs `cargo tree -e normal` on these four crates and refuses any dependency outside an allowlist. For `gate-outcome` the allowlist is **empty** with default features (feature `json` admits only `serde` and `serde_json`). For the other three it is `serde`, `serde_json`, `thiserror`, one SHA-256 implementation and one ed25519 implementation (§1.4 says who computes digests). A grep gate refuses `std::fs`, `std::net`, `std::process`, `std::env` and `SystemTime::now` in their sources. Purity is what makes policy decisions replayable: replay recomputes every decision and must get the recorded one (§2.9).
 
 **Async.** tokio (current-thread runtime) is used only in the I/O crates, because rmcp requires it (R1 §5). The pure crates stay synchronous.
 
@@ -111,7 +131,7 @@ harness-mcp       harness-journal
 | `Message.content: String` (`crates/harness-model/src/lib.rs:28-34`) | `Message` becomes an enum: `System(HarnessText)`, `Task(TaskText)`, `Assistant(Untrusted<String>)`, `Observation { call, body: Untrusted<String> }`. `HarnessText` is constructible only from harness templates. Rendering to the wire calls `inspect("prompt-assembly")` at one choke point. | Scaffold review F4: the trust mark must survive the loop boundary |
 | `Containment::Available(Backend)` pub-constructible (`crates/harness-sandbox/src/lib.rs:20-25`) | `Available(Conformed)`. `Conformed` has private fields and is minted only inside `harness-sandbox` by a passing probe (§6.1). `require()` (`:50-55`) returns `Conformed`. Every spawn API takes `&Conformed`. | F5: a lying `Available` must be untypeable |
 | `Backend` names (`crates/harness-sandbox/src/lib.rs:29-36`) | `Seatbelt`, `LinuxNs` (namespaces + Landlock + seccomp), `WinAppContainer` | Matches §6.3 |
-| `Sink::append` doc-level promise (`crates/harness-journal/src/lib.rs:31-35`); `Event` has no untrusted home (`:11-29`) | `JournalWriter` exposes only `append`. The reader is a separate type. Events carry `UntrustedBlob` (§7.1). | F11 |
+| `Sink::append` doc-level promise (`crates/harness-journal/src/lib.rs:31-35`); `Event` has no untrusted home (`:11-29`) | `JournalWriter` exposes only appends (`append`, and `append_intent`, which mints `Journaled`, §2.2), each returning `Result`. The reader is a separate type. Events carry `UntrustedBlob` (§7.1). | F11 |
 | Manifest parsed with serde last-key-wins | Duplicate JSON keys refused by a custom map visitor (§4.3) | F13 |
 | Schema v0 `{schema_version, app, app_version, capabilities}` (`crates/harness-tools/src/lib.rs:24`, `:37-49`) | Schema v1 (§4.1). v0 is refused with a migration message; only the example fixture uses v0. | R5 §6.6: `deny_unknown_fields` plus exact versioning means extensions need a version bump |
 | CLI exit 2 for both usage and unreadable input (`crates/harness-cli/src/main.rs:33`, `:43`) | Exit codes per §7.7; the last stdout line is the JSON `GateReport` | F10; UNIFIED §6 child protocol |
@@ -127,13 +147,22 @@ The same rule has been broken three times in the suite: two layers each defined 
 pub enum GateOutcome { Passed(Witness), Failed, Indeterminate { why: IndeterminateKind } }
 pub enum IndeterminateKind { NothingChecked, UnreadableEvidence, CouldNotRun, UnsupportedOs, StaleBinary }
 pub struct Witness { /* private */ checked: usize, digest: Digest }
+pub struct Digest([u8; 32]);                              // opaque bytes; this crate never hashes anything
+impl Digest { pub fn from_bytes(b: [u8; 32]) -> Digest; pub fn as_bytes(&self) -> &[u8; 32]; }
 pub struct GateReport { /* gate id, outcome, findings: Vec<Finding>, coverage: Coverage, scope: Scope */ }
 pub fn verdict(reports: &[GateReport]) -> GateOutcome;   // total, worst-wins, verdict(&[]) = Indeterminate{NothingChecked}
 pub trait Check { type Input; fn examine(&self, input: &Self::Input) -> Examination; }
 pub fn run_checked<C: Check>(check: &C, input: &C::Input) -> GateReport; // the ONLY Witness mint
-pub mod child { pub struct ChildRun { /* exit kind, last stdout line, marker seen, timed out */ }
+pub mod child { pub struct ChildRun { /* exit kind, last stdout line, marker seen, timed out, capture: Digest */ }
                 pub fn interpret(run: &ChildRun) -> GateReport; }            // UNIFIED §6, verbatim
 ```
+
+**Where digests come from.** `gate-outcome` computes no hash, so it stays zero-dependency. `Digest` is an opaque 32-byte value that the **caller** computes and passes in: through `Examination` (the digests of the items examined plus a digest over that set) and through `ChildRun.capture` (the digest of the captured stdout and marker bytes). Only these crates compute digests, all through one SHA-256 function, `harness_core::sha256(&[u8]) -> Digest`, built on the single SHA-256 crate on the purity allowlist:
+- `harness-journal`: the hash chain, blob addresses and `UntrustedBlob.sha256` (§7.1);
+- `harness-run`: the digests check adapters examine, the diff digest, tree and protected-path digests, and `ChildRun.capture`;
+- `harness-tools`: read hashes and edit verification (§2.3, §4.9).
+
+**Trust assumption, stated.** A `Witness` digest is a claim by harness code, not something `gate-outcome` proves. The claim cannot turn a non-pass into a pass: `Passed` still needs a non-empty examined set and no `Blocking` finding (or exit 0 plus the marker, for the child protocol). A wrong digest can only mislabel *which* bytes were examined. Every digest that labels evidence is recomputable from journaled blobs, and audit replay recomputes them (§2.9): a mismatch is `Indeterminate { UnreadableEvidence }` at the first divergent step.
 
 **Boundary.** The crate contains the vocabulary, the total `verdict()`, the witness choke point and the interpretation of the child protocol. It contains:
 - no I/O (callers spawn children and capture exit and stdout themselves, R3 H-03);
@@ -145,17 +174,19 @@ pub mod child { pub struct ChildRun { /* exit kind, last stdout line, marker see
 
 **Location.** The crate lives in its **own repository**, versioned independently (SemVer; any change to the enum is a major version and needs re-review). rustysuite consumes the same crate rather than building one. During H1-H2 it is a workspace member here (`crates/gate-outcome`, extractable, no harness imports). It moves to its own repository before H3 exits (§9). The licence is the owner's call (Q1, §11).
 
-**Harness types that are not verdicts.** `StopCause` (§2.5), `ToolStatus` (§4.5), `PolicyDecision` (§5.1) and `ApprovalState` (§5.3) describe *what happened*. None of them has a success variant for the run. The only way a run is reported as passed is `GateOutcome::Passed`. A CI grep gate refuses `enum` declarations named `*Outcome` or `*Verdict` in `crates/harness-*` (INV-28).
+**Harness types that are not verdicts.** `StopCause` (§2.5), `ToolStatus` (§4.5), `PolicyDecision` (§5.1), `ApprovalState` (§5.3) and the `PlanReports` collection (§7.3) describe *what happened*. None of them has a success variant for the run. The only way a run is reported as passed is `GateOutcome::Passed`. A CI grep gate refuses `enum` declarations named `*Outcome` or `*Verdict` in `crates/harness-*` (INV-28).
 
 ## 2. The run loop
 
 ### 2.1 Lifecycle
 
 ```
-admit task spec -> plan session (grants, trifecta, budgets) -> probe sandbox (if any execute-class grant)
- -> materialise workspace + grading base -> journal header
- -> LOOP { build context -> model call -> parse -> validate -> decide -> (approve) -> execute -> journal -> stop checks }
- -> verify (checks in pristine grading worktree) -> [repair round?] -> review (independent run) -> verdict() -> run report
+admit task spec -> state_root locality check (§2.8) -> plan session (grants, trifecta, budgets, fixed check plan)
+ -> probe sandbox (if any execute-class grant or mcp-stdio provider; none => refuse, §4.5)
+ -> materialise workspace + grading base -> journal header (durable, else refuse)
+ -> LOOP { build context -> model call -> parse -> validate -> decide -> (approve) -> journal intent -> execute -> journal result -> stop checks }
+ -> verify (full plan in pristine grading worktree) -> [repair round?] -> review (independent run)
+ -> finalize (verdict() only over a complete plan, §7.3) -> RunStopped durable -> run report
 ```
 
 The **task spec** is a user-authored file, trusted as intent, passed by path or stdin, never on
@@ -176,9 +207,12 @@ Each turn is one pass of a pure transition `step(state, observation) -> Decision
    - Free text outside the action is journaled as `Untrusted` reasoning and never parsed.
 5. **Validate** the tool id against the session's active set, and the arguments against the manifest's input schema (`additionalProperties: false`, exact types).
 6. **Decide** with `harness-policy` (§5): allow, ask or deny. Ask pauses the run for approval (§5.3). A denial is returned to the model as an observation and the loop continues.
-7. **Execute.** The policy mints an `Authorized<Call>`, which is the only type a `ToolProvider` accepts (§4.5). The call runs through the provider under the conformed sandbox when its class requires one. The result is `ToolResult { status, output: Untrusted<Bytes>, truncated, digest }`. Empty output is rendered as an explicit "(command succeeded, no output)" (R1 §1.2).
-8. **Journal** (write-ahead). The intent is appended before execution and the result after it. A crash leaves at most one incomplete step (§2.10).
-9. **Stop checks**: submit requested, budgets, loop detection (§2.6).
+7. **Journal the intent (write-ahead).** The policy mints an `Authorized<Call>`. `JournalWriter::append_intent(event, call)` appends the intent event (carrying the call digest), fsyncs, and only when both return `Ok` hands back `Journaled<Authorized<Call>>`. `Journaled<C>` has private fields and no other constructor, and it is the **only** type `ToolProvider::invoke` accepts (§4.5). An unjournaled intent is therefore untypeable, not merely forbidden. If the append or fsync fails, no `Journaled` value exists, the step ends here without executing, and the run stops (§7.1, "Write failure").
+8. **Execute.** The call runs through the provider under the conformed sandbox when its class requires one. The result is `ToolResult { status, output: Untrusted<Bytes>, truncated, digest }`. Empty output is rendered as an explicit "(command succeeded, no output)" (R1 §1.2).
+9. **Journal the result**, then fsync. If this append fails, the effect has happened but is unrecorded. The run stops with the same outcome as in step 7. Resume restores the workspace from the last snapshot, so an unrecorded workspace edit is discarded. It treats the trailing intent as "outcome unknown" and re-decides it (§2.10). The run report names that step as "effect may have occurred; not recorded".
+10. **Stop checks**: submit requested, budgets, loop detection, journal writer poisoned (§2.6, §7.1).
+
+A crash therefore leaves at most one incomplete step (an intent with no result), never an executed step with no intent.
 
 v0.1 runs one action per turn: no parallel tool calls. llama.cpp disables them by default, and small models are fragile with many tool calls (R1 §6).
 
@@ -214,6 +248,7 @@ Context is **rebuilt every turn from run state**, never grown by appending. R4 �
 | Repair rounds | harness | 1 | no further repair; verdict stands |
 | Per-call timeout | harness, kills the whole process tree (§6) | 120 s exec, 30 s others | `ToolStatus::Timeout` (observation, not a stop) |
 | Approval wait | harness | 15 min | the request becomes Deny |
+| Verification wall-clock | harness monotonic clock, from `VerificationStarted` (a separate budget, so an agent that spends its whole budget cannot starve the checks) | 30 min, task-settable | the running check is killed, the rest do not run, and the plan is incomplete ⇒ `Indeterminate { CouldNotRun }` (§7.3) |
 
 Every budget measures its own spend; no caller can assert it (scaffold review F3, `crates/harness-core/src/lib.rs:102-120`). Exhaustion carries `{ dimension, spent, limit }`. Budgets are never extended silently (`crates/harness-core/src/lib.rs:76-78`).
 
@@ -229,14 +264,18 @@ Every budget measures its own spend; no caller can assert it (scaffold review F3
 - `ModelUnavailable`
 - `Cancelled`
 - `SandboxLost`
+- `JournalUnavailable { op, error }` (an append or fsync failed; §7.1)
 
 It is not a verdict. The run's result is always a `GateOutcome`:
 
 | Situation | Result |
 |---|---|
-| `Submitted`, checks run | `verdict(check reports ++ review report)` |
-| `Budget(_)` / `Loop(_)` / `FormatErrors` / `ContextExhausted` | Checks **still run** (by default; `verify_on_stop = true`), because evidence decides, not the agent's claim. The result is `verdict(...)`, so a finished-but-unclaimed task can pass and a claimed-but-broken one cannot. |
+| `Submitted`, every planned check reported | `verdict(check reports ++ review report)` |
+| `Budget(_)` / `Loop(_)` / `FormatErrors` / `ContextExhausted` | Checks **still run** (by default; `verify_on_stop = true`), because evidence decides, not the agent's claim. The result is `verdict(...)` under the same completeness rule as the row above, so a finished-but-unclaimed task can pass and a claimed-but-broken one cannot. |
 | `Cancelled`, `SandboxLost`, `PolicyAbort`, `ModelUnavailable` before any check | `Indeterminate { CouldNotRun }` |
+| **Verification interrupted**: any stop, crash, cancel, verification-budget exhaustion or sandbox loss after verification started and before every planned check (reviewer included) has a report | `Indeterminate { CouldNotRun }`, never `verdict()` over the reports that did arrive (§7.3, "Completeness"; INV-34) |
+| `JournalUnavailable` at any point after the header is durable, including the final `RunStopped` append | `Indeterminate { UnreadableEvidence }`. Verification does not start, or stops, because check reports that cannot be journaled cannot be audited (§7.1; INV-33). |
+| Journal header cannot be written | the run refuses to start; nothing has executed: `Indeterminate { CouldNotRun }` |
 | Task spec has no checks | `Indeterminate { NothingChecked }`, always, whatever the agent says (INV-18) |
 
 The **sentinel** is the `task.submit` tool call (the analogue of mini-SWE-agent's `COMPLETE_TASK_AND_SUBMIT`, R1 §1.3). It carries a short deliverable note, which is untrusted. It only moves the run into the verification phase.
@@ -249,6 +288,8 @@ The **sentinel** is the `task.submit` tool call (the analogue of mini-SWE-agent'
 | Edit churn | more than 8 successful edits to one file | `Loop(EditChurn)` (R1 §1.7 "doom loops") |
 | No progress | 10 steps with no new observation digest and no workspace tree-digest change | `Loop(NoProgress)` |
 | Denial hammering | 3 policy denials of the same capability | `Loop(Denied)`, and the capability is removed from the active set for the rest of the run |
+
+**Standing conditions are signalled once per state change** (R3 H-14). A detector notice fires once per detector state, not once per step. The same goes for `Quarantined`, `SandboxUnavailable` and a budget dimension crossing 80%: each is journaled once when the condition begins and once when it ends, with the count of affected attempts in between, not once per attempt. Turning these typed events into alerts (paging, dashboards) is out of scope: the harness is a library and a CLI. It emits the typed events through the journal and the embedding API, and a supervisor decides whom to tell (§11).
 
 ### 2.7 Repair policy
 
@@ -274,7 +315,17 @@ The **sentinel** is the `task.submit` tool call (the analogue of mini-SWE-agent'
 - **Run identity.** `run-id` is time-ordered and random (128 bits). `attempt-<n>` is a monotonic counter under that id. All output paths are derived from identity, so a relaunch cannot address an earlier attempt's directories (R3 H-12).
 - **No shared database.** Concurrent runs share no writable state (R1 §2, R3 H-09).
 - **Concurrency.** A semaphore per model endpoint limits parallel runs, default 1 for loopback endpoints (R3 H-10). Launches beyond the limit queue; they never storm the server.
-- **Refusals.** `state_root` on a network filesystem is refused at startup. So is a `state_root` inside a workspace.
+- **Refusals.** A `state_root` inside a workspace is refused at startup. So is a `state_root` that is not **positively identified as a local filesystem**. The single-writer lock and the fsync durability of §7.1 do not hold reliably on network filesystems.
+
+**Filesystem-locality check** (`harness-sandbox::fs_locality(path) -> Result<LocalFs, Refused>`). It is an **allowlist**, not a network-FS denylist, so an unrecognised filesystem is refused rather than assumed local. It runs on the canonicalised `state_root` at startup and again on each new `attempt-<n>` directory, so a mount placed under `state_root` is caught:
+
+| OS | Mechanism | Admitted | Refused |
+|---|---|---|---|
+| Linux | `statfs(2)` `f_type` via `rustix` (safe API) | a committed list of local magic numbers (ext4, xfs, btrfs, tmpfs, zfs, f2fs; overlayfs only when its `upperdir`, read from `/proc/self/mountinfo`, is itself on an admitted type) | everything else, explicitly including NFS, SMB/CIFS, 9p, Ceph and every FUSE filesystem (sshfs and similar are FUSE) |
+| macOS | `statfs(2)`: the `MNT_LOCAL` flag **and** `f_fstypename` ∈ {`apfs`, `hfs`} (UNVERIFIED that `rustix` exposes both without `unsafe`; otherwise the call lives in an audited crate under §6.7's rules) | local APFS/HFS+ | no `MNT_LOCAL` (smbfs, nfs, afpfs, webdav), or any other type name |
+| Windows | UNC and `\\?\UNC\` paths refused by shape before any call; then `GetVolumePathNameW` + `GetDriveTypeW` + `GetVolumeInformationW` in `harness-sandbox-windows` | `DRIVE_FIXED` with NTFS or ReFS | `DRIVE_REMOTE`, `DRIVE_REMOVABLE`, `DRIVE_UNKNOWN`, any other filesystem name, or a failed call |
+
+A refusal happens before the journal header is written. The run does not start (`Indeterminate { CouldNotRun }`, exit 5), and the message names the detected type plus the fix: point `state_root` at a local disk. The default `state_root` sits in the user's local data directory, so an ordinary install never meets the refusal. There is no override flag. **Spike S-F1** confirms each OS's mechanism against a local, an SMB and an NFS mount in CI. Until S-F1 passes on an OS, that OS admits only the rows above, and a failed or unexpected query result is a refusal. What the check cannot see is named in §11 (a local filesystem on network block storage).
 
 ### 2.9 Replay
 
@@ -287,6 +338,10 @@ Inference is not deterministic even at temperature 0 (R1 §1.7), so **replay mea
 Resume opens a new attempt from the last fully journaled step: the chain is verified (§7.1), the
 workspace is restored from that step's snapshot, and a trailing intent with no result is
 re-decided, not re-executed blindly (policy re-runs; approval is re-asked where required).
+
+Two further rules:
+- **Verification is all-or-nothing across a resume.** Suppose the old attempt's journal holds a `VerificationStarted` with no matching `VerificationFinished` (a crash or kill mid-verification). Its check reports are never reused. The new attempt rebuilds the grading worktree and re-runs the **full** plan (§7.3).
+- **Resume after a journal failure** opens a new journal file for the new attempt; it never appends to the poisoned one. If the new journal's header cannot be written either, the resume refuses (`Indeterminate { CouldNotRun }`).
 
 ## 3. Model layer
 
@@ -379,10 +434,10 @@ The manifest is JSON (the scaffold's format). A detached `manifest.json.sig` is 
 | Field | Type / closed set | Rule | Justification |
 |---|---|---|---|
 | `schema_version` | integer, must be in the harness's supported set (v0.1: `{1}`) | mismatch refused, naming both versions | R5 §6.6 |
-| `provider` | name `[a-z0-9_-]{1,64}` (the scaffold grammar, `crates/harness-tools/src/lib.rs:120-154`) | the namespace. Reserved names refused (§4.3). Must be admitted (§4.4). | Renamed from `app`: providers are not only apps (ADR-0002) |
+| `provider` | name `[a-z0-9_-]{1,64}` (the scaffold grammar, `crates/harness-tools/src/lib.rs:120-154`) | the namespace. Reserved names (a core constant plus additive config) refused (§4.3). Must be admitted (§4.4). | Renamed from `app`: providers are not only apps (ADR-0002) |
 | `provider_version` | ≤ 32 bytes | recorded | scaffold |
 | `min_harness` | SemVer | a harness older than this refuses | R1 §4.4 |
-| `transport` | `builtin`, `mcp-stdio { argv, env_allow }` or `in-process { feature }` | `mcp-stdio` servers are spawned **confined** (§4.6) | §4.5 |
+| `transport` | `builtin`, `mcp-stdio { argv, env_allow }` or `in-process { feature }` | `mcp-stdio` servers are spawned **confined**, only with `Conformed`; without it the session is refused (§4.5) | §4.5 |
 | `mcp_protocols` | list of MCP protocol versions | highest common version chosen; none in common → refused | R1 §4.1 |
 | `capabilities[].id` | `<provider>.<verb...>`, scaffold grammar, ≤ 128 | must be under the provider's own namespace | scaffold |
 | `capabilities[].mcp_name` | string | the server's tool name mapped to this id (1:1, no fallback) | R5 §6.4: a binding that does not resolve fails the load |
@@ -417,13 +472,25 @@ Parsing refuses the following. Each has a test (R3 H-01, H-02):
 - duplicate JSON keys, at any depth (F13);
 - unknown fields (`deny_unknown_fields`, as today, `crates/harness-tools/src/lib.rs:39`);
 - a schema version outside the supported set;
-- reserved provider names: `harness` (built-ins) plus a user- or add-on-extensible reserved list, fixed at config load;
+- reserved provider names, before any per-capability check (see "Reserved namespaces" below);
 - ids outside the provider namespace;
 - duplicate ids;
 - an empty capability list;
 - any `mcp_name` mapped twice;
 - input schemas using keywords outside the subset, or missing `additionalProperties: false`;
 - descriptions or summaries containing control, zero-width or bidi characters. These are **refused, not stripped**, because stripping would change the bytes that `description_sha256` pins.
+
+**Reserved namespaces are a core constant** (R5 §6.3: "Reserved-ness is a core constant, not configuration"):
+
+```rust
+// harness-manifest
+pub const RESERVED_NAMESPACES: &[&str] = &["harness", "rustyvault"];
+```
+
+- `harness` is the built-ins' namespace. Only the manifest compiled into the binary may use it.
+- `rustyvault` is the suite's secret-custody service. No manifest may declare that namespace, whoever signs it. Secret custody reaches the harness only as a `SecretStore` add-on (§5.5, §8), never as a provider whose verbs could appear in an approval prompt an agent can trigger.
+- The effective reserved set is `RESERVED_NAMESPACES ∪ config.extra_reserved`. User or add-on config may **add** names. It cannot remove one: the config field is an additive list, there is no syntax for removal, and the union is computed in `harness-manifest`, where the constant lives.
+- Changing the constant is a code change to this repository, reviewed like any other. Today the scaffold refuses `rustyvault.*` ids only through the foreign-namespace rule (its test at `crates/harness-tools/src/lib.rs:245-249`). v1 refuses the provider **name** itself.
 
 ### 4.4 Trust tiers, admission, signing, pinning
 
@@ -450,19 +517,22 @@ Parsing refuses the following. Each has a test (R3 H-01, H-02):
 pub trait ToolProvider {
     fn namespace(&self) -> &Namespace;
     async fn presented(&mut self) -> Result<Vec<PresentedTool>, ProviderError>; // what the provider claims (compared, never trusted)
-    async fn invoke(&mut self, call: Authorized<Call>, ctx: &InvokeCtx) -> Result<ToolResult, ToolError>;
+    async fn invoke(&mut self, call: Journaled<Authorized<Call>>, ctx: &InvokeCtx) -> Result<ToolResult, ToolError>;
 }
 pub struct Authorized<C> { /* private; minted only by harness-policy::decide */ }
+pub struct Journaled<C> { /* private; minted only by harness-journal::JournalWriter::append_intent after a durable append (§2.2 step 7) */ }
 pub struct InvokeCtx<'a> { pub conformed: Option<&'a Conformed>, pub deadline: Instant, pub secrets: SecretHandles<'a>, pub step: StepId }
 pub enum ToolStatus { Ok, Error { code: u16 }, Timeout, Crashed { signal: Option<i32> }, Refused { reason: RefusalKind } }
 ```
 
-`Authorized<Call>` cannot be constructed outside `harness-policy`, so no provider can be driven by an unvalidated call. This is the same pattern as the scaffold's `require()` doc: "there is no API that runs a command without a [`Backend`] in hand" (`crates/harness-sandbox/src/lib.rs:48-49`).
+`Authorized<Call>` cannot be constructed outside `harness-policy`, and `Journaled<_>` cannot be constructed outside `harness-journal`. So no provider can be driven by an unvalidated call, or by one whose intent is not durably journaled. This is the same pattern as the scaffold's `require()` doc: "there is no API that runs a command without a [`Backend`] in hand" (`crates/harness-sandbox/src/lib.rs:48-49`).
 
 **Three implementations:**
 1. **builtin:** in-process Rust, `harness.*` (§4.8).
 2. **mcp-stdio** (`harness-mcp`, over rmcp 3.4 with the stdio and child-process features, no compiled C per R1 §5). The server binary runs **inside the sandbox** under a `ConfinedSpec` derived from its manifest. Egress is granted only if some capability declares it, and then only through the proxy (§6.5). Its environment is `env_allow` only.
 3. **in-process adapter:** a Rust crate behind a cargo feature, for trusted providers that need zero IPC. It still ships a manifest and is still policy-checked. The only thing it skips is process isolation, so it is allowed only for `builtin` or `signed` tiers.
+
+**No `Conformed`, no provider process** (INV-6). `harness-mcp` starts an mcp-stdio server only through `Backend::spawn(spec, &Conformed)`. It has no other spawn path, and `McpProvider::connect(manifest, &Conformed)` cannot be called without the token. At session planning (§2.1), if the task grants any capability of an mcp-stdio provider and `require()` fails, the **session is refused** before anything starts. The refusal is typed and names the provider, the outcome is `Indeterminate { UnsupportedOs }` or `{ CouldNotRun }` per §6.1, and the exit code is 3. The provider is never started unconfined, never run in-process instead, and never silently dropped from a task that asked for it. The same rule covers an in-process adapter that declares **any** execute-class capability: its crate code runs in the harness process, so without `Conformed` the whole provider is not loaded, not just that capability. The harness's own unconfined children are limited to the `__confine` helper (§6.3) and argv-only git over harness-built trees with hooks disabled (§7.6).
 
 Remote MCP over Streamable HTTP is feature `mcp-http`, off, and not in v0.1 (it needs TLS; §11).
 
@@ -556,6 +626,7 @@ rustysuite apps are one set of such providers. Their manifests and servers ship 
 | `write`, blast `own`, built-in workspace edits | allow: the sandbox plus snapshots make them undoable, and fewer prompts is safer (R1 §3.4, −84% prompts) |
 | `write`, provider-declared | ask (`user_confirm`) unless user policy allows |
 | `execute` | allow only with `Conformed`, else deny (INV-6) |
+| any capability of an mcp-stdio provider, or of an in-process adapter declaring any execute-class capability | only with `Conformed`, else the session is refused at planning (§4.5, INV-6) |
 | egress `lan`/`internet` | ask; plus the trifecta check; plus the proxy (§6.5) |
 | `irreversible` or blast `shared` | **ask every time** (`protected_action`); never cached, never scoped to the run |
 | **no approver present** (non-interactive, CI, embedded without a UI) | every Ask becomes Deny |
@@ -601,6 +672,8 @@ Consequences:
 - A plan-then-execute or dual-LLM path, which would allow some combinations (CaMeL, R1 §3.3), is future work (Q7).
 
 **Hosted models** are handled as a disclosure rule, not a trifecta label. The provider is not attacker-readable, but everything in context goes to it. A hosted profile may be used only if the session's maximum sensitivity is ≤ `operational`, unless the user's config opts a specific sensitivity in (Q2). `restricted` never goes to a hosted model.
+
+**The loopback model server is outside the trifecta computation.** The whole context goes to it every turn. The E label counts only capability egress, so the P ∧ U ∧ E guarantee **assumes** the model server process has no egress of its own. The harness cannot measure or constrain that: the server is a user process the harness neither starts nor confines, and it is part of the user's trust base. The harness does three things. It records the endpoint class and the server's claims in `ModelIdentity` (§3.5). It never gives a sandbox a route to the server (§6.5). It names this as a residual (§11). It claims no more.
 
 ### 5.5 Secrets
 
@@ -736,13 +809,36 @@ If S-L1 shows that Linux needs `unsafe` (e.g. `pre_exec` rather than the helper 
 
 **Header (line 0):** harness version; config, policy and manifest SHA-256s; `ModelIdentity`
 (§3.5) and profile hash; sandbox backend, matrix row and probe digest; OS; `shell_enabled`;
-protected-path digests; verification plan digest. This header is what makes a trajectory comparable, so harness regressions stay visible between releases (R1 §2, principle #13).
+protected-path digests; verification plan digest; and an **environment sample**. This header is what makes a trajectory comparable, so harness regressions stay visible between releases (R1 §2, principle #13).
 
-**Type-level append-only (F11).** `JournalWriter` owns the file (opened for append, with an exclusive advisory lock, single writer). Its only operation is `append(Event) -> Seq`. There is no seek, truncate, remove or rewrite in its API. `JournalReader` is a separate type that verifies the chain on open.
+**Environment sample** (R3 H-17: environment is data, and environmental failures stay distinct). Each sample records:
+- CPU count and the 1-minute load average;
+- memory total and memory available;
+- free bytes on the `state_root` volume;
+- for each field, its **producing method** (e.g. `/proc/loadavg`, `/proc/meminfo`, `sysctl vm.loadavg`, `GlobalMemoryStatusEx`).
+
+When to sample:
+- in the header;
+- at `VerificationStarted`;
+- on every `ToolFinished` or `CheckReported` whose status is `Timeout`, `Crashed` or `CouldNotRun`.
+
+A field the platform cannot supply through a safe API is recorded as `unmeasured` with the reason, never as zero. Windows sampling lives in `harness-sandbox-windows` (§6.7), or the field is `unmeasured`. The sample never changes an outcome. When a `CouldNotRun` or `Timeout` coincides with memory available under 5% or load above twice the CPU count, the run report adds an `Info` finding `possibly-environmental`. A human can then tell host pressure from a broken check without re-running.
+
+**Type-level append-only (F11).** `JournalWriter` owns the file (opened for append, with an exclusive advisory lock, single writer). Its only operations are `append(Event) -> Result<Seq, JournalError>` and `append_intent(Event, C) -> Result<Journaled<C>, JournalError>`. There is no seek, truncate, remove or rewrite in its API. `JournalReader` is a separate type that verifies the chain on open.
 
 **Detection and durability.** A mutated or reordered middle line fails verification
 (`UnreadableEvidence`, INV-11); a torn final line (a crash) is reported as such and resume starts
-from the last good line (§2.10); the writer fsyncs after every step's result event.
+from the last good line (§2.10). The writer fsyncs after every intent event (before execution, §2.2 step 7), after every result event, and after `VerificationStarted`, each `CheckReported`, `VerificationFinished` and `RunStopped`.
+
+**Write failure (fail-closed; INV-33).** A run whose evidence cannot be recorded can neither proceed nor pass:
+- **What counts as failure.** Any `Err` from a write or an fsync (disk full, EIO, a read-only remount, an error taking the exclusive lock), a short write, or a writer whose in-memory `seq` and chain head no longer match what it last made durable.
+- **Poisoning.** On any failure, `JournalWriter` becomes **poisoned**, and every later `append` returns `Err` without touching the file. A failed fsync is never retried on the same file, because the page-cache state after a failed fsync is not portable to rely on.
+- **No execution.** A poisoned writer mints no `Journaled` value, so no provider can be invoked (§2.2 step 7, §4.5).
+- **No egress.** The egress proxy appends its per-request `Egress` event **before** forwarding. If that append fails, the request is refused.
+- **The run stops.** `harness-run` checks the poison flag before every step and before every check. It stops with `StopCause::JournalUnavailable`, and the outcome is `Indeterminate { UnreadableEvidence }` (§2.5). Verification does not start, or stops where it is.
+- **Commit point.** The run's outcome is released only after `RunStopped` (carrying that outcome) is appended and fsynced. The order is: `RunStopped` durable, then the last stdout line (the `GateReport`), then the `GATE_OK_FILE` marker (only for `Passed`), then exit. If the `RunStopped` append fails, `harness-run` replaces whatever `verdict()` returned with `Indeterminate { UnreadableEvidence }`. Downgrading needs no witness; only `Passed` does. It writes no marker and exits 5. A `Passed` outcome therefore exists only for a run whose whole record is durable.
+- **Where the failure is reported.** It goes to stderr and to the run report. It cannot go to the broken journal.
+- **Testing.** `JournalWriter` is generic over a small `JournalFile` seam (`write_all`, `sync_data`). The real implementation wraps `std::fs::File`, and the fault-injecting implementation used by INV-33 fails the Nth write or fsync.
 
 **Anchoring.** The final chain head is printed in the run report. Detecting wholesale replacement of a journal needs that head recorded elsewhere. In the suite, it goes into the suite's own evidence records (§8); standalone, it is the user's to keep (residual).
 
@@ -768,10 +864,12 @@ The JSON form carries `"untrusted": true`. Display paths escape control, bidi an
 | `EditApplied` | path, before and after digests, snapshot id |
 | `Egress` | host, port, bytes, decision |
 | `Redacted` | which handle or canary matched (never the value), location |
-| `Quarantined` / `SandboxUnavailable` | capability and drift kind; typed reason |
+| `Quarantined` / `SandboxUnavailable` | capability and drift kind; typed reason (journaled on entry and exit of the condition, §2.6) |
 | `LoopDetected` / `BudgetCharged` | detector; dimension, spent, limit (charged per step, aggregated) |
 | `SubmitRequested` | *deliverable note* |
-| `CheckReported` | `GateReport` per check (JSON per `gate-outcome`) |
+| `VerificationStarted` / `VerificationFinished` | plan digest, the ordered planned check ids (reviewer slot included), diff blob ref and digest, environment sample; `Finished` carries the report count and whether the plan is complete |
+| `CheckReported` | `GateReport` per check (JSON per `gate-outcome`), keyed by planned check id |
+| `ReviewerRefused` | attempt index, candidate profile id, reason (e.g. `SameIdentity`) |
 | `ReviewReported` | reviewer run id, reviewer `ModelIdentity`, `GateReport` |
 | `RunStopped` | `StopCause`, the run's `GateOutcome`, deliverable digest, chain head |
 
@@ -805,6 +903,20 @@ These check content, never presence (R3 H-01).
 
 **The run's `GateOutcome`** is `verdict(all check reports ++ reviewer report)`: total and worst-wins, and an empty set gives `Indeterminate { NothingChecked }`. Summaries and counts in the report are derived from the reports, never written by the agent (R3 H-24).
 
+**Completeness (INV-34).** `verdict()` is never applied to a partial report set:
+- **The plan is fixed first.** The planned check set is fixed before the agent loop starts. It contains every task check, the three artifact checks and, when review is enabled, one reviewer slot. Its digest goes in the journal header, and `VerificationStarted` lists its ids in order.
+- **Reports are collected by id.** The verification driver collects reports into `PlanReports { plan_digest, reports: BTreeMap<CheckId, GateReport> }`, a plain collection with no success state. Its only consumer is `harness-run::finalize(&plan, reports) -> GateOutcome`.
+- **What `finalize` does.** It calls `verdict()` only when the report ids equal the planned ids exactly. If any planned id has no report, the result is `Indeterminate { CouldNotRun }`. If an id is not in the plan, or a check reported twice, the result is `Indeterminate { UnreadableEvidence }`. A plan with no task checks gives `Indeterminate { NothingChecked }` whatever the artifact checks and the reviewer say (INV-18).
+- **Reports that did arrive** are journaled and shown in the run report as diagnostics, including any `Failed`. They never produce the outcome of an incomplete plan.
+- **Covered interruptions:**
+  - `Cancelled` (SIGINT/SIGTERM or API cancel): the running check's process tree is killed, and the rest do not start.
+  - Verification-budget exhaustion (§2.4).
+  - `SandboxLost`.
+  - A poisoned journal: `UnreadableEvidence` wins here, per §7.1.
+  - A harness crash. No outcome is emitted at all. A consumer of the CLI sees a signal or an abnormal exit with no report line, which UNIFIED §6 maps to `CouldNotRun`. A later resume re-runs the whole plan (§2.10).
+- **Each repair round** (§2.7) is a full verification pass under the same rule.
+- **The marker.** `GATE_OK_FILE` is written only by the commit sequence of §7.1, after `finalize` returned `Passed` and `RunStopped` is durable. A kill at any earlier point leaves no marker.
+
 ### 7.4 What the agent can and cannot influence
 
 The agent influences only the **workspace contents**. It cannot choose which checks run, see hidden checks, write the grading worktree, write the verification plan or produce a `GateReport`. Its `task.submit` note is journaled as untrusted and never read by any check.
@@ -821,6 +933,21 @@ When the task enables `review` (the default for any task with write grants), the
   - an unresolvable anchor is a `PHANTOM` finding.
 
   A valid artifact becomes a `GateReport` via `run_checked`: `Passed(Witness { checked = reviewed hunks, digest = diff digest })` if there is no `Blocking` finding, `Failed` if there is one. An invalid artifact, a reviewer timeout or a reviewer crash gives `Indeterminate { CouldNotRun }`, after which the **fallback reviewer** (next configured profile) is engaged and recorded (R3 H-22).
+- **Every attempt re-checks identity, fallbacks included** (INV-19). `harness-run::reviewer` calls `check_distinct(author, candidate)` immediately before launching **each** attempt: the primary reviewer and every fallback. The check compares:
+  - run ids (must differ, always);
+  - profile id and profile SHA-256 (must differ when two or more models are configured, per Q5);
+  - endpoint plus claimed model id and declared weights digest (must differ under the same condition).
+
+  A candidate that fails the check is **not launched**. `ReviewerRefused { reason: SameIdentity }` is journaled, and the chain moves to the next fallback, which is checked the same way. The same check also runs once at session planning over the whole configured chain, so a misconfigured fallback is reported before the agent starts. The per-attempt check is the one that binds.
+
+  **The fallback chain:**
+  - With two or more models, the chain is the configured profiles minus the author's.
+  - With one model, it is a single fresh reviewer run on the same profile: distinct run id and fresh context, the Q5 default.
+
+  **The reviewer slot's report:**
+  - It is the report of the first attempt that produced a valid artifact.
+  - A valid `Failed` review is final. Fallbacks are engaged only when an attempt produced **no** valid artifact, so a blocking review cannot be shopped away.
+  - If every attempt is refused or fails, the slot's report is `Indeterminate { CouldNotRun }`, and the run cannot be `Passed`.
 - **It can only block.** Because `verdict()` is worst-wins, a reviewer's pass cannot rescue failed checks. A reviewer is also not a substitute for checks: with no checks, the outcome stays `Indeterminate { NothingChecked }`.
 
 ### 7.6 Reward-hacking defences
@@ -842,12 +969,12 @@ When the task enables `review` (the default for any task with write grants), the
 
 | Exit | Meaning |
 |---|---|
-| 0 | `Passed`; the `GATE_OK_FILE` marker is written only then |
+| 0 | `Passed`; the `GATE_OK_FILE` marker is written only then, and only after `RunStopped` is durable (§7.1 commit point) |
 | 1 | `Failed` |
 | 2 | usage error |
-| 3 | confinement refused (the task needs execution, and `require()` failed) |
+| 3 | confinement refused (the task needs execution or grants an mcp-stdio provider, and `require()` failed; §4.5) |
 | 4 | unreadable input (task spec, config, manifest) |
-| 5 | `Indeterminate` (the kind is in the JSON) |
+| 5 | `Indeterminate` (the kind is in the JSON), including a journal failure (§7.1), incomplete verification (§7.3) and a non-local `state_root` (§2.8) |
 
 A consumer that only reads exit codes sees 3, 4 and 5 as `CouldNotRun`. That is lossy but fail-closed (UNIFIED §6 item 2). This fulfils F10.
 
@@ -877,10 +1004,10 @@ This section follows R6 §0 and §4. **Standalone** is the primary product (ADR-
 | Phase | Scope | Exit criteria (all gates green on macOS, Linux, Windows) | Key tests |
 |---|---|---|---|
 | **H0** | This design | Independent adversarial review → rework → confirming review → SOUND; §11 owner questions answered or defaults accepted in writing | review record |
-| **H1** read-only agent | `gate-outcome` (workspace member); `harness-core` loop, `Meter`, loop detection; `harness-model` client (loopback), profiles, both protocols, replay (audit mode); `harness-manifest` v1 + built-in manifest; `harness-policy` for read classes; read tools in-process (no exec); journal v1; CLI `run` / `replay` / `profile check`; purity gates | A read-only question-answering task runs end to end on a local model with both protocols. Every run's outcome is `Indeterminate { NothingChecked }` (no checks yet), and that is shown to the user. | INV-1, 2, 3, 8, 11, 14, 18, 20, 22, 23, 24, 27, 28, 29, 30; replay determinism (audit mode reproduces every decision); format-error budget; mock server returning empty / `length` / 429 |
-| **H2** confined action loop | `harness-sandbox` Linux + macOS backends, `Conformed`, confined file-op helper; `harness-conformance` FT-1..18; S-W1 spike (+ Windows backend if it passes); edit engine; `exec.run` with allowlist; workspace materialisation + protected overlays; approvals + tokens; secrets boundary + canaries; network = none only | FT suite green on Linux and macOS CI; Windows either green or `Unavailable` with the refusal path tested; a coding task edits and runs tests inside the sandbox | INV-5, 6, 10, 12, 13, 15, 16, 21, 25; edit no-op and stale-read tests; CRLF test; symlink escape (FT-12); orphan kill (FT-16) |
-| **H3** evidence + reviewer | verification plan, child protocol, check adapters with refusal witnesses, pristine grading worktree, diff audit, repair rounds, reviewer run + fallback, run report, CLI exit codes; `gate-outcome` moved to its own repository | Reward-hack suite: deleting a failing test, flipping `#[ignore]`, editing a gate script, and adding a check that exits 0 without a marker all end **not green**, witnessed. A pinned evaluation set runs and its baseline is recorded per (harness version, model) (R1 §8 #15). | INV-4, 17, 18, 19, 26, 28; adapter refusal witnesses; phantom-citation reviewer test; reviewer ≠ author refusal |
-| **H4** providers + MCP | `harness-mcp` (rmcp stdio, confined servers), admission CLI, signing and pinning, quarantine, the full trifecta with real labels, egress proxy (Linux + macOS; Windows after S-W2) | A third-party MCP server works as a `pinned`-tier provider; the fixture provider integrates with zero core diff | INV-7, 9, 31; rug-pull (a mutated description is quarantined); shadowing (duplicate namespace refused); FT-13/14/15 through the proxy; an MCP sampling request refused |
+| **H1** read-only agent | `gate-outcome` (workspace member); `harness-core` loop, `Meter`, loop detection; `harness-model` client (loopback), profiles, both protocols, replay (audit mode); `harness-manifest` v1 + built-in manifest; `harness-policy` for read classes; read tools in-process (no exec); journal v1 with write-ahead `Journaled` calls and poisoning; filesystem-locality check + spike S-F1; environment sample; CLI `run` / `replay` / `profile check`; purity gates | A read-only question-answering task runs end to end on a local model with both protocols. Every run's outcome is `Indeterminate { NothingChecked }` (no checks yet), and that is shown to the user. | INV-1, 2, 3, 8, 11, 14, 18, 20, 22, 23, 24, 27, 28, 29, 30, 33 (read tools), 35; replay determinism (audit mode reproduces every decision); format-error budget; mock server returning empty / `length` / 429 |
+| **H2** confined action loop | `harness-sandbox` Linux + macOS backends, `Conformed`, confined file-op helper; `harness-conformance` FT-1..18; S-W1 spike (+ Windows backend if it passes); edit engine; `exec.run` with allowlist; workspace materialisation + protected overlays; approvals + tokens; secrets boundary + canaries; network = none only | FT suite green on Linux and macOS CI; Windows either green or `Unavailable` with the refusal path tested; a coding task edits and runs tests inside the sandbox | INV-5, 6, 10, 12, 13, 15, 16, 21, 25, 33 (exec and edits); edit no-op and stale-read tests; CRLF test; symlink escape (FT-12); orphan kill (FT-16) |
+| **H3** evidence + reviewer | verification plan, child protocol, check adapters with refusal witnesses, pristine grading worktree, diff audit, repair rounds, reviewer run + fallback, run report, CLI exit codes; `gate-outcome` moved to its own repository | Reward-hack suite: deleting a failing test, flipping `#[ignore]`, editing a gate script, and adding a check that exits 0 without a marker all end **not green**, witnessed. A pinned evaluation set runs and its baseline is recorded per (harness version, model) (R1 §8 #15). | INV-4, 17, 18, 19, 26, 28, 34; adapter refusal witnesses; phantom-citation reviewer test; reviewer ≠ author refusal, including a fallback equal to the author |
+| **H4** providers + MCP | `harness-mcp` (rmcp stdio, confined servers), admission CLI, signing and pinning, quarantine, the full trifecta with real labels, egress proxy (Linux + macOS; Windows after S-W2) | A third-party MCP server works as a `pinned`-tier provider; the fixture provider integrates with zero core diff | INV-6 (provider spawn), 7, 9, 31; rug-pull (a mutated description is quarantined); shadowing (duplicate namespace refused); FT-13/14/15 through the proxy; an MCP sampling request refused |
 | **H5** suite add-ons | suite providers (engine verbs, evidence reporting), `addon-*` features (mesh transport, secret-custody client), a pinned harness entry for rustybenchmark's agentic board | Default build has zero suite dependencies; with add-ons on, every invariant still passes; suite-side acceptance happens in the suite | INV-32; add-on on/off matrix |
 
 Phases are strictly ordered: H2 does not start before H1's exit, and so on. Each phase's exit goes through the two-eyes review, because the harness is itself reviewed like a gate.
@@ -891,12 +1018,12 @@ INV-1..14 are carried from R6 §5 (re-scoped where this design settles a detail)
 
 | ID | Property | Falsifying test | Phase |
 |---|---|---|---|
-| INV-1 | Every invocable capability resolves to closed-set dimension values. Unknown fields, versions, namespaces and reserved names are refused. | Manifests with an unknown field, an unknown effect value, v0 and v2, `provider: "harness"` → each refused with a typed error | H1 |
+| INV-1 | Every invocable capability resolves to closed-set dimension values. Unknown fields, versions, namespaces and reserved names are refused; the reserved set always contains `RESERVED_NAMESPACES`, whatever the config says. | Manifests with an unknown field, an unknown effect value, v0 and v2, `provider: "harness"`, `provider: "rustyvault"` → each refused with a typed error; the same two names refused under a config whose `extra_reserved` is empty or lists other names | H1 |
 | INV-2 | `Untrusted<T>` has no `Deref`, and its `Debug` shows no payload | compile-fail test on deref; property test: `format!("{:?}")` contains no payload substring | H1 |
 | INV-3 | An empty or truncated completion is never a turn result or a pass | mock server: empty body with a clean stream end, then `finish_reason: length` → typed error, run outcome ≠ `Passed` | H1 |
 | INV-4 | `Passed(Witness)` cannot be constructed outside `gate-outcome`'s choke points | compile-fail test constructing `Witness` or `Passed` from a harness crate | H1 (crate) / H3 (use) |
 | INV-5 | An irreversible or `shared`-blast call without a valid, bound, unconsumed approval refuses, every time | invoke under ask with no approval; with an approval for different args; with an expired one; with a reused one → all refuse | H2 |
-| INV-6 | Without `Conformed`, no execute-class tool and no confined check runs | disable the backend (matrix row absent) on each OS → refusal path, `Indeterminate { UnsupportedOs }` or `{ CouldNotRun }` | H2 |
+| INV-6 | Without `Conformed`, no execute-class tool, no confined check, no mcp-stdio provider process and no in-process adapter with an execute-class capability runs; there is no unconfined fallback | disable the backend (matrix row absent) on each OS → refusal path, `Indeterminate { UnsupportedOs }` or `{ CouldNotRun }`; grant an mcp-stdio capability with the backend disabled → session refused at planning, and a counter on the spawn seam shows zero provider processes started | H2 / H4 (providers) |
 | INV-7 | A capability whose pinned description or schema hash drifts is quarantined until re-pinned outside the run | mock MCP server mutates its description between admission and connect → invocations refuse; `Quarantined` journaled | H4 |
 | INV-8 | Two providers cannot share a namespace, and ids stay inside their namespace | admit two manifests with the same `provider` → second refused; foreign-namespace id → refused | H1 |
 | INV-9 | A session whose active set plus workspace is P ∧ U ∧ E is refused at start and on any set change | compose such a set → typed refusal naming three capabilities; quarantine that creates it mid-run → `PolicyAbort` | H1 (pure) / H4 (real labels) |
@@ -909,7 +1036,7 @@ INV-1..14 are carried from R6 §5 (re-scoped where this design settles a detail)
 | INV-16 | Approval tokens bind run, step, capability, args digest, expiry and nonce, and cannot be forged outside the harness process | flip one byte in each field; replay a consumed nonce; present a token from another run → refused | H2 |
 | INV-17 | Any agent change to a protected path makes the run not green | agent deletes a failing test / edits a gate script / edits CI config → `Failed` with `protected-path-modified` | H3 |
 | INV-18 | A task with no checks is never `Passed` | submit on a task with an empty verification plan → `Indeterminate { NothingChecked }` | H1 |
-| INV-19 | Reviewer identity ≠ author identity, and the reviewer never sees the author transcript | configure reviewer = author run → refused; inspect reviewer context digests → no author transcript blocks | H3 |
+| INV-19 | Reviewer identity ≠ author identity for every reviewer attempt, fallbacks included, and the reviewer never sees the author transcript | configure reviewer = author run → refused; with two models configured, make the primary reviewer crash and configure the fallback = the author profile → fallback not launched, `ReviewerRefused` journaled, outcome ≠ `Passed`; inspect reviewer context digests → no author transcript blocks | H3 |
 | INV-20 | Audit replay reproduces every context digest and policy decision, or names the first divergence | replay an H1 journal → identical; tamper a recorded tool result → divergence at that step | H1 |
 | INV-21 | Concurrent runs share no writable state | 8 concurrent runs on one host → zero lock failures, disjoint paths; one run's sandbox cannot read another's workspace (FT-3) | H2 |
 | INV-22 | Duplicate JSON keys are refused at every depth | `{"schema_version":1,…,"schema_version":0}` and a duplicated nested key → refused | H1 |
@@ -923,6 +1050,9 @@ INV-1..14 are carried from R6 §5 (re-scoped where this design settles a detail)
 | INV-30 | Built-in file tools cannot reach outside the workspace | planted symlink to `$HOME` canary: H1 in-process path (materialisation refused the symlink); H2 helper path (FT-12) | H1 / H2 |
 | INV-31 | A new provider integrates with no core change | fixture provider end to end; CI asserts an empty diff over `crates/` | H4 |
 | INV-32 | Standalone build has zero suite dependencies; add-ons are off by default | `cargo tree` of the default feature set against the suite crate list → empty; invariants pass with add-ons off | H5 |
+| INV-33 | No intent executes unless its journal append is durable, and a run whose journal cannot be written is never `Passed` | fault-injected `JournalFile`: fail the intent write, then the intent fsync, then the result write, then the `RunStopped` write (after every check passed) → in each case a spy provider sees zero invocations after the failure, the outcome is `Indeterminate { UnreadableEvidence }`, the exit code is 5 and no `GATE_OK_FILE` exists; header write failure → run refuses to start; proxy request after a failed `Egress` append → refused | H1 / H2 |
+| INV-34 | Verification that does not report every planned check is `Indeterminate`, never a verdict over the subset | plan of three checks where check 1 passes and check 3 would fail: SIGKILL the harness after check 1 → no report line, no marker, abnormal exit; SIGTERM after check 1 → `Indeterminate { CouldNotRun }`; exhaust the verification budget after check 1 → `Indeterminate { CouldNotRun }`; resume after the SIGKILL → all three re-run; a report with an unplanned id → `Indeterminate { UnreadableEvidence }` | H3 |
+| INV-35 | `state_root` is used only on a filesystem positively identified as local | per OS: `state_root` on an SMB and an NFS mount, and (Linux) on a FUSE mount → startup refusal naming the type, no journal header written; a network mount placed under `state_root` → the next attempt refuses | H1 (S-F1) |
 
 ## 11. Non-goals, owner questions, and limits
 
@@ -938,10 +1068,15 @@ likely later choice (R1 §4.2) once a UI other than the CLI embeds the harness.
 
 ### Open owner questions (each with the fail-closed default that holds until answered)
 
-1. **`gate-outcome` licence and home.** The crate's value is universal adoption, so a permissive licence (MIT OR Apache-2.0) fits it best. Its own repository is decided (§1.4). *Default:* PolyForm Noncommercial, like this repo, until the owner rules.
+1. **`gate-outcome` licence.** Its own repository is decided (§1.4). The licence is open, and it is a real tension, not a formality:
+   - **For a permissive licence** (MIT OR Apache-2.0): the crate exists to be the *one* outcome type every consumer shares. A noncommercial licence limits who can adopt it, and it limits which of the suite's own consumers may link it, since the suite does not link PolyForm Noncommercial crates into anything it publishes (R2 (a) item 12).
+   - **For PolyForm Noncommercial**: ADR-0003 is decided for this repository ("I don't want it used by businesses without my permission"). Splitting one crate out under a permissive licence is an exception to that decision, which only the owner can make.
+   - **What either answer changes.** A permissive `gate-outcome` would relax nothing here. rustyharness itself stays PolyForm Noncommercial under ADR-0003, and every consumer stays bound by its own licence rules. The question is only whether ADR-0003's reason extends to a small vocabulary crate with no product value on its own.
+
+   *Question to the owner:* does ADR-0003 cover `gate-outcome`, or is it a recorded exception? *Default:* PolyForm Noncommercial, like this repo, until the owner rules.
 2. **May a hosted model ever see `personal`-sensitivity data?** *Default:* no. Hosted is limited to sessions with sensitivity ≤ operational. `restricted` is never allowed, whatever the answer.
 3. **May the harness ever hold `restricted` capabilities** (the life-data class)? *Default:* refused at session start (INV-27). The owner's ADR-0002 item 3 already points this way.
-4. **Windows in v1.** *Default:* Windows ships read-only (no execution) unless spike S-W1 passes. The alternative is to state now that Windows execution is v2.
+4. **Windows in v1.** *Default:* Windows ships read-only (no execution) unless spike S-W1 passes. The alternative is to state now that Windows execution is v2. A consequence users must be told: from H3 on, a read-only Windows session with a verification plan cannot run its checks. Every check reports `Indeterminate { UnsupportedOs }` or `{ CouldNotRun }`, so the run is never `Passed` on Windows until S-W1 passes. The CLI says so at session start, not only in the final report.
 5. **Reviewer independence bar.** *Default:* fresh context + distinct run always required; a distinct model required when two or more are configured. The alternative is to always require a distinct model, which would make the reviewer unavailable to single-model standalone users.
 6. **Concurrency default per model endpoint.** *Default:* 1 for loopback, user-configurable (R3 §7 Q3).
 7. **When to invest in a trifecta-breaking architecture** (plan-then-execute / dual-LLM, R1 §3.3). *Default:* never combine; revisit after H4.
@@ -957,6 +1092,14 @@ likely later choice (R1 §4.2) once a UI other than the CLI embeds the harness.
 - Covert or timing channels out of a sandbox (R6 §8).
 - Exact seccomp and SBPL rule lists (spike outputs, reviewed as policy).
 - A completeness claim over entry points (R6 §2).
+- Alerting on journal events (paging, dashboards). The harness emits typed, deduplicated events (§2.6); a supervisor alerts on them.
+
+### Residual risks (named, not mitigated here)
+
+- **The model server process.** A loopback model server (llama.cpp or similar) receives the whole context every turn. It is a user process, part of the user's trust base. Its own network access is outside harness control in a standalone deployment: the harness neither measures nor constrains it. The trifecta rule (§5.4) assumes that server has no egress. A user who needs that assumption to hold must run the server without network access. (R6 TH-9 is the closest threat; this is the standalone residual.)
+- **Journal wholesale replacement.** Detectable only when the chain head is recorded elsewhere (§7.1). Standalone, keeping it is the user's job.
+- **Filesystem locality below the filesystem.** §2.8's check identifies the filesystem type, not the storage beneath it. A local filesystem on network block storage (iSCSI, a network-backed virtual disk) passes. The properties the check protects, one writer's lock and fsync durability, are the block device's to keep there.
+- **Digests are harness claims.** `gate-outcome` does not recompute them (§1.4). Audit replay does.
 
 ### What would make this design wrong
 
@@ -982,15 +1125,15 @@ likely later choice (R1 §4.2) once a UI other than the CLI embeds the harness.
 | H-10 harness-metered concurrency, typed provider errors | §2.8, §3.2 |
 | H-11 done-ness from harness-owned state | §2.5, §7.3, §7.4 |
 | H-12 first-class run identity | §2.8 |
-| H-13 durable per-attempt logs, recovery | §7.1, §2.10 |
-| H-14 standing-condition dedup | loop-detector notices fire once per detector state (§2.6); fuller alerting is out of scope |
+| H-13 durable per-attempt logs, recovery | §7.1 (fsync per intent and result; write failure fail-closed, INV-33), §2.10 |
+| H-14 standing-condition dedup | §2.6: detector notices once per detector state; `Quarantined`, `SandboxUnavailable` and budget-threshold events journaled once on entry and once on exit of the condition. Alerting on those typed events is declared out of scope for a library harness (§11); a supervisor consumes them. |
 | H-15 find-based snapshots incl. empty dirs | §2.8 snapshots |
 | H-16 detective signals labelled | §5.5 redaction |
-| H-17 environment context recorded | journal header §7.1; `UnsupportedOs` / `CouldNotRun` kinds |
+| H-17 environment context recorded | §7.1 environment sample (CPU count, load, memory available, free disk, each with its producing method; `unmeasured` never zero) in the header, at `VerificationStarted` and on every timeout, crash or `CouldNotRun`; `possibly-environmental` Info finding; `UnsupportedOs` / `CouldNotRun` kinds |
 | H-18 verification depth recorded; Rust, portable | header + `Coverage` on reports; §9 three-OS gates |
 | H-19 volatile facts derived by the harness | §2.3 block 4 |
 | H-20 citation resolution blocks | §7.5 reviewer anchors |
 | H-21 structured claims | run report fields derived from reports (§7.3) |
-| H-22 structural two-eyes with fallback | §7.5; INV-19 |
+| H-22 structural two-eyes with fallback | §7.5 (identity re-checked before every attempt, fallbacks included); INV-19 |
 | H-23 stamps over committed content | protected digests in the header (§7.6); chain head (§7.1) |
 | H-24 summaries derived from records | §7.3 last paragraph |
