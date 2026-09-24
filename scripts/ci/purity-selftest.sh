@@ -252,40 +252,91 @@ probe_case "the probe imported from another path" \
 probe_case "a let binding shadows the probe" 'let cx' \
     'let SystemProbe = harness_policy::locality::NoProbe; let cx' 'let SystemProbe'
 
-# INV-23: nothing chosen at run time reaches an argv (purity.sh §2f).
-argv_case() {
+# INV-23: every spawn goes through capture.rs's closed query set (purity.sh
+# §2f). Each case names the sub-rule that must fire (H1f-4 review F-8).
+spawn_case() {
     fresh
     plant crates/harness-sandbox/src/zz_spawn.rs "$2"
-    expect_refusal "$1" "INV-23: a spawned program or its arguments are not fixed literals"
+    expect_refusal "$1" "INV-23: a spawn outside crates/harness-sandbox/src/capture.rs"
 }
-argv_case "a program from a variable" \
+# The call shapes the first version of the gate matched...
+spawn_case "a program from a variable" \
     'pub fn zz(p: &str) { let _ = std::process::Command::new(p); }\n'
-argv_case "a relative program literal (PATH lookup)" \
-    'pub fn zz() { let _ = std::process::Command::new("sh"); }\n'
-argv_case "a program literal extended at run time" \
-    'pub fn zz(t: &str) { let _ = std::process::Command::new("/bin/".to_owned() + t); }\n'
-argv_case "a comment cannot stand in for the code" \
-    '// Command::new("/bin/true")\npub fn zz() { let _ = std::process::Command::new("sh"); }\n'
-argv_case "an argument from a variable" \
+spawn_case "an argument from a variable" \
     'pub fn zz(t: &str) { let _ = std::process::Command::new("/bin/echo").arg(t); }\n'
-argv_case "an argument built with format!" \
-    'pub fn zz(t: &str) { let _ = std::process::Command::new("/bin/echo").arg(format!("{t}")); }\n'
-argv_case "arg0 from a variable" \
-    'pub fn zz(t: &str) { let _ = std::process::Command::new("/bin/echo").arg0(t); }\n'
-argv_case "an args array with a variable" \
-    'pub fn zz(t: &str) { let _ = std::process::Command::new("/bin/echo").args(["-n", t]); }\n'
-argv_case "args from a vector" \
-    'pub fn zz(v: Vec<String>) { let _ = std::process::Command::new("/bin/echo").args(v); }\n'
-argv_case "Command renamed on import" \
+spawn_case "Command renamed on import" \
     'use std::process::Command as Spawn;\npub fn zz() { let _ = Spawn::new("/bin/true"); }\n'
-# Control: fixed literals, across lines and with a trailing comma, pass.
+spawn_case "fixed literals are still a spawn outside the module" \
+    'pub fn zz() {\n    let _ = std::process::Command::new("/usr/bin/true").args(["-n"]).arg("y");\n}\n'
+# ...and the spellings that defeated it (H1f-4 review F-1).
+spawn_case "turbofish" \
+    'pub fn zz(p: &str, t: &str) { let _ = std::process::Command::new::<&str>(p).arg::<&str>(t); }\n'
+spawn_case "UFCS" \
+    'pub fn zz(c: &mut std::process::Command, t: &str) { std::process::Command::arg(c, t); }\n'
+spawn_case "a raw identifier" \
+    'pub fn zz(p: &str) { let _ = std::process::r#Command::r#new(p); }\n'
+spawn_case "qualified self" \
+    'pub fn zz(p: &str) { let _ = <std::process::Command>::new(p); }\n'
+spawn_case "a function path" \
+    'pub fn zz(p: &str) { let _ = Some(p).map(std::process::Command::new); }\n'
+spawn_case "a type alias" \
+    'type C = std::process::Command;\npub fn zz(p: &str) { let _ = C::new(p); }\n'
+spawn_case "a macro splicing the name" \
+    'macro_rules! sp { ($t:ident, $p:expr) => { std::process::$t::new($p) }; }\npub fn zz(p: &str) { let _ = sp!(Command, p); }\n'
+spawn_case "CommandExt::arg0" \
+    'use std::os::unix::process::CommandExt;\npub fn zz(c: &mut X, t: &str) { c.arg0(t); }\n'
+spawn_case "raw_arg" \
+    'pub fn zz(c: &mut X, t: &str) { c.raw_arg(t); }\n'
+# A raw C string that an escape-aware stripper would read as unterminated
+# (H1f-4 review F-2): the code after it must stay visible.
+spawn_case "a spawn after a raw C string" \
+    'pub fn zz(t: &str) { let _ = cr"\\"; let _ = std::process::Command::new(t); // "\n}\n'
+# A production module that is merely NAMED tests.rs is scanned (F-4).
 fresh
-plant crates/harness-sandbox/src/zz_spawn.rs \
-    'pub fn zz() {\n    let _ = std::process::Command::new(\n        "/usr/bin/true",\n    )\n    .args([\n        "-n",\n        "x",\n    ])\n    .arg("y");\n}\n'
+plant crates/harness-sandbox/src/zzdir/tests.rs 'pub fn zz(p: &str) { let _ = std::process::Command::new(p); }\n'
+expect_refusal "a production module named tests.rs" "INV-23: a spawn outside crates/harness-sandbox/src/capture.rs"
+# Code brought in from outside the scan (F-4).
+fresh
+plant crates/harness-sandbox/src/zz_spawn.rs '#[path = "../zzhidden/a.rs"]\nmod hidden;\n'
+expect_refusal "a #[path] module" "INV-23: #[path] module"
+fresh
+plant crates/harness-sandbox/src/zz_spawn.rs 'include!("../zzhidden/b.rs");\n'
+expect_refusal "include! of another file" "INV-23: compile-time include"
+fresh
+plant crates/harness-sandbox/zzhidden/c.rs 'pub fn zz(p: &str) { let _ = std::process::Command::new(p); }\n'
+ln -s ../zzhidden/c.rs "$copy/crates/harness-sandbox/src/zz_spawn.rs" || fail "ln failed"
+expect_refusal "a symlinked source" "INV-23: symlinks under crates/"
+# A NUL byte would make grep read the file as binary (F-3).
+fresh
+plant crates/harness-sandbox/src/zz_spawn.rs 'pub fn zz() {} // \0\n'
+expect_refusal "a NUL byte in a source" "INV-23: a NUL byte in a source file"
+# capture.rs itself: only §4.5's programs, its tests only under cfg(test) (F-5).
+fresh
+awk '{ print } /^impl Query \{/ { print "    #[allow(dead_code)]"; print "    fn zz() -> Command { Command::new(\"/bin/sh\") }" }' \
+    "$copy/crates/harness-sandbox/src/capture.rs" >"$tmpdir/capture.planted" || fail "awk failed"
+mv "$tmpdir/capture.planted" "$copy/crates/harness-sandbox/src/capture.rs" || fail "mv failed"
+grep -qF '"/bin/sh"' "$copy/crates/harness-sandbox/src/capture.rs" || fail "capture plant did not land"
+expect_refusal "another program in capture.rs" 'program "/bin/sh" is not one'
+fresh
+awk '!/^#\[cfg\(test\)\]$/' "$copy/crates/harness-sandbox/src/capture.rs" >"$tmpdir/capture.planted" ||
+    fail "awk failed"
+mv "$tmpdir/capture.planted" "$copy/crates/harness-sandbox/src/capture.rs" || fail "mv failed"
+expect_refusal "capture.rs tests not cfg(test)" "its tests are not declared #[cfg(test)] mod tests;"
+# A grep that fails on the INV-23 word scan must fail the gate, not pass it (F-3).
+mkdir -p "$tmpdir/grepshim" || fail "mkdir grepshim failed"
+real_grep=$(command -v grep) || fail "grep not found on PATH"
+printf '#!/bin/sh\ncase "$*" in\n    *CommandExt*) echo "grep: simulated failure" >&2; exit 2 ;;\nesac\nexec "%s" "$@"\n' \
+    "$real_grep" >"$tmpdir/grepshim/grep" || fail "could not write the grep shim"
+chmod +x "$tmpdir/grepshim/grep" || fail "chmod grepshim failed"
+fresh
+expect_refusal "grep fails on the INV-23 scan" "grep error" PATH="$tmpdir/grepshim:$PATH"
+# Control: the word in a comment or a string literal elsewhere is not code.
+fresh
+plant crates/harness-sandbox/src/zz_spawn.rs '// Command::new(p) lives in capture.rs only.\npub fn zz() -> &'"'"'static str { "Command" }\n'
 run_purity
-[ "$rc" -eq 0 ] || fail "fixed literal spawns were refused (rc=$rc):
+[ "$rc" -eq 0 ] || fail "the word Command in a comment or string was refused (rc=$rc):
 $(cat "$tmpdir/out")"
-printf 'ok accepted: fixed literal spawns\n'
+printf 'ok accepted: Command in a comment and a string literal\n'
 
 # H1a review N-3: the remaining name-scan gaps.
 n3_case() {

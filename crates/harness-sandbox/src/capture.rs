@@ -1,10 +1,13 @@
-//! Bounded capture of a fixed system query's standard output: the macOS
-//! probes' `/sbin/mount` (locality, §2.8), `/usr/sbin/sysctl` and
-//! `/usr/bin/vm_stat` (environment sample, §7.1).
+//! The harness's only spawns in H1 (§4.5, INV-23): a closed set of
+//! read-only system queries, [`Query`], each with its program and argv
+//! fixed here, run through a bounded capture of their standard output. The
+//! macOS probes use them: `/sbin/mount` (locality, §2.8), `/usr/sbin/sysctl`
+//! and `/usr/bin/vm_stat` (environment sample, §7.1).
 //!
-//! These are the harness's only unconfined children besides those §4.5
-//! names, and each is read-only, run by absolute path with a fixed argv
-//! (no payload reaches it, INV-23). The capture bounds what the child can
+//! purity.sh §2f holds the rest of the tree to this: the word `Command` may
+//! appear in code only in this file (and its `#[cfg(test)]` tests), and this
+//! file may name no program but these three. So no caller can choose a
+//! program or an argument, however it is spelled (H1f-4 review F-1). The capture bounds what the child can
 //! do to the harness (H1f-3 review F-7), assuming it does not fork (none of
 //! the three does; a killed child's own children would outlive it, and
 //! `wait` after a kill is not time-limited): its environment is cleared
@@ -26,9 +29,41 @@ pub const CAPTURE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 /// How long a system query may take.
 pub const CAPTURE_DEADLINE: Duration = Duration::from_secs(5);
 
-/// Run `cmd` (its program and argv already fixed by the caller) and return
-/// its stdout, within the bounds above.
-pub(crate) fn capture(mut cmd: Command, deadline: Duration) -> Result<Vec<u8>, String> {
+/// The system queries the harness may run, and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Query {
+    /// `/sbin/mount`: the mount table (locality probe, §2.8).
+    Mount,
+    /// `/usr/sbin/sysctl -n vm.loadavg hw.memsize hw.logicalcpu`.
+    Sysctl,
+    /// `/usr/bin/vm_stat`.
+    VmStat,
+}
+
+impl Query {
+    /// The query's fixed program and argv.
+    fn command(self) -> Command {
+        match self {
+            Query::Mount => Command::new("/sbin/mount"),
+            Query::Sysctl => {
+                let mut c = Command::new("/usr/sbin/sysctl");
+                c.args(["-n", "vm.loadavg", "hw.memsize", "hw.logicalcpu"]);
+                c
+            }
+            Query::VmStat => Command::new("/usr/bin/vm_stat"),
+        }
+    }
+}
+
+/// Run `q` and return its stdout, within the bounds above.
+// Only the macOS probes call it; unix test builds compile the module too.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn query(q: Query) -> Result<Vec<u8>, String> {
+    capture(q.command(), CAPTURE_DEADLINE)
+}
+
+/// Run `cmd` and return its stdout, within the bounds above.
+fn capture(mut cmd: Command, deadline: Duration) -> Result<Vec<u8>, String> {
     let until = Instant::now() + deadline;
     let mut child = cmd
         .env_clear()
@@ -94,41 +129,4 @@ pub(crate) fn capture(mut cmd: Command, deadline: Duration) -> Result<Vec<u8>, S
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Each command is built inline from literals: this file is under
-    // crates/*/src, where purity.sh §2f (INV-23) allows only fixed spawns.
-
-    #[test]
-    fn a_clean_exit_returns_its_output_with_a_c_locale_and_no_inherited_env() {
-        let mut c = Command::new("/bin/sh");
-        c.args(["-c", "echo \"$LC_ALL:${HOME:-unset}\""]);
-        assert_eq!(capture(c, CAPTURE_DEADLINE).unwrap(), b"C:unset\n");
-    }
-
-    #[test]
-    fn failure_oversize_and_a_hang_are_errors() {
-        let mut c = Command::new("/bin/sh");
-        c.args(["-c", "exit 3"]);
-        assert!(capture(c, CAPTURE_DEADLINE).unwrap_err().contains("exited"));
-
-        let mut c = Command::new("/bin/sh");
-        c.args(["-c", "head -c 5000000 /dev/zero"]);
-        let big = capture(c, CAPTURE_DEADLINE).unwrap_err();
-        assert!(big.contains("over the cap"), "{big}");
-
-        let t = Instant::now();
-        let mut c = Command::new("/bin/sh");
-        c.args(["-c", "exec sleep 30"]);
-        let hung = capture(c, Duration::from_millis(200)).unwrap_err();
-        assert!(hung.contains("deadline"), "{hung}");
-        assert!(t.elapsed() < Duration::from_secs(10));
-
-        // Output complete, but the child lingers: still an error.
-        let mut c = Command::new("/bin/sh");
-        c.args(["-c", "echo x; exec 1>&- sleep 30"]);
-        let lingering = capture(c, Duration::from_millis(300)).unwrap_err();
-        assert!(lingering.contains("did not exit"), "{lingering}");
-    }
-}
+mod tests;

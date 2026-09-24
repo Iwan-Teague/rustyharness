@@ -343,13 +343,11 @@ pub fn mac_measure(
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use harness_policy::locality::FsQuery;
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
-    use std::process::Command;
 
-    use harness_policy::locality::FsQuery;
-
-    use crate::capture::{capture, CAPTURE_DEADLINE};
+    use crate::capture::{self, Query};
 
     use super::{failed, mac_measure, parse_mac_mount, MOUNT_TABLE_MAX_BYTES};
 
@@ -360,7 +358,7 @@ mod macos {
         };
         // Bounded, with a deadline and a cleared environment (H1f-3 review
         // F-7; see crate::capture).
-        let out = match capture(Command::new("/sbin/mount"), CAPTURE_DEADLINE) {
+        let out = match capture::query(Query::Mount) {
             Ok(o) => o,
             Err(e) => return failed(format!("/sbin/mount: {e}")),
         };

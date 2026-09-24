@@ -12,7 +12,7 @@ cd "$(dirname "$0")/../.."
 printf '=== 1/5 cargo fmt --all --check ===\n'
 cargo fmt --all --check
 
-printf '=== 2/5 purity (dep shape, pure-content, INV-28) ===\n'
+printf '=== 2/5 purity (dep shape, pure-content, INV-23, INV-28) ===\n'
 sh scripts/ci/purity.sh
 printf '%s\n' '--- purity refusal witnesses (planted violations must be refused) ---'
 sh scripts/ci/purity-selftest.sh

@@ -779,36 +779,39 @@ fn every_argv() -> Vec<String> {
     }
 }
 
-/// What the INV-23 scan saw while the harness waited for a reply.
+/// What one INV-23 scan saw while the harness waited for a reply.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct Scan {
     /// The canary was in the chat request (so the task was in flight).
     in_request: bool,
     /// Every argv that carried the canary.
     carrying: Vec<String>,
-    /// An argv naming the harness binary and the task FILE was seen.
+    /// The running harness was seen: an argv naming the binary and the
+    /// task FILE.
     harness_seen: bool,
 }
 
 /// INV-23: the task text never reaches an argv. The real binary runs a task
-/// whose text carries a canary; while the model server holds the first chat
-/// request (the harness is mid-run, waiting for the reply), every process's
-/// argv is read. The canary is in the request (so it was in flight) and in
-/// no argv, and the scan saw the harness itself (its argv names the task
-/// FILE). The static half is purity.sh §2f: every spawn in the harness is a
-/// fixed literal.
+/// whose text carries a canary, through a tool step, and at EVERY chat
+/// request (the harness is mid-run, waiting for the reply) every process's
+/// argv is read: the canary is in each request, in no argv, and the scan
+/// saw the harness itself. A witness runs first: a process whose argv[0] is
+/// a canary must be found, so the scan is shown able to see one. Named
+/// limit: each scan is a snapshot, so a child that starts and exits between
+/// two scans is covered only by the static half, purity.sh §2f (every spawn
+/// is one of capture.rs's three fixed queries).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn inv_23_the_task_text_reaches_no_argv() {
+    use std::os::unix::process::CommandExt;
     let fx = fixture("inv23");
     let canary = format!("TASK-CANARY-{:x}", std::process::id() ^ 0x5eed_1e55);
-    // Witness first (R3 H-04): the scan does find a canary on an argv.
-    // `; :` keeps the shell (and its argv) alive instead of exec'ing sleep,
-    // and the scan retries until the child has exec'd (a just-forked child
-    // still shows its parent's argv).
+    // Witness first (R3 H-04): one process, no shell and no grandchild (a
+    // killed `sh` could leave its `sleep` behind), argv[0] the canary.
     let witness = format!("{canary}-WITNESS");
-    let mut child = Command::new("/bin/sh")
-        .args(["-c", "sleep 30; :", &witness])
+    let mut child = Command::new("/bin/sleep")
+        .arg("30")
+        .arg0(&witness)
         .spawn()
         .unwrap();
     let until = std::time::Instant::now() + Duration::from_secs(10);
@@ -824,44 +827,45 @@ fn inv_23_the_task_text_reaches_no_argv() {
     let _ = child.kill();
     let _ = child.wait();
     assert!(found, "the argv scan cannot see a planted canary");
+
     std::fs::write(
         &fx.task,
         format!(r#"{{"task":"Find {canary} in a.txt","grants":["harness.fs.read"]}}"#),
     )
     .unwrap();
     let task_path = fx.task.to_str().unwrap().to_owned();
-    let seen: Arc<Mutex<Option<Scan>>> = Arc::new(Mutex::new(None));
-    let (s, c, t) = (seen.clone(), canary.clone(), task_path.clone());
+    let scans: Arc<Mutex<Vec<Scan>>> = Arc::new(Mutex::new(Vec::new()));
+    let (s, c, t) = (scans.clone(), canary.clone(), task_path.clone());
     let m = mock_with(
-        vec![act("harness.task.submit", r#"{"note":"done"}"#)],
+        vec![
+            act("harness.fs.read", r#"{"path":"a.txt"}"#),
+            act("harness.task.submit", r#"{"note":"done"}"#),
+        ],
         move |req| {
             let argvs = every_argv();
-            let carrying: Vec<String> = argvs.iter().filter(|a| a.contains(&c)).cloned().collect();
-            let harness_seen = argvs
-                .iter()
-                .any(|a| a.contains("rustyharness") && a.contains(&t));
-            let mut g = s.lock().unwrap();
-            if g.is_none() {
-                *g = Some(Scan {
-                    in_request: req.contains(&c),
-                    carrying,
-                    harness_seen,
-                });
-            }
+            s.lock().unwrap().push(Scan {
+                in_request: req.contains(&c),
+                carrying: argvs.iter().filter(|a| a.contains(&c)).cloned().collect(),
+                harness_seen: argvs.iter().any(|a| a.contains(BIN) && a.contains(&t)),
+            });
         },
     );
     let ep = format!("http://127.0.0.1:{}/v1", m.port);
     let o = cli(&run_args(&fx, &ep), false, &fx.marker);
     assert_eq!(o.code(), Some(5), "{}", String::from_utf8_lossy(&o.stderr));
-    let scan = seen.lock().unwrap().take().expect("no chat request");
-    assert!(scan.in_request, "the canary did not reach the model server");
-    assert!(
-        scan.harness_seen,
-        "the scan did not see the running harness"
-    );
-    assert!(
-        scan.carrying.is_empty(),
-        "argv carries the task text: {:?}",
-        scan.carrying
-    );
+    let scans = std::mem::take(&mut *scans.lock().unwrap());
+    // One scan per model call: before the read and after it.
+    assert_eq!(scans.len(), 2);
+    for (i, scan) in scans.iter().enumerate() {
+        assert!(scan.in_request, "scan {i}: the canary was not in flight");
+        assert!(
+            scan.harness_seen,
+            "scan {i}: the running harness was not seen"
+        );
+        assert!(
+            scan.carrying.is_empty(),
+            "scan {i}: argv carries the task text: {:?}",
+            scan.carrying
+        );
+    }
 }

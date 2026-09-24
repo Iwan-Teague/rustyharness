@@ -16,6 +16,9 @@
 # verdict lives in gate-outcome (gate-outcome itself is exempt: it IS the
 # outcome crate).
 #
+# INV-23 (§2f): every spawn in the harness is one of the fixed queries in
+# crates/harness-sandbox/src/capture.rs, so no payload reaches an argv.
+#
 # Fail closed: every tool call is checked. A tool that errors, or a check
 # that read nothing, fails the gate; it never prints OK.
 # scripts/ci/purity-selftest.sh plants violations and proves each refusal.
@@ -252,7 +255,8 @@ normalise() {
 # byte-string and char literals removed (the delimiters stay). H1a review
 # N-3 added the comment stripping; H1e-1 review NF-B showed a plain stripper
 # can be fooled by `"/*"` … `"*/"` or `"//"` inside literals, so this one
-# tracks literals: `"…"` with escapes, `r#*"…"#*` and `br…`, `b"…"`, and
+# tracks literals: `"…"` with escapes, `r#*"…"#*`, `br…` and `cr…` (H1f-4 review
+# F-2: a raw C string read as an escaped one hid code), `b"…"`, `c"…"`, and
 # `'x'`/`'\n'`/`'é'` char literals (a `'` not closing within one character
 # is a lifetime). Every scan runs on BOTH the raw text and this code view.
 strip_comments() {
@@ -286,8 +290,8 @@ strip_comments() {
             if (c2 == "//") break
             if (c2 == "/*") { mode = "block"; depth = 1; i += 2; continue }
             if (c == "\"") { out = out "\""; mode = "str"; i++; continue }
-            if ((c == "r" || c2 == "br") && !ident_before(line, i)) {
-                j = i + (c == "b" ? 2 : 1); h = 0
+            if ((c == "r" || c2 == "br" || c2 == "cr") && !ident_before(line, i)) {
+                j = i + ((c == "b" || c == "c") ? 2 : 1); h = 0
                 while (substr(line, j, 1) == "#") { h++; j++ }
                 if (substr(line, j, 1) == "\"") {
                     hashes = h; hs = ""; for (k = 0; k < h; k++) hs = hs "#"
@@ -315,7 +319,7 @@ strip_comments() {
 # an error, which fails the gate.
 scan() {
     rc=0
-    grep -oE "$2" "$3" >"$tmpdir/match" || rc=$?
+    grep -aoE "$2" "$3" >"$tmpdir/match" || rc=$?
     case $rc in
         0) while IFS= read -r m; do
                printf '%s: %s: %s\n' "$4" "$1" "$m" >>"$tmpdir/hits"
@@ -456,44 +460,80 @@ if [ -n "$cli_bad" ]; then
     fail "the rustyharness binary must use exactly the production probe, harness_sandbox::locality::SystemProbe (crates/harness-cli/src/main.rs)$cli_bad"
 fi
 
-# --- 2f. INV-23: nothing chosen at run time reaches an argv ------------------
+# --- 2f. INV-23: one spawn module, three fixed programs ---------------------
 # Prompts, task text and approval payloads never appear on any argv (design
-# §10 INV-23, R3 H-08: payloads travel through files, pipes or stdin). The
-# harness's own spawns are few and fixed, so the rule is structural: in every
-# non-test source under crates/*/src, each `Command::new(` names an absolute
-# path as a string literal, and each `.arg(`, `.arg0(` and `.args([...])`
-# takes string literals only; `Command` is never imported under another
-# name. Checked on the raw text (the program literal starts with "/") and on
-# the comment-stripped code, where literal contents are emptied (so a
-# comment cannot stand in for code, and `"/x".to_owned() + t` is not a
-# literal). Test files (tests.rs, testing.rs, tests/) may spawn freely.
-find crates -path '*/src/*' -type f -name '*.rs' ! -name tests.rs ! -name testing.rs \
-    >"$tmpdir/argv-found" || fail "find failed (INV-23)"
+# §10 INV-23, R3 H-08). Structural, not by call shape (H1f-4 review F-1:
+# turbofish, UFCS, aliases, raw identifiers and macros all defeat a pattern
+# for `Command::new(`): every spawn in the harness goes through the closed
+# `Query` enum in crates/harness-sandbox/src/capture.rs, which fixes each
+# program and argv. So:
+#   - no symlink under crates/, and no `#[path]` or `include!` in any source
+#     under crates/*/src (they could bring in code this scan never reads);
+#   - no source file with a NUL byte (a NUL makes grep read a file as binary);
+#   - the words `Command`, `CommandExt` and `raw_arg` appear in code (comments
+#     and literal contents stripped) in no source under crates/*/src except
+#     capture.rs and its `#[cfg(test)]` tests (capture/tests.rs); any spelling
+#     of a spawn has to write one of them;
+#   - capture.rs declares its tests `#[cfg(test)]`, names `Command` (so the
+#     scan read it), and every absolute-path literal in it is one of the
+#     programs §4.5 lists: /sbin/mount, /usr/sbin/sysctl, /usr/bin/vm_stat.
+# Integration tests (crates/*/tests/) are separate test crates and may spawn
+# freely. Fails closed on legitimate code too: prose inside code, a type or
+# method named `Command` elsewhere, or another program in capture.rs are all
+# refused, and need a review of this gate to allow.
+spawn_file=crates/harness-sandbox/src/capture.rs
+spawn_tests=crates/harness-sandbox/src/capture/tests.rs
+find crates -type l >"$tmpdir/links" || fail "find failed (INV-23 symlinks)"
+if [ -s "$tmpdir/links" ]; then
+    fail "INV-23: symlinks under crates/ (a source could hide behind one):
+$(cat "$tmpdir/links")"
+fi
+find crates -path '*/src/*' -type f -name '*.rs' >"$tmpdir/argv-found" || fail "find failed (INV-23)"
 sort "$tmpdir/argv-found" >"$tmpdir/argv-files" || fail "sort failed (INV-23)"
-grep -qxF crates/harness-sandbox/src/locality.rs "$tmpdir/argv-files" ||
-    fail "INV-23 scan would miss crates/harness-sandbox/src/locality.rs"
-# occ PATTERN FILE: how many times the ERE matches.
-occ() { grep -oE -- "$1" "$2" | wc -l | tr -d ' '; }
+for must in "$spawn_file" "$spawn_tests" crates/harness-sandbox/src/locality.rs; do
+    grep -qxF "$must" "$tmpdir/argv-files" || fail "INV-23 scan would miss $must"
+done
 : >"$tmpdir/hits"
 while IFS= read -r f; do
-  normalise "$f" "$tmpdir/argv-raw"
+  tr -d '\000' <"$f" >"$tmpdir/argv-nonul" || fail "tr failed on $f (INV-23)"
+  rc=0
+  cmp -s "$tmpdir/argv-nonul" "$f" || rc=$?
+  case $rc in
+      0) ;;
+      1) printf '%s: INV-23: a NUL byte in a source file\n' "$f" >>"$tmpdir/hits" ;;
+      *) fail "cmp failed on $f (INV-23)" ;;
+  esac
   strip_comments "$f" "$tmpdir/argv-stripped"
   normalise "$tmpdir/argv-stripped" "$tmpdir/argv-code"
-  spawns=$(occ 'Command::new ?\(' "$tmpdir/argv-raw")
-  [ "$spawns" = "$(occ 'Command::new ?\( ?"/' "$tmpdir/argv-raw")" ] ||
-      printf '%s: a program that is not an absolute path literal\n' "$f" >>"$tmpdir/hits"
-  [ "$(occ 'Command::new ?\(' "$tmpdir/argv-code")" = "$(occ 'Command::new ?\( ?"" ?,? ?\)' "$tmpdir/argv-code")" ] ||
-      printf '%s: a program that is not a single string literal\n' "$f" >>"$tmpdir/hits"
-  [ "$(occ '\.arg0? ?\(' "$tmpdir/argv-code")" = "$(occ '\.arg0? ?\( ?"" ?,? ?\)' "$tmpdir/argv-code")" ] ||
-      printf '%s: .arg( or .arg0( with something other than a string literal\n' "$f" >>"$tmpdir/hits"
-  [ "$(occ '\.args ?\(' "$tmpdir/argv-code")" = "$(occ '\.args ?\( ?&? ?\[ ?"" ?( ?, ?"" ?)* ?,? ?\] ?\)' "$tmpdir/argv-code")" ] ||
-      printf '%s: .args( with something other than an array of string literals\n' "$f" >>"$tmpdir/hits"
-  if grep -qE "(^|$nb)Command as($nb|\$)" "$tmpdir/argv-code"; then
-      printf '%s: Command imported under another name\n' "$f" >>"$tmpdir/hits"
-  fi
+  scan "INV-23: #[path] module" '#\[ ?path ?=' "$tmpdir/argv-code" "$f"
+  scan "INV-23: compile-time include" "(^|$nb)(include|include_str|include_bytes) ?!" "$tmpdir/argv-code" "$f"
+  case $f in
+      "$spawn_file" | "$spawn_tests") continue ;;
+  esac
+  scan "INV-23: a spawn outside $spawn_file" "(^|$nb)(Command|CommandExt|raw_arg)($nb|\$)" "$tmpdir/argv-code" "$f"
 done <"$tmpdir/argv-files"
+strip_comments "$spawn_file" "$tmpdir/spawn-stripped"
+normalise "$tmpdir/spawn-stripped" "$tmpdir/spawn-code"
+grep -qF '#[cfg(test)] mod tests;' "$tmpdir/spawn-code" ||
+    printf '%s: INV-23: its tests are not declared #[cfg(test)] mod tests;\n' "$spawn_file" >>"$tmpdir/hits"
+grep -qE "(^|$nb)Command($nb|\$)" "$tmpdir/spawn-code" ||
+    fail "INV-23: $spawn_file names no Command (read nothing?)"
+normalise "$spawn_file" "$tmpdir/spawn-raw"
+rc=0
+grep -aoE '"/[^"]*"' "$tmpdir/spawn-raw" >"$tmpdir/spawn-programs" || rc=$?
+case $rc in
+    0) ;;
+    1) fail "INV-23: $spawn_file names no program (read nothing?)" ;;
+    *) fail "grep error (rc=$rc) listing programs in $spawn_file" ;;
+esac
+while IFS= read -r prog; do
+    case $prog in
+        '"/sbin/mount"' | '"/usr/sbin/sysctl"' | '"/usr/bin/vm_stat"') ;;
+        *) printf '%s: INV-23: program %s is not one §4.5 lists\n' "$spawn_file" "$prog" >>"$tmpdir/hits" ;;
+    esac
+done <"$tmpdir/spawn-programs"
 if [ -s "$tmpdir/hits" ]; then
-    fail "INV-23: a spawned program or its arguments are not fixed literals (no payload may reach an argv):
+    fail "INV-23: spawns are confined to the closed query set in $spawn_file:
 $(cat "$tmpdir/hits")"
 fi
 

@@ -228,12 +228,10 @@ mod os {
 
 #[cfg(target_os = "macos")]
 mod os {
-    use std::process::Command;
-
     use harness_core::environment::{EnvSample, Method, Reading, Unmeasured};
 
     use super::{parse_sysctl, parse_vm_stat};
-    use crate::capture::{capture, CAPTURE_DEADLINE};
+    use crate::capture::{query, Query};
 
     fn or_failed(v: Option<u64>, method: Method) -> Reading {
         v.map_or(Reading::Unmeasured(Unmeasured::ReadFailed), |value| {
@@ -246,13 +244,10 @@ mod os {
     }
 
     pub(super) fn sample() -> EnvSample {
-        let mut sysctl = Command::new("/usr/sbin/sysctl");
-        sysctl.args(["-n", "vm.loadavg", "hw.memsize", "hw.logicalcpu"]);
-        let (load, mem, cpus) = text(capture(sysctl, CAPTURE_DEADLINE))
+        let (load, mem, cpus) = text(query(Query::Sysctl))
             .map(|t| parse_sysctl(&t))
             .unwrap_or((None, None, None));
-        let vm_stat = Command::new("/usr/bin/vm_stat");
-        let avail = text(capture(vm_stat, CAPTURE_DEADLINE)).and_then(|t| parse_vm_stat(&t));
+        let avail = text(query(Query::VmStat)).and_then(|t| parse_vm_stat(&t));
         EnvSample {
             cpus: or_failed(cpus, Method::SysctlHwLogicalcpu),
             load_1m_milli: or_failed(load, Method::SysctlVmLoadavg),
