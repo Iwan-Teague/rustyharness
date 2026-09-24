@@ -11,6 +11,13 @@ will ship as optional add-ons (H5), off unless enabled ([ADR-0002](docs/adr/0002
 
 The model is a swappable part. The harness is what makes an agent reliable.
 
+**Aim** (owner, 2026-09-24): on its own, a full coding agent like opencode or Cline,
+with every action behind the user's permission and inside confinement. Apps that
+embed it, such as rustybenchmark, pass their own locked-down configuration and do
+their own grading and measuring; the harness holds no app-specific code. Much of
+this is not built yet: see Status below, and the owner decisions in
+[the design](docs/01-design-v0.1.md#owner-decisions-after-v02-2026-09-24).
+
 ## Status
 
 **H1, the read-only agent, is built; its phase-exit review is next** (design

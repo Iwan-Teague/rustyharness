@@ -16,7 +16,9 @@ so the history stays readable. What is still open is listed first.
    2. May a hosted model ever see `personal` data? *Default:* no.
    3. May the harness ever hold `restricted` capabilities? *Default:* refused (INV-27).
    4. Windows in v1? *Default:* read-only unless spike S-W1 passes; today every
-      Windows `state_root` is refused until S-W1 (design row H1f-1).
+      Windows `state_root` is refused until S-W1 (design row H1f-1). *Owner intent
+      (2026-09-24):* Windows execution is wanted, because rustybenchmark will ship a
+      Windows app; the S-W1 gate stands (design OD-7).
    5. Reviewer independence bar? *Default:* fresh context and distinct run always; a
       distinct model when two or more are configured.
    6. Concurrency per model endpoint? *Default:* 1 for loopback (not enforced in
@@ -37,6 +39,16 @@ so the history stays readable. What is still open is listed first.
    killable helper closes), so the review decides whether H1 exits with it named;
    and `replay`'s "every record recomputed and matched" message, which should say
    that replies, tool results and samples are re-fed.
+4. **(owner) Sharing confinement code with rustybenchmark** (reopened 2026-09-24;
+   was answered item 5). The owner's position: the benchmark's grading sandbox stays
+   its own, and the harness never depends on the benchmark. Open: share confinement
+   code through a standalone crate outside both projects (as `gate-outcome` is for
+   outcomes), or keep two implementations? (Design OD-4.)
+5. **Design the capabilities the owner required on 2026-09-24** (design OD-5): ports
+   with permission, background processes, embedder-supplied confinement inputs, and
+   `gc`. Each needs a design delta, an R6 threat-model update where it touches the
+   network, the two-eyes review, and a phase. rustybenchmark needs the first three
+   with, or soon after, H2.
 
 ## Answered by the design
 
@@ -52,9 +64,9 @@ so the history stays readable. What is still open is listed first.
 4. **Reuse vs write** — the model client is the harness's own (a small HTTP/1.1
    client over `std::net`, no TLS in the default build; §3.2, design row H1d); MCP
    uses rmcp (§4.5, H4).
-5. **Shared crates with rustybenchmark** — the sandbox backends and the conformance
-   corpus are proposed as the shared crates; the harness takes no dependency on the
-   benchmark (§6.3).
+5. ~~**Shared crates with rustybenchmark**~~ — reopened 2026-09-24: see Still open
+   item 4. (The v0.2 answer proposed the sandbox backends and the conformance corpus
+   as the shared crates, §6.3.)
 6. **Hosted models** — off in the default build (feature `hosted`), opt-in per run
    (§3.2); a hosted profile only for sessions whose maximum sensitivity is at most
    `operational`, `restricted` never (§5.4); a loopback profile never falls back to
@@ -73,7 +85,9 @@ so the history stays readable. What is still open is listed first.
     per-OS backends gated by a conformance token, namespaces + Landlock + seccomp
     on Linux, deny-default Seatbelt on macOS, AppContainer + Job Object on Windows
     (D12, §6). A separate OS account per agent is the suite's confinement decision
-    (§8), still the suite owner's (OI-24).
+    (§8), still the suite owner's (OI-24). *Owner (2026-09-24):* no VMs and no external
+    container runtimes (Docker, Podman), because a VM reserves memory the local model
+    needs. The native backends above stay, container-like or not (design OD-6).
 13. **Local-only vs cloud models** — local first: loopback by default, hosted only by
     feature and per-run opt-in (§3.2, §5.4).
 14. **Reuse rustyfin's assistant tool contract** — its confirmation-token pattern is
