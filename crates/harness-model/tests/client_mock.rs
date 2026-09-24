@@ -15,8 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use harness_core::{Source, Untrusted};
-use harness_model::client::{ApiKey, ClientConfig, OpenAiCompatible, RetryPolicy};
-use harness_model::http::HttpLimits;
+use harness_model::client::{ApiKey, ClientConfig, HttpLimits, OpenAiCompatible, RetryPolicy};
 use harness_model::profile::{Profile, Protocol};
 use harness_model::protocol::{parse_reply, FormatError};
 use harness_model::{
@@ -269,7 +268,9 @@ fn rate_limits_are_retried_within_the_budget_and_recorded() {
     let m = mock(vec![Behave::Respond(too_many.clone()); 4]);
     assert_eq!(
         client(&m, None).complete(&req(), soon()).unwrap_err(),
-        ModelError::RateLimited { attempts: 4 }
+        ModelError::RateLimited {
+            statuses: vec![429, 429, 429, 429]
+        }
     );
     assert_eq!(
         m.requests.lock().unwrap().len(),
@@ -290,6 +291,23 @@ fn rate_limits_are_retried_within_the_budget_and_recorded() {
     );
 }
 
+// H1d review F-7: the whole retry history survives the final failure.
+#[test]
+fn the_final_failure_keeps_every_retry_status() {
+    let m = mock(vec![
+        Behave::Respond(http("503 Service Unavailable", "text/plain", "")),
+        Behave::Respond(http("500 Internal Server Error", "text/plain", "")),
+        Behave::Respond(http("503 Service Unavailable", "text/plain", "")),
+        Behave::Respond(http("429 Too Many Requests", "text/plain", "")),
+    ]);
+    assert_eq!(
+        client(&m, None).complete(&req(), soon()).unwrap_err(),
+        ModelError::RateLimited {
+            statuses: vec![503, 500, 503, 429]
+        }
+    );
+}
+
 #[test]
 fn server_errors_are_retried_then_typed() {
     let m = mock(vec![
@@ -304,7 +322,7 @@ fn server_errors_are_retried_then_typed() {
         client(&m, None).complete(&req(), soon()).unwrap_err(),
         ModelError::Unavailable(Unavailable::Status {
             code: 503,
-            attempts: 4
+            statuses: vec![503, 503, 503, 503]
         })
     );
 }
@@ -337,7 +355,7 @@ fn retries_never_run_past_the_deadline() {
         .complete(&req(), Instant::now() + Duration::from_millis(300))
         .unwrap_err();
     assert!(
-        matches!(e, ModelError::RateLimited { attempts: 1 }),
+        matches!(&e, ModelError::RateLimited { statuses } if statuses == &vec![429]),
         "{e:?}"
     );
     assert!(t.elapsed() < Duration::from_millis(300));

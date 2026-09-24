@@ -29,5 +29,11 @@ printf '=== 5/5 cargo test --workspace ===\n'
 cargo test --locked --workspace
 printf '%s\n' '--- tests again with gate-outcome/json ---'
 cargo test --locked --workspace --features gate-outcome/json
+printf '%s\n' '--- compile-fail doctests with their expected error codes enforced ---'
+# Stable rustdoc accepts `compile_fail,E0451` but checks the code only when
+# it believes it is a nightly build; RUSTC_BOOTSTRAP=1 turns that check on
+# (H1a review N-6). It enables no unstable feature in the code under test:
+# the crates build on stable without it, as every other step shows.
+RUSTC_BOOTSTRAP=1 cargo test --locked --workspace --doc --features gate-outcome/json
 
 printf 'All 5 rustyharness gates passed.\n'

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use gate_outcome::{GateOutcome, IndeterminateKind};
-use harness_core::{sha256, Digest, StopCause, Untrusted};
+use harness_core::{sha256, CallDigest, Digest, RunId, StopCause, Untrusted};
 use serde_json::{Map, Value};
 
 use crate::canon::{escape, rfc3339_utc, EventKind, Ident, RecordFields, GENESIS, INLINE_MAX};
@@ -29,7 +29,7 @@ pub(crate) use sealed::Sealed;
 /// fault-injecting file in `crate::testing`. No other crate can supply a
 /// `sync_data` that does nothing and still obtain `Journaled` values.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// struct Noop;
 /// impl harness_journal::JournalFile for Noop {
 ///     fn write_all(&mut self, _: &[u8]) -> std::io::Result<()> { Ok(()) }
@@ -47,7 +47,7 @@ pub trait JournalFile: Sealed {
 /// Sealed like [`JournalFile`]: a blob store that claims durability it
 /// does not have would let records cite missing evidence.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// struct Noop;
 /// impl harness_journal::BlobSink for Noop {
 ///     fn put(&mut self, _: &str, _: &[u8]) -> std::io::Result<()> { Ok(()) }
@@ -188,6 +188,13 @@ impl Default for SystemClock {
     }
 }
 
+/// The same clock serves the Meter's wall budget (F-10.9).
+impl harness_core::MonoClock for SystemClock {
+    fn now(&self) -> std::time::Duration {
+        self.start.elapsed()
+    }
+}
+
 impl Clock for SystemClock {
     fn mono_ms(&self) -> u64 {
         u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -232,7 +239,7 @@ impl Header {
 /// private and the type implements no `Clone`, `Default` or serde, so a
 /// `Journaled` value cannot be forged, copied or parsed back from bytes.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// let forged = harness_journal::Journaled { call: (), intent_seq: 1, intent_hash: harness_core::sha256(b"") };
 /// ```
 ///
@@ -240,7 +247,7 @@ impl Header {
 /// the doctest fails ONLY because `Journaled` is not `Clone` (E0277; review
 /// F-2: a generic `C` and method syntax made it fail for another reason).
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use harness_journal::Journaled;
 /// fn dup(j: &Journaled<()>) -> Journaled<()> { <Journaled<()> as Clone>::clone(j) }
 /// ```
@@ -356,7 +363,7 @@ pub struct JournalWriter<F, B, K> {
     file: F,
     blobs: B,
     clock: K,
-    run: Ident,
+    run: RunId,
     attempt: u32,
     seq: u64,
     head: Digest,
@@ -391,7 +398,7 @@ impl JournalWriter<FsFile, DirBlobs, SystemClock> {
     /// start.
     pub fn create(
         attempt_dir: &Path,
-        run: Ident,
+        run: RunId,
         attempt: u32,
         header: Header,
     ) -> Result<Self, StartError> {
@@ -400,7 +407,7 @@ impl JournalWriter<FsFile, DirBlobs, SystemClock> {
 
     pub(crate) fn create_with(
         attempt_dir: &Path,
-        run: Ident,
+        run: RunId,
         attempt: u32,
         header: Header,
         ds: &dyn DirSync,
@@ -439,7 +446,7 @@ impl JournalWriter<FsFile, DirBlobs, SystemClock> {
     /// H1e).
     pub fn create_next_attempt(
         run_dir: &Path,
-        run: Ident,
+        run: RunId,
         header: Header,
     ) -> Result<(Self, u32), StartError> {
         Self::create_next_attempt_with(run_dir, run, header, &RealDirSync)
@@ -447,7 +454,7 @@ impl JournalWriter<FsFile, DirBlobs, SystemClock> {
 
     pub(crate) fn create_next_attempt_with(
         run_dir: &Path,
-        run: Ident,
+        run: RunId,
         header: Header,
         ds: &dyn DirSync,
     ) -> Result<(Self, u32), StartError> {
@@ -471,7 +478,7 @@ impl<F: JournalFile, B: BlobSink, K: Clock> JournalWriter<F, B, K> {
         file: F,
         blobs: B,
         clock: K,
-        run: Ident,
+        run: RunId,
         attempt: u32,
         header: Header,
     ) -> Result<Self, StartError> {
@@ -595,16 +602,18 @@ impl<F: JournalFile, B: BlobSink, K: Clock> JournalWriter<F, B, K> {
     }
 
     /// Write-ahead (§2.2 step 7): append the `ToolStarted` intent carrying
-    /// `call_digest`, fsync, and only when both succeeded hand back the call
+    /// `call.call_digest()` (computed here from the call itself), fsync, and only when both succeeded hand back the call
     /// as [`Journaled`]. On any failure no `Journaled` exists and the writer
     /// is poisoned, so the call cannot be executed.
-    pub fn append_intent<C>(
+    pub fn append_intent<C: CallDigest>(
         &mut self,
         step: u64,
         event: Event,
         call: C,
-        call_digest: Digest,
     ) -> Result<Journaled<C>, JournalError> {
+        // The digest comes from the call itself (H1c review F-7), never from
+        // the caller, so the intent describes exactly what may run.
+        let call_digest = call.call_digest();
         self.check_poison()?;
         if event.kind() != EventKind::ToolStarted {
             return Err(JournalError::InvalidEvent(

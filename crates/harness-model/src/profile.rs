@@ -66,12 +66,19 @@ pub struct Sampling {
     pub max_tokens: u64,
 }
 
-/// The `profile check` stamp: the digest of the smoke-eval report it passed.
+/// The `profile check` stamp, bound to the profile's content (H1d review
+/// F-5): `stamp_sha256 = sha256(content digest hex ":" report digest hex)`,
+/// where the content digest covers every profile field except the stamp
+/// itself. [`Profile::validated`] recomputes it, so a stamp copied into
+/// another profile, a made-up stamp, or a profile edited after
+/// `profile check` is simply unvalidated.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Stamp {
-    /// SHA-256 (hex) of the report.
+    /// SHA-256 (hex) of the smoke-eval report.
     pub report_sha256: String,
+    /// SHA-256 (hex) binding the report to this profile's content.
+    pub stamp_sha256: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,6 +203,9 @@ impl Profile {
             if st.report_sha256.parse::<Digest>().is_err() {
                 return Err(f("validated.report_sha256"));
             }
+            if st.stamp_sha256.parse::<Digest>().is_err() {
+                return Err(f("validated.stamp_sha256"));
+            }
         }
         if w.grammar != Grammar::None {
             return Err(ProfileError::NotInThisBuild {
@@ -301,7 +311,60 @@ impl Profile {
     /// Whether `profile check` stamped this profile. Recorded as
     /// `profile_validated` in every journal header (§3.4).
     pub fn validated(&self) -> bool {
-        self.validated.is_some()
+        self.validated.as_ref().is_some_and(|st| {
+            st.report_sha256
+                .parse::<Digest>()
+                .is_ok_and(|r| self.stamp_for(&r) == *st)
+        })
+    }
+
+    /// The stamp digest, when the stamp is valid for this content (what the
+    /// journal header records next to `profile_validated`).
+    pub fn stamp_sha256(&self) -> Option<&str> {
+        self.validated
+            .as_ref()
+            .filter(|_| self.validated())
+            .map(|s| s.stamp_sha256.as_str())
+    }
+
+    /// The canonical content of this profile: every field except the stamp,
+    /// as sorted-key JSON. Derived from the validated fields, so two files
+    /// that differ only in whitespace or key order have the same content.
+    pub fn content_sha256(&self) -> Digest {
+        let s = self.sampling;
+        let mut v = serde_json::json!({
+            "profile_version": 1,
+            "id": self.id,
+            "model": self.model,
+            "context_window": self.context_window,
+            "fill_ratio": self.fill_ratio,
+            "protocol": match self.protocol { Protocol::Native => "native", Protocol::Text => "text" },
+            "tool_choice_required_ok": self.tool_choice_required_ok,
+            "grammar": "none",
+            "max_active_tools": self.max_active_tools,
+            "edit_format": match self.edit_format { EditFormat::Replace => "replace", EditFormat::Whole => "whole" },
+            "recent_turns": self.recent_turns,
+            "sampling": {"temperature": s.temperature, "top_p": s.top_p, "max_tokens": s.max_tokens},
+        });
+        if let (Some(seed), Some(sampling)) = (
+            s.seed,
+            v.get_mut("sampling").and_then(|x| x.as_object_mut()),
+        ) {
+            sampling.insert("seed".into(), serde_json::Value::from(seed));
+        }
+        if let (Some(n), Some(o)) = (&self.kv_quant_note, v.as_object_mut()) {
+            o.insert("kv_quant_note".into(), serde_json::Value::from(n.clone()));
+        }
+        sha256(v.to_string().as_bytes())
+    }
+
+    /// The stamp `profile check` writes for a passing report on THIS content.
+    pub fn stamp_for(&self, report: &Digest) -> Stamp {
+        let bound = format!("{}:{}", self.content_sha256(), report);
+        Stamp {
+            report_sha256: report.to_string(),
+            stamp_sha256: sha256(bound.as_bytes()).to_string(),
+        }
     }
     /// SHA-256 of the profile file, when loaded from one.
     pub fn sha256(&self) -> Option<Digest> {
@@ -358,9 +421,7 @@ pub fn score(profile: &Profile, r: &SmokeResults) -> CheckResult {
         "profile-check/1 id={} model={} protocol={:?} cases={} valid={} format_errors={} edit_format=unchecked",
         profile.id, profile.model, profile.protocol, r.cases, r.valid_tool_calls, r.format_errors
     );
-    CheckResult::Stamp(Stamp {
-        report_sha256: sha256(report.as_bytes()).to_string(),
-    })
+    CheckResult::Stamp(profile.stamp_for(&sha256(report.as_bytes())))
 }
 
 #[cfg(test)]
@@ -435,7 +496,10 @@ mod tests {
                 r#"{"temperature":0.2,"top_p":0.9,"max_tokens":40000}"#,
             ),
             ("kv_quant_note", "\"a\\nb\""),
-            ("validated", r#"{"report_sha256":"nope"}"#),
+            (
+                "validated",
+                r#"{"report_sha256":"nope","stamp_sha256":"nope"}"#,
+            ),
         ] {
             assert!(
                 matches!(
@@ -461,13 +525,47 @@ mod tests {
         }
     }
 
+    fn stamp_json(st: &Stamp) -> String {
+        format!(
+            r#"{{"report_sha256":"{}","stamp_sha256":"{}"}}"#,
+            st.report_sha256, st.stamp_sha256
+        )
+    }
+
+    // H1d review F-5: the stamp is bound to the profile's content.
     #[test]
-    fn a_stamped_profile_reports_validated() {
-        let stamped = with(
-            "validated",
-            r#"{"report_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}"#,
+    fn a_stamp_validates_only_the_content_it_was_made_for() {
+        let p = Profile::parse(GOOD.as_bytes()).unwrap();
+        let st = p.stamp_for(&sha256(b"report"));
+        let stamped = Profile::parse(with("validated", &stamp_json(&st)).as_bytes()).unwrap();
+        assert!(stamped.validated());
+        assert_eq!(stamped.stamp_sha256(), Some(st.stamp_sha256.as_str()));
+        assert_eq!(
+            stamped.content_sha256(),
+            p.content_sha256(),
+            "the stamp is not content"
         );
-        assert!(Profile::parse(stamped.as_bytes()).unwrap().validated());
+
+        // Edited after profile check: a different model, protocol or sampling.
+        let mut o: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&with("validated", &stamp_json(&st))).unwrap();
+        o.insert("model".into(), serde_json::json!("another-model"));
+        let edited = Profile::parse(serde_json::Value::Object(o).to_string().as_bytes()).unwrap();
+        assert!(!edited.validated(), "an edited profile is unvalidated");
+        assert_eq!(edited.stamp_sha256(), None);
+
+        // A made-up stamp (any 64 hex digits) validates nothing.
+        let fake = r#"{"report_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","stamp_sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}"#;
+        assert!(!Profile::parse(with("validated", fake).as_bytes())
+            .unwrap()
+            .validated());
+        // Neither does a stamp copied from another profile.
+        let other = Profile::conservative_default("m").stamp_for(&sha256(b"report"));
+        assert!(
+            !Profile::parse(with("validated", &stamp_json(&other)).as_bytes())
+                .unwrap()
+                .validated()
+        );
     }
 
     #[test]

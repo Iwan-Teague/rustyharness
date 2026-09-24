@@ -14,7 +14,7 @@
 //! intent is not durably journaled: those are not merely forbidden, they do
 //! not typecheck (F-01, INV-33).
 //!
-//! ```compile_fail
+//! ```compile_fail,E0308
 //! // An authorised but unjournaled call is the wrong type.
 //! fn drive<P: harness_tools::ToolProvider>(
 //!     p: &mut P,
@@ -25,7 +25,7 @@
 //! }
 //! ```
 //!
-//! ```compile_fail
+//! ```compile_fail,E0308
 //! // A journaled but unauthorised call is the wrong type too.
 //! fn drive<P: harness_tools::ToolProvider>(
 //!     p: &mut P,

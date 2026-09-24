@@ -301,7 +301,7 @@ pub struct Call {
 /// is [`Session::authorize`], so a provider that accepts only
 /// `Authorized<Call>` cannot be driven by an unchecked call (§4.5).
 ///
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// let forged = harness_policy::Authorized {
 ///     call: harness_policy::Call { capability: "harness.fs.read".into(), args: serde_json::json!({}) },
 ///     rule: harness_policy::RuleId::Builtin("allow.default.read"),
@@ -311,6 +311,23 @@ pub struct Call {
 pub struct Authorized<C> {
     call: C,
     rule: RuleId,
+}
+
+/// The canonical form of a call, digested for the journal's write-ahead
+/// intent: the compact JSON of `{"args": …, "capability": …}` with sorted
+/// keys (serde_json's map is ordered). The journal calls this on the very
+/// `Authorized<Call>` it then returns as `Journaled`, so the intent names
+/// exactly the call that may run (H1c review F-7).
+impl harness_core::CallDigest for Authorized<Call> {
+    fn call_digest(&self) -> harness_core::Digest {
+        let mut m = serde_json::Map::new();
+        m.insert("args".into(), self.call.args.clone());
+        m.insert(
+            "capability".into(),
+            Value::from(self.call.capability.clone()),
+        );
+        harness_core::sha256(Value::Object(m).to_string().as_bytes())
+    }
 }
 
 impl<C> Authorized<C> {

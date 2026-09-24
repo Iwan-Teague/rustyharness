@@ -39,7 +39,7 @@ use harness_core::Untrusted;
 
 pub mod client;
 pub mod endpoint;
-pub mod http;
+pub(crate) mod http;
 pub mod profile;
 pub mod protocol;
 pub mod replay;
@@ -135,6 +135,14 @@ impl RenderNonce {
     }
 }
 
+/// A validated nonce (16-64 lowercase hex, harness-generated) is
+/// harness-vouched text for the journal's `ModelRequested` record.
+impl harness_core::TrustedName for RenderNonce {
+    fn trusted_name(&self) -> &str {
+        &self.0
+    }
+}
+
 /// One model request.
 #[derive(Debug)]
 pub struct ModelRequest {
@@ -220,8 +228,9 @@ pub enum Unavailable {
     Status {
         /// The last status.
         code: u16,
-        /// Attempts made.
-        attempts: u32,
+        /// Every attempt's status, in order (H1d review F-7: the whole
+        /// retry history survives a final failure).
+        statuses: Vec<u16>,
     },
 }
 
@@ -244,10 +253,10 @@ pub enum ModelError {
     #[error("model backend unavailable: {0:?}")]
     Unavailable(Unavailable),
     /// 429 after the retry budget.
-    #[error("rate limited after {attempts} attempts")]
+    #[error("rate limited after {} attempts", statuses.len())]
     RateLimited {
-        /// Attempts made.
-        attempts: u32,
+        /// Every attempt's status, in order (the last is 429).
+        statuses: Vec<u16>,
     },
     /// Replay could not reproduce the recorded exchange (§2.9).
     #[error("replay diverged at model exchange {exchange}: {why}")]
@@ -280,8 +289,11 @@ pub struct ModelIdentity {
     pub profile_id: String,
     /// SHA-256 of the profile bytes (hex), when loaded from a file.
     pub profile_sha256: Option<String>,
-    /// Whether the profile carries a `profile check` stamp.
+    /// Whether the profile carries a `profile check` stamp valid for its
+    /// content (H1d review F-5).
     pub profile_validated: bool,
+    /// That stamp's digest, recorded with the flag.
+    pub profile_stamp_sha256: Option<String>,
     /// The API key's handle name, never its value (§5.5).
     pub api_key_handle: Option<String>,
 }

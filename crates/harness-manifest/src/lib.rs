@@ -214,6 +214,21 @@ impl CapId {
     }
 }
 
+/// A validated capability id is harness-vouched text (typed provenance for
+/// trusted journal fields, H1c review F-6).
+impl harness_core::TrustedName for CapId {
+    fn trusted_name(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A validated provider name is harness-vouched text.
+impl harness_core::TrustedName for ProviderName {
+    fn trusted_name(&self) -> &str {
+        &self.0
+    }
+}
+
 impl fmt::Display for CapId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -465,7 +480,7 @@ impl Limits {
 ///
 /// # Compile-fail: no field writes, even on a clone (review F-5)
 ///
-/// ```compile_fail
+/// ```compile_fail,E0616
 /// use harness_manifest::{builtin, Effect, SemVer, ValidationContext};
 /// let ctx = ValidationContext::new(SemVer { major: 0, minor: 0, patch: 1 }, &[]).unwrap();
 /// let m = builtin::manifest(&ctx).unwrap();

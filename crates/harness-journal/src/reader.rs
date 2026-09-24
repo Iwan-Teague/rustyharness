@@ -430,7 +430,10 @@ impl JournalReader {
     }
 
     /// [`JournalReader::open`], and the journal must belong to `run`.
-    pub fn open_expecting(attempt_dir: &Path, run: &crate::Ident) -> Result<Verified, ReadError> {
+    pub fn open_expecting(
+        attempt_dir: &Path,
+        run: &harness_core::RunId,
+    ) -> Result<Verified, ReadError> {
         let v = Self::open(attempt_dir)?;
         if v.run != run.as_str() {
             return Err(broken(0, BreakKind::WrongAttempt).into());

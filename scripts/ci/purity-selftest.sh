@@ -175,6 +175,78 @@ printf 'fn zz() { let _ = std::net::TcpStream::connect("x"); }\n' >>"$copy/crate
     fail "could not plant into wire.rs"
 expect_refusal "harness-model's pure wire.rs opens a socket" "pure sources name forbidden facilities"
 
+# --- H1e-1 plants --------------------------------------------------------------
+
+# H1d review F-3: a pure model file reaching a sibling I/O module.
+fresh
+printf 'fn zz() { let _ = crate::http::exchange; }\n' >>"$copy/crates/harness-model/src/wire.rs" ||
+    fail "could not plant into wire.rs"
+expect_refusal "pure wire.rs names crate::http" "a pure harness-model file reaches a non-pure module"
+fresh
+printf 'use crate::{profile::Profile as _P, client::OpenAiCompatible as _C};\n' \
+    >>"$copy/crates/harness-model/src/protocol.rs" || fail "could not plant into protocol.rs"
+expect_refusal "pure protocol.rs imports client in a use group" "a pure harness-model file reaches a non-pure module"
+fresh
+printf 'pub mod zz;\n' >>"$copy/crates/harness-model/src/lib.rs" || fail "could not plant a module"
+printf '' >"$copy/crates/harness-model/src/zz.rs" || fail "could not plant zz.rs"
+expect_refusal "an unclassified harness-model module" "is not classified as pure or I/O"
+
+# H1d review F-4: any crate outside harness-model's allowlist, whatever its name.
+fresh
+mkdir -p "$copy/crates/zz-extra/src" || fail "mkdir failed"
+printf '[package]\nname = "zz-innocuous"\nversion = "0.0.0"\nedition = "2021"\npublish = false\nlicense = "MIT"\n' \
+    >"$copy/crates/zz-extra/Cargo.toml" || fail "could not plant zz-innocuous"
+printf '' >"$copy/crates/zz-extra/src/lib.rs" || fail "could not plant zz-innocuous lib"
+awk '{ print } /^\[dependencies\]/ { print "zz-innocuous = { path = \"../zz-extra\" }" }' \
+    "$copy/crates/harness-model/Cargo.toml" >"$tmpdir/Cargo.toml.planted" ||
+    fail "awk failed planting a dependency"
+mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-model/Cargo.toml" || fail "mv failed"
+expect_refusal "harness-model depends on a crate outside its allowlist" "harness-model pulled in non-allowlisted crates"
+
+# H1c confirming review NF-1: a workspace feature that forwards to fault-injection.
+fresh
+awk '{ print } /^\[dependencies\]/ { print "harness-journal = { path = \"../harness-journal\" }" }' \
+    "$copy/crates/harness-cli/Cargo.toml" >"$tmpdir/Cargo.toml.planted" || fail "awk failed"
+mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-cli/Cargo.toml" || fail "mv failed"
+printf '\n[features]\nchaos = ["harness-journal/fault-injection"]\n' >>"$copy/crates/harness-cli/Cargo.toml" ||
+    fail "could not plant the chaos feature"
+expect_refusal "a chaos feature forwards to fault-injection" "a workspace feature forwards to harness-journal/fault-injection"
+# ... and the compile_error! that keeps it out of optimised builds.
+fresh
+awk '!/^compile_error!\(/ && !/test-only and refused in optimised builds"$/ && !/^\);$/' \
+    "$copy/crates/harness-journal/src/lib.rs" >"$tmpdir/lib.rs.planted" || fail "awk failed"
+mv "$tmpdir/lib.rs.planted" "$copy/crates/harness-journal/src/lib.rs" || fail "mv failed"
+grep -q 'compile_error' "$copy/crates/harness-journal/src/lib.rs" &&
+    fail "compile_error! plant did not land"
+expect_refusal "the fault-injection compile_error! removed" "an optimised build with harness-journal/fault-injection compiles"
+
+# H1a review N-3: the remaining name-scan gaps.
+n3_case() {
+    fresh
+    plant crates/harness-core/src/zz_plant.rs "$2"
+    expect_refusal "$1" "pure sources name forbidden facilities"
+}
+n3_case "a comment between path segments" 'fn f() { let _ = std::/*x*/fs::read("a"); }\n'
+n3_case "#[path] module" '#[path = "../../harness-journal/src/writer.rs"]\nmod w;\n'
+n3_case "include_str!" 'const X: &str = include_str!("lib.rs");\n'
+n3_case "env!" 'const X: &str = env!("HOME");\n'
+n3_case "macro_rules!" 'macro_rules! m { ($a:ident) => { std::$a::read("a") } }\n'
+n3_case "static global" 'static COUNTER: u32 = 0;\n'
+fresh
+plant crates/harness-core/src/zz_plant.rs 'pub enum /*c*/ RunOutcome { A }\n'
+expect_refusal "INV-28 with a comment inside" "INV-28"
+
+# H1c review F-6: TrustedName implemented outside the owning files.
+fresh
+plant crates/harness-tools/src/zz_plant.rs 'struct S(String);\nimpl harness_core::TrustedName for S { fn trusted_name(&self) -> &str { &self.0 } }\n'
+expect_refusal "TrustedName vouched for by an unlisted file" "TrustedName implemented outside the files that own"
+
+# H1a review N-6: a compile_fail doctest without its error code.
+fresh
+printf '/// ```compile_fail\n/// let x: u8 = "a";\n/// ```\npub fn zz() {}\n' >>"$copy/crates/harness-tools/src/lib.rs" ||
+    fail "could not plant a doctest"
+expect_refusal "compile_fail without an error code" "compile_fail doctests without an expected error code"
+
 # --- tool failures must fail closed -------------------------------------------
 mkdir "$tmpdir/shim" || fail "mkdir shim failed"
 cat >"$tmpdir/shim/cargo" <<EOF

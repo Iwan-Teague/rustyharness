@@ -133,6 +133,22 @@ printf '%s\n' harness-policy >>"$tmpdir/allowed-manifest-raw" || fail "printf fa
 sort -u "$tmpdir/allowed-manifest-raw" >"$tmpdir/allowed-policy" || fail "sort failed"
 refuse_intruders "$tmpdir/policy" "$tmpdir/allowed-policy" "harness-policy"
 
+# --- INV-24 / H1d review F-4: harness-model's dependency tree is allowlisted --
+# harness-model is the crate that talks to the network. Its normal tree may
+# contain only the reviewed crates below; anything else (a TLS stack, an HTTP
+# client, anything) fails here, whatever its name. The denylist that follows
+# stays as a second, clearer message for the well-known TLS names.
+tree_names "$tmpdir/model" harness-model
+grep -qxF harness-journal "$tmpdir/model" ||
+    fail "harness-model tree does not contain harness-journal (read the wrong tree?)"
+printf '%s\n' \
+    harness-model harness-core harness-journal gate-outcome \
+    serde serde_core serde_derive proc-macro2 quote syn unicode-ident \
+    serde_json itoa ryu memchr zmij thiserror thiserror-impl \
+    sha2 digest block-buffer hybrid-array typenum crypto-common cfg-if \
+    cpufeatures libc >"$tmpdir/allowed-model-raw"
+sort -u "$tmpdir/allowed-model-raw" >"$tmpdir/allowed-model" || fail "sort failed"
+
 # --- INV-24: no TLS in the default build ------------------------------------
 # The default build connects only to loopback over plain HTTP (design §3.2);
 # TLS arrives only with a future, off-by-default `hosted` feature. No crate
@@ -154,6 +170,7 @@ if [ -s "$tmpdir/tls-hits" ]; then
     fail "INV-24: TLS/HTTP-client crates in the default build:
 $(cat "$tmpdir/tls-hits")"
 fi
+refuse_intruders "$tmpdir/model" "$tmpdir/allowed-model" "harness-model"
 
 # --- test-only seams stay out of normal builds (H1c review F-3) -------------
 # harness-journal's `fault-injection` feature compiles a JournalFile that
@@ -171,6 +188,24 @@ grep -q 'harness-journal' "$tmpdir/feat-normal" ||
     fail "the normal feature tree does not name harness-journal (read nothing?)"
 if grep -qF 'fault-injection' "$tmpdir/feat-normal"; then
     fail "a normal dependency edge enables harness-journal/fault-injection"
+fi
+# H1c confirming review NF-1: `cargo tree` shows only ACTIVE features, so a
+# workspace feature that merely FORWARDS to fault-injection (e.g.
+# `chaos = ["harness-journal/fault-injection"]`) is invisible above. No
+# `[features]` table in the workspace may mention it, except the feature's
+# own definition in harness-journal.
+: >"$tmpdir/fwd-hits"
+for toml in crates/*/Cargo.toml; do
+    awk -v f="$toml" '
+        /^[ \t]*\[/ { sec = $0 }
+        sec ~ /^[ \t]*\[features\]/ && /fault-injection/ {
+            if (!(f ~ /harness-journal/ && $0 ~ /^[ \t]*fault-injection[ \t]*=[ \t]*\[[ \t]*\][ \t]*$/))
+                print f ": " $0
+        }' "$toml" >>"$tmpdir/fwd-hits" || fail "awk failed on $toml"
+done
+if [ -s "$tmpdir/fwd-hits" ]; then
+    fail "a workspace feature forwards to harness-journal/fault-injection:
+$(cat "$tmpdir/fwd-hits")"
 fi
 
 # --- shared: file lists and normalisation -----------------------------------
@@ -194,6 +229,30 @@ normalise() {
         fail "awk could not read $1"
     awk '{ gsub(/[ \t\r]+/, " "); gsub(/ ?:: ?/, "::"); print }' \
         "$tmpdir/joined" >"$2" || fail "awk could not normalise $1"
+}
+
+# strip_comments FILE OUT: the file with `//` line comments and (non-nested)
+# `/* */` block comments removed (H1a review N-3: `std::/*x*/fs` and
+# `enum /*c*/ RunOutcome` hid from the scans). A `//` inside a string
+# literal also cuts the rest of that line, so every scan runs on BOTH the
+# raw and the stripped text: neither form can hide from both.
+strip_comments() {
+    awk '
+    {
+        line = $0; out = ""
+        while (length(line) > 0) {
+            if (inb) {
+                i = index(line, "*/")
+                if (i == 0) { line = ""; break }
+                line = substr(line, i + 2); inb = 0; continue
+            }
+            a = index(line, "/*"); b = index(line, "//")
+            if (b > 0 && (a == 0 || b < a)) { out = out substr(line, 1, b - 1); line = ""; break }
+            if (a > 0) { out = out substr(line, 1, a - 1) " "; line = substr(line, a + 2); inb = 1; continue }
+            out = out line; line = ""
+        }
+        print out
+    }' "$1" >"$2" || fail "awk could not read $1 (stripping comments)"
 }
 
 # scan WHAT PATTERN NORMALISED FILE: record a hit if the ERE matches.
@@ -238,7 +297,10 @@ for must in crates/gate-outcome/src/lib.rs crates/harness-core/src/lib.rs \
 done
 : >"$tmpdir/hits"
 while IFS= read -r f; do
-    normalise "$f" "$tmpdir/norm"
+  strip_comments "$f" "$tmpdir/stripped"
+  normalise "$tmpdir/stripped" "$tmpdir/norm-code"
+  for view in raw code; do
+    if [ "$view" = raw ]; then normalise "$f" "$tmpdir/norm"; else cp "$tmpdir/norm-code" "$tmpdir/norm" || fail "cp failed"; fi
     # std::fs, ::std::io::stdout, std :: net ...
     scan "std path" "(^|$nb)std::$facility($nb|\$)" "$tmpdir/norm" "$f"
     # use std::{collections::HashMap, fs}; use std::{fs as f, net as n};
@@ -256,10 +318,83 @@ while IFS= read -r f; do
     scan "thread" "(^|$nb)thread::spawn($nb|\$)" "$tmpdir/norm" "$f"
     scan "async" "(^|$nb)async ?(fn|move|\{)" "$tmpdir/norm" "$f"
     scan "runtime crate" "(^|$nb)(tokio|mio|async_std)($nb|\$)" "$tmpdir/norm" "$f"
+  done
+  # Code-only scans (comments stripped, so prose mentioning the words is
+  # fine). H1a review N-3: module and file inclusion from elsewhere,
+  # compile-time reads, macros that could splice a forbidden path, and
+  # global state.
+  scan "#[path] module" "#\[ ?path ?=" "$tmpdir/norm-code" "$f"
+  scan "compile-time read" "(^|$nb)(include|include_str|include_bytes|env|option_env) ?!" "$tmpdir/norm-code" "$f"
+  scan "macro_rules" "(^|$nb)macro_rules ?!" "$tmpdir/norm-code" "$f"
+  scan "static item" "(^|[^A-Za-z0-9_'])static (mut )?[A-Za-z_]" "$tmpdir/norm-code" "$f"
 done <"$tmpdir/pure-files"
 if [ -s "$tmpdir/hits" ]; then
     fail "pure sources name forbidden facilities:
 $(cat "$tmpdir/hits")"
+fi
+
+
+# --- 2b. harness-model: pure files cannot reach I/O modules (H1d review F-3) -
+# The four pure model files share a crate with the socket code, so an I/O
+# path is one `crate::` away. Every module of harness-model must be
+# classified here, and the pure files may not name a non-pure one, through
+# `crate::`, `super::`, a `use crate::{…}` group, or `extern crate self`.
+model_pure='endpoint wire protocol profile'
+model_io='http client replay smoke scripted'
+grep -oE '^(pub(\(crate\))? )?mod [a-z_]+;' crates/harness-model/src/lib.rs >"$tmpdir/model-mods-raw" ||
+    fail "no module declarations found in harness-model/src/lib.rs (read nothing?)"
+awk '{ print $NF }' "$tmpdir/model-mods-raw" | tr -d ';' >"$tmpdir/model-mods" ||
+    fail "awk failed on the module list"
+while IFS= read -r m; do
+    case " $model_pure $model_io " in
+        *" $m "*) ;;
+        *) fail "harness-model module '$m' is not classified as pure or I/O in scripts/ci/purity.sh" ;;
+    esac
+done <"$tmpdir/model-mods"
+io_alt=$(printf '%s' "$model_io" | tr ' ' '|')
+: >"$tmpdir/hits"
+for f in crates/harness-model/src/endpoint.rs crates/harness-model/src/wire.rs \
+    crates/harness-model/src/protocol.rs crates/harness-model/src/profile.rs; do
+    for view in raw code; do
+        if [ "$view" = raw ]; then normalise "$f" "$tmpdir/norm"; else
+            strip_comments "$f" "$tmpdir/stripped"; normalise "$tmpdir/stripped" "$tmpdir/norm"; fi
+        scan "I/O sibling module" "(^|$nb)(crate|super|harness_model)::($io_alt)($nb|\$)" "$tmpdir/norm" "$f"
+        scan "I/O sibling module (group)" "(^|$nb)(crate|super)::\{([^;]*[^A-Za-z0-9_;])?($io_alt)($nb|\$)" "$tmpdir/norm" "$f"
+        scan "extern crate self" "(^|$nb)extern crate self($nb|\$)" "$tmpdir/norm" "$f"
+    done
+done
+if [ -s "$tmpdir/hits" ]; then
+    fail "a pure harness-model file reaches a non-pure module:
+$(cat "$tmpdir/hits")"
+fi
+
+# --- 2c. typed provenance: who may vouch for trusted journal text ------------
+# `harness_core::TrustedName` lets a type put text into a TRUSTED journal
+# field (H1c review F-6). Implementing it is a provenance claim, so it may
+# appear only in the files that own the vouched-for types.
+rust_files "$tmpdir/all-files" crates
+: >"$tmpdir/hits"
+while IFS= read -r f; do
+    case "$f" in
+        crates/harness-core/src/lib.rs|crates/harness-manifest/src/lib.rs|crates/harness-model/src/lib.rs) continue ;;
+    esac
+    strip_comments "$f" "$tmpdir/stripped"
+    normalise "$tmpdir/stripped" "$tmpdir/norm"
+    scan "TrustedName impl" "(^|$nb)impl[^{;]*TrustedName for($nb|\$)" "$tmpdir/norm" "$f"
+done <"$tmpdir/all-files"
+if [ -s "$tmpdir/hits" ]; then
+    fail "TrustedName implemented outside the files that own vouched-for types:
+$(cat "$tmpdir/hits")"
+fi
+
+# --- 2d. compile-fail doctests pin their reason (H1a review N-6) -------------
+# Every compile_fail doctest names its expected error code; gates.sh runs the
+# doctests with RUSTC_BOOTSTRAP=1 so rustdoc enforces the codes.
+grep -rn '```compile_fail' crates >"$tmpdir/cf" || fail "no compile_fail doctests found (read nothing?)"
+grep -vE '```compile_fail,E[0-9]{4}' "$tmpdir/cf" >"$tmpdir/cf-bad" || true
+if [ -s "$tmpdir/cf-bad" ]; then
+    fail "compile_fail doctests without an expected error code:
+$(cat "$tmpdir/cf-bad")"
 fi
 
 # --- 3. INV-28: exactly one outcome type -----------------------------------
@@ -272,10 +407,38 @@ while IFS= read -r f; do
     normalise "$f" "$tmpdir/norm"
     # Prefix match on purpose: `enum RunOutcomeKind` is refused too.
     scan "INV-28" "(^|$nb)enum [A-Za-z0-9_]*(Outcome|Verdict)" "$tmpdir/norm" "$f"
+    # And with comments stripped (`enum /*c*/ RunOutcome`, H1a review N-3).
+    strip_comments "$f" "$tmpdir/stripped"
+    normalise "$tmpdir/stripped" "$tmpdir/norm"
+    scan "INV-28" "(^|$nb)enum [A-Za-z0-9_]*(Outcome|Verdict)" "$tmpdir/norm" "$f"
 done <"$tmpdir/harness-files"
 if [ -s "$tmpdir/hits" ]; then
     fail "INV-28: verdict enums must live in gate-outcome, not harness-*:
 $(cat "$tmpdir/hits")"
 fi
+
+# --- 4. no optimised build contains the journal's test seams (H1c NF-1) ------
+# harness-journal has a compile_error! for `fault-injection` without debug
+# assertions. Check that it FIRES (content, not presence of the line) by
+# expanding the crate root with rustc directly: macro expansion reports the
+# compile_error! before any dependency is resolved, so this needs no build,
+# and nothing is cached between runs (a cached `cargo check` could report a
+# stale result for a tree copied with old mtimes). Control: with debug
+# assertions on (test builds) it must NOT fire.
+command -v rustc >/dev/null 2>&1 || fail "rustc not found on PATH"
+fi_check() {
+    rustc --edition 2021 --crate-type lib --crate-name harness_journal \
+        --cfg 'feature="fault-injection"' -C "debug-assertions=$1" --emit=metadata \
+        -o "$tmpdir/fi.rmeta" crates/harness-journal/src/lib.rs >"$tmpdir/fi-$1" 2>&1 || true
+    grep -c "test-only and refused in optimised builds" "$tmpdir/fi-$1" >"$tmpdir/fi-count" || true
+    read -r fi_n <"$tmpdir/fi-count" || fi_n=0
+}
+fi_check off
+[ "${fi_n:-0}" -gt 0 ] ||
+    fail "an optimised build with harness-journal/fault-injection compiles (the compile_error! is gone):
+$(cat "$tmpdir/fi-off")"
+fi_check on
+[ "${fi_n:-0}" -eq 0 ] ||
+    fail "the fault-injection compile_error! also fires with debug assertions on (tests would break)"
 
 printf 'purity gate OK: dependency shape, pure-content, INV-28 all clean.\n'

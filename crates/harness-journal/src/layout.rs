@@ -5,10 +5,43 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use harness_core::RunId;
+
 /// The journal file in an attempt directory.
 pub const JOURNAL_FILE: &str = "journal.jsonl";
 /// The blob store in an attempt directory.
 pub const BLOBS_DIR: &str = "blobs";
+
+/// `state_root/runs/<run-id>` (design §2.8). The id is a [`RunId`]: 32
+/// lowercase hex characters, never `.`, `..` or a path (NF-3).
+pub fn run_dir(state_root: &Path, run: &RunId) -> PathBuf {
+    state_root.join("runs").join(run.as_str())
+}
+
+/// Create `state_root/runs/<run-id>` durably: `runs/` is created if absent
+/// (and `state_root` fsynced), the run directory is created with
+/// `create_dir` (it must not exist), and `runs/` is fsynced so the new entry
+/// survives a crash (the H1c F-1 rule, applied one level up). Neither
+/// `runs/` nor the run directory may be a symlink.
+pub fn create_run_dir(state_root: &Path, run: &RunId) -> io::Result<PathBuf> {
+    let runs = state_root.join("runs");
+    match fs::create_dir(&runs) {
+        Ok(()) => crate::writer::sync_dir(state_root)?,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let m = fs::symlink_metadata(&runs)?;
+    if m.file_type().is_symlink() || !m.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runs/ is not a real directory",
+        ));
+    }
+    let dir = runs.join(run.as_str());
+    fs::create_dir(&dir)?;
+    crate::writer::sync_dir(&runs)?;
+    Ok(dir)
+}
 
 /// `attempt-<n>` under `run_dir`.
 pub fn attempt_dir(run_dir: &Path, n: u32) -> PathBuf {

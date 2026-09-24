@@ -13,6 +13,14 @@
 //! - The API key (§5.5) lives only in this process: it is written into the
 //!   `Authorization` header and nowhere else. `Debug`, errors and the
 //!   journal identity carry its handle name, never its value.
+//!
+//! The socket-level HTTP client is crate-private (H1d review F-1): the only
+//! way to reach a server is [`OpenAiCompatible`], whose constructor checks
+//! that the endpoint is loopback (INV-24).
+//!
+//! ```compile_fail,E0603
+//! let _ = harness_model::http::exchange;
+//! ```
 
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -22,7 +30,8 @@ use harness_core::strict_json;
 use serde_json::Value;
 
 use crate::endpoint::{Endpoint, EndpointRefused, LoopbackHost};
-use crate::http::{exchange, HttpError, HttpLimits};
+pub use crate::http::HttpLimits;
+use crate::http::{exchange, HttpError};
 use crate::profile::Profile;
 use crate::wire::{parse_json_reply, parse_sse_reply, render_request};
 use crate::{
@@ -273,6 +282,7 @@ impl ModelBackend for OpenAiCompatible {
             profile_id: self.profile.id().to_owned(),
             profile_sha256: self.profile.sha256().map(|d| d.to_string()),
             profile_validated: self.profile.validated(),
+            profile_stamp_sha256: self.profile.stamp_sha256().map(str::to_owned),
             api_key_handle: self.key.as_ref().map(|k| k.handle.clone()),
         }
     }
@@ -289,21 +299,20 @@ impl ModelBackend for OpenAiCompatible {
                 Attempt::Retryable(s) => s,
             };
             retried.push(status);
-            let attempts = attempt + 1;
-            let give_up = |s: u16| {
+            let give_up = |s: u16, statuses: Vec<u16>| {
                 if s == 429 {
-                    ModelError::RateLimited { attempts }
+                    ModelError::RateLimited { statuses }
                 } else {
-                    ModelError::Unavailable(Unavailable::Status { code: s, attempts })
+                    ModelError::Unavailable(Unavailable::Status { code: s, statuses })
                 }
             };
             if attempt >= self.config.retry.max_retries {
-                return Err(give_up(status));
+                return Err(give_up(status, retried));
             }
             let wait = Duration::from_millis(backoff_ms(&self.config.retry, attempt));
             match deadline.checked_duration_since(Instant::now()) {
                 Some(left) if left > wait => std::thread::sleep(wait),
-                _ => return Err(give_up(status)),
+                _ => return Err(give_up(status, retried)),
             }
             attempt += 1;
         }

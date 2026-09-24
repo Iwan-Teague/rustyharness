@@ -636,3 +636,29 @@ fn inv_25_effective_confirmation_is_never_below_any_floor() {
         }
     }
 }
+
+// H1c review F-7: the digest is computed from the authorised call itself.
+#[test]
+fn the_call_digest_is_computed_from_the_authorised_call() {
+    use harness_core::CallDigest;
+    let s = read_all();
+    let a = s
+        .authorize(call("harness.fs.read", json!({"path": "a", "lines": 5})))
+        .unwrap();
+    let b = s
+        .authorize(call("harness.fs.read", json!({"lines": 5, "path": "a"})))
+        .unwrap();
+    let c = s
+        .authorize(call("harness.fs.read", json!({"path": "b", "lines": 5})))
+        .unwrap();
+    assert_eq!(a.call_digest(), b.call_digest(), "key order is canonical");
+    assert_ne!(
+        a.call_digest(),
+        c.call_digest(),
+        "different arguments, different digest"
+    );
+    assert_eq!(
+        a.call_digest(),
+        harness_core::sha256(br#"{"args":{"lines":5,"path":"a"},"capability":"harness.fs.read"}"#)
+    );
+}

@@ -97,7 +97,7 @@ mod tests {
         let mut s = StandingConditions::default();
         let q = Condition {
             kind: ConditionKind::Quarantined,
-            key: Ident::new("fixture.item.read").unwrap(),
+            key: Ident::of("fixture.item.read").unwrap(),
         };
         assert!(s.observe(&q, false).is_none(), "inactive and unchanged");
         let enter = s.observe(&q, true).expect("entry is journaled");
@@ -123,11 +123,11 @@ mod tests {
         let mut s = StandingConditions::default();
         let a = Condition {
             kind: ConditionKind::SandboxUnavailable,
-            key: Ident::new("userns-disabled").unwrap(),
+            key: Ident::of("userns-disabled").unwrap(),
         };
         let b = Condition {
             kind: ConditionKind::BudgetAbove80,
-            key: Ident::new("tokens").unwrap(),
+            key: Ident::of("tokens").unwrap(),
         };
         assert!(s.observe(&a, true).is_some());
         assert!(s.observe(&b, true).is_some());

@@ -49,6 +49,85 @@ pub fn sha256_parts(parts: &[&[u8]]) -> Digest {
     Digest::from_bytes(out)
 }
 
+/// A run identity (design §2.8): 128 bits, time-ordered then random,
+/// written as exactly 32 lowercase hex characters. Its own strict type
+/// (H1c confirming review NF-3): a run id becomes a directory name under
+/// `state_root/runs/`, so it can never be `.`, `..`, contain a separator or
+/// start with `.` or `-`; the grammar makes all of those impossible.
+///
+/// Pure: the caller supplies the time and the randomness.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RunId(String);
+
+impl RunId {
+    /// Build from a Unix-millisecond timestamp (the high 48 bits, so ids
+    /// sort by creation time) and 80 random bits.
+    pub fn new(unix_ms: u64, random: [u8; 10]) -> Self {
+        let mut s = format!("{:012x}", unix_ms & 0xFFFF_FFFF_FFFF);
+        for b in random {
+            s.push_str(&format!("{b:02x}"));
+        }
+        Self(s)
+    }
+
+    /// Parse an existing id: exactly 32 lowercase hex characters.
+    pub fn parse(s: &str) -> Option<Self> {
+        let ok = s.len() == 32 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        ok.then(|| Self(s.to_owned()))
+    }
+
+    /// The id.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RunId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A value whose text the harness vouches for: it was minted by the harness
+/// or validated against a closed grammar the harness owns (H1c review F-6,
+/// typed provenance). The journal accepts runtime text into a TRUSTED
+/// record field only through a type implementing this trait
+/// (`harness_journal::Ident::from_trusted`).
+///
+/// Implementing it is a provenance claim, reviewed like code: the purity
+/// gate refuses `impl … TrustedName for` anywhere except the files that own
+/// the types below (`scripts/ci/purity.sh`).
+pub trait TrustedName {
+    /// The vouched-for text.
+    fn trusted_name(&self) -> &str;
+}
+
+impl TrustedName for RunId {
+    fn trusted_name(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The digest of a call, computed from the call itself (H1c review F-7): the
+/// journal's write-ahead intent records `call_digest()` of the very value it
+/// then hands back as `Journaled`, so an intent always describes the call it
+/// authorises. Implemented by `harness_policy::Authorized<Call>` over the
+/// call's canonical JSON.
+pub trait CallDigest {
+    /// SHA-256 of the call's canonical form.
+    fn call_digest(&self) -> Digest;
+}
+
+/// A monotonic clock (F-10.9): the [`Meter`] reads wall time itself from
+/// one of these, so no caller can assert how much time was spent. The run
+/// driver passes the real one (the standard monotonic clock, outside this
+/// pure crate); tests pass a manual one.
+pub trait MonoClock {
+    /// Time since an arbitrary fixed origin. Must never go backwards; if it
+    /// does, the meter charges nothing for that tick (it never un-spends).
+    fn now(&self) -> Duration;
+}
+
 /// Data that crossed a trust boundary into the harness: tool output, file
 /// contents, test logs, web pages, model completions.
 ///
@@ -58,7 +137,7 @@ pub fn sha256_parts(parts: &[&[u8]]) -> Digest {
 ///
 /// # INV-2 (compile-fail): no `Deref` coercion out of `Untrusted`
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use harness_core::{Source, Untrusted};
 /// let u = Untrusted::new(String::from("secret"), Source::Model);
 /// let leaked: &String = &u;
@@ -267,6 +346,9 @@ pub struct Meter {
     format_errors_total: u64,
     repair_rounds_used: u32,
     exhaustion: Option<Exhausted>,
+    clock: Box<dyn MonoClock>,
+    last_tick: Duration,
+    paused: bool,
 }
 
 impl fmt::Debug for Meter {
@@ -284,16 +366,23 @@ impl fmt::Debug for Meter {
             .field("format_errors_total", &self.format_errors_total)
             .field("repair_rounds_used", &self.repair_rounds_used)
             .field("exhaustion", &self.exhaustion)
-            .finish()
+            .field("paused", &self.paused)
+            .finish_non_exhaustive()
     }
 }
 
 impl Meter {
     /// A meter with explicit limits for all six dimensions and the profile's
     /// price table, bound once here so no later call can declare an exchange
-    /// free. `None` means a local model that costs nothing.
-    pub fn new(limits: MeterLimits, pricing: Option<Pricing>) -> Self {
+    /// free. `None` means a local model that costs nothing. `clock` is the
+    /// monotonic clock wall time is read from (F-10.9); the meter starts
+    /// measuring at construction.
+    pub fn new(limits: MeterLimits, pricing: Option<Pricing>, clock: Box<dyn MonoClock>) -> Self {
+        let last_tick = clock.now();
         Self {
+            clock,
+            last_tick,
+            paused: false,
             limits,
             pricing,
             spent_steps: 0,
@@ -372,17 +461,36 @@ impl Meter {
         self.check_renewable_exhaustion()
     }
 
-    /// Charge wall-clock time spent WORKING (design §2.4).
-    ///
-    /// Approval waits are excluded by NOT ticking through them. Saturates at
-    /// [`Duration::MAX`] rather than panicking; the wall check below still
-    /// trips.
-    pub fn tick_wall(&mut self, dt: Duration) -> Result<(), StopCause> {
+    /// Charge the wall-clock time spent WORKING since the last tick (design
+    /// §2.4), read from the meter's own clock (F-10.9: no caller-supplied
+    /// delta). While paused (an approval wait) time passes uncharged. A
+    /// clock that went backwards charges nothing; saturates at
+    /// [`Duration::MAX`] rather than panicking.
+    pub fn tick_wall(&mut self) -> Result<(), StopCause> {
         if let Some(cause) = self.latched() {
             return Err(cause);
         }
-        self.elapsed = self.elapsed.checked_add(dt).unwrap_or(Duration::MAX);
+        let now = self.clock.now();
+        if !self.paused {
+            let dt = now.saturating_sub(self.last_tick);
+            self.elapsed = self.elapsed.checked_add(dt).unwrap_or(Duration::MAX);
+        }
+        self.last_tick = now.max(self.last_tick);
         self.check_renewable_exhaustion()
+    }
+
+    /// Start an approval wait (§2.4: excluded from the wall budget). Charges
+    /// the time worked up to now first.
+    pub fn pause_wall(&mut self) -> Result<(), StopCause> {
+        let r = self.tick_wall();
+        self.paused = true;
+        r
+    }
+
+    /// End an approval wait; time counts again from now.
+    pub fn resume_wall(&mut self) {
+        self.last_tick = self.clock.now().max(self.last_tick);
+        self.paused = false;
     }
 
     /// Re-check the renewable dimensions in §2.4 table order
@@ -610,9 +718,12 @@ const DENIAL_LIMIT: u32 = 3;
 /// Two rules keep the detectors honest against interleaving:
 ///
 /// - The identical-action notice is remembered PER `(tool, args digest)`
-///   key, and cleared only when that key falls below the threshold in the
-///   window. Other actions in between do not reset it, so an action repeated
-///   every other step is noticed once and then stopped.
+///   key FOR THE WHOLE RUN (the burst rule, design §2.6, H1a review N-1):
+///   the first time a key reaches the threshold in the window it gets the
+///   one notice; the next time it reaches the threshold — in the same burst
+///   or any later one, whatever came in between — the run stops with
+///   `Loop(Repeat)`. Episodes do not reset. The set grows by at most one key
+///   per action, bounded by the step budget.
 /// - "New" observation and tree digests mean never seen before in this run,
 ///   not merely different from the last one. Alternating between two
 ///   already-seen digests is not progress. The seen sets grow by at most one
@@ -715,11 +826,7 @@ impl LoopDetector {
         while self.window.len() > IDENTICAL_WINDOW {
             self.window.pop_front();
         }
-        // A key whose repeats have left the window has cleared: a future
-        // episode of THAT key may Notice again. Other keys keep their state.
-        let window = &self.window;
-        self.repeat_noticed
-            .retain(|noticed| window.iter().filter(|e| *e == noticed).count() >= IDENTICAL_LIMIT);
+        // A noticed key stays noticed for the whole run (burst rule, §2.6).
         let key = (tool, args_digest);
         let count = self.window.iter().filter(|entry| *entry == &key).count();
         if count < IDENTICAL_LIMIT {
@@ -743,6 +850,128 @@ impl LoopDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// A manual monotonic clock for tests.
+    #[derive(Clone, Default)]
+    struct ManualClock(Rc<Cell<Duration>>);
+
+    impl ManualClock {
+        fn advance(&self, d: Duration) {
+            self.0.set(self.0.get() + d);
+        }
+        fn set(&self, d: Duration) {
+            self.0.set(d);
+        }
+    }
+
+    impl MonoClock for ManualClock {
+        fn now(&self) -> Duration {
+            self.0.get()
+        }
+    }
+
+    fn meter(limits: MeterLimits, pricing: Option<Pricing>) -> Meter {
+        Meter::new(limits, pricing, Box::new(ManualClock::default()))
+    }
+
+    // F-10.9: no caller can assert a delta; a clock that goes backwards
+    // charges nothing and never un-spends.
+    #[test]
+    fn tick_wall_measures_its_own_clock_and_never_goes_backwards() {
+        let clock = ManualClock::default();
+        clock.set(Duration::from_secs(50));
+        let mut m = Meter::new(
+            MeterLimits {
+                steps: 50,
+                tokens: u64::MAX,
+                wall: Duration::from_secs(100),
+                cost_micros: u64::MAX,
+                format_errors: 3,
+                repair_rounds: 1,
+            },
+            None,
+            Box::new(clock.clone()),
+        );
+        assert!(m.tick_wall().is_ok());
+        assert_eq!(m.elapsed(), Duration::ZERO, "construction starts the clock");
+        clock.advance(Duration::from_secs(7));
+        assert!(m.tick_wall().is_ok());
+        assert_eq!(m.elapsed(), Duration::from_secs(7));
+        clock.set(Duration::from_secs(1)); // backwards
+        assert!(m.tick_wall().is_ok());
+        assert_eq!(m.elapsed(), Duration::from_secs(7));
+        clock.set(Duration::from_secs(60)); // forward again, from the high-water mark
+        assert!(m.tick_wall().is_ok());
+        assert_eq!(m.elapsed(), Duration::from_secs(10));
+    }
+
+    // H1a confirming review N-1: bursts of an identical action separated by
+    // fillers used to get a fresh notice each time (30 bursts, 30 notices,
+    // no stop). The burst rule: one notice per key per run, then Stop.
+    #[test]
+    fn repeated_bursts_of_one_action_stop_on_the_second_burst() {
+        let mut d = LoopDetector::new();
+        let key = Digest::from_bytes([7; 32]);
+        let mut notices = 0;
+        let mut stop_at = None;
+        'bursts: for burst in 0..30u8 {
+            for _ in 0..3 {
+                match d.observe(LoopEvent::Action {
+                    tool: "harness.fs.read".into(),
+                    args_digest: key,
+                }) {
+                    LoopSignal::Notice(_) => notices += 1,
+                    LoopSignal::Stop(k) => {
+                        stop_at = Some((burst, k));
+                        break 'bursts;
+                    }
+                    LoopSignal::Quiet => {}
+                }
+            }
+            for i in 0..4u8 {
+                d.observe(LoopEvent::Action {
+                    tool: "harness.fs.list".into(),
+                    args_digest: Digest::from_bytes([burst.wrapping_mul(8).wrapping_add(i); 32]),
+                });
+                d.observe(LoopEvent::Observation {
+                    digest: Digest::from_bytes([burst.wrapping_mul(8).wrapping_add(i) ^ 0xff; 32]),
+                });
+            }
+        }
+        assert_eq!(notices, 1, "one notice per key per run");
+        assert_eq!(
+            stop_at,
+            Some((1, LoopKind::Repeat)),
+            "stopped in the second burst"
+        );
+    }
+
+    #[test]
+    fn run_ids_are_strict_and_time_ordered() {
+        let a = RunId::new(1_000, [0xab; 10]);
+        let b = RunId::new(2_000, [0x00; 10]);
+        assert_eq!(a.as_str().len(), 32);
+        assert!(a < b, "time-ordered");
+        assert_eq!(RunId::parse(a.as_str()), Some(a.clone()));
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "-rf",
+            ".hidden",
+            "a/b",
+            "a\\b",
+            "00000000000000000000000000000000x",
+            "0000000000000000000000000000000",
+            "0000000000000000000000000000000G",
+            "0000000000000000000000000000000A",
+        ] {
+            assert!(RunId::parse(bad).is_none(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn sha256_matches_the_fips_vectors() {
@@ -777,7 +1006,7 @@ mod tests {
 
     #[test]
     fn meter_steps_budget_is_self_measured() {
-        let mut m = Meter::new(
+        let mut m = meter(
             MeterLimits {
                 steps: 2,
                 tokens: u64::MAX,
@@ -820,7 +1049,7 @@ mod tests {
 
     #[test]
     fn meter_tokens_falls_back_to_byte_estimate_and_marks_it() {
-        let mut m = Meter::new(limits(u64::MAX, u64::MAX), None);
+        let mut m = meter(limits(u64::MAX, u64::MAX), None);
         // No server usage: 300 prompt bytes → 100 input tokens, 900 reply
         // bytes → 300 output tokens.
         assert!(m.record_tokens(None, 300, 900).is_ok());
@@ -846,7 +1075,7 @@ mod tests {
 
     #[test]
     fn meter_token_estimate_counts_the_prompt_and_rounds_up() {
-        let mut m = Meter::new(limits(u64::MAX, u64::MAX), None);
+        let mut m = meter(limits(u64::MAX, u64::MAX), None);
         // 1 and 2 bytes are one token each, never zero.
         assert!(m.record_tokens(None, 1, 2).is_ok());
         assert_eq!(m.tokens_spent(), (1, 1));
@@ -859,7 +1088,7 @@ mod tests {
         // A server that never reports usage cannot run past the Tokens
         // budget: the prompt is charged, and tiny replies are not rounded
         // away.
-        let mut m = Meter::new(limits(1000, u64::MAX), None);
+        let mut m = meter(limits(1000, u64::MAX), None);
         let mut accepted = 0;
         let mut stop = None;
         for _ in 0..40 {
@@ -886,7 +1115,7 @@ mod tests {
 
     #[test]
     fn meter_tokens_budget_latches_on_reported_usage() {
-        let mut m = Meter::new(limits(100, u64::MAX), None);
+        let mut m = meter(limits(100, u64::MAX), None);
         let usage = TokenUsage {
             input: 60,
             output: 40,
@@ -914,10 +1143,7 @@ mod tests {
         );
         // Latched: every later charge of any kind returns the same cause.
         assert_eq!(m.charge_step(), Err(StopCause::Budget(BudgetDim::Tokens)));
-        assert_eq!(
-            m.tick_wall(Duration::from_secs(1)),
-            Err(StopCause::Budget(BudgetDim::Tokens))
-        );
+        assert_eq!(m.tick_wall(), Err(StopCause::Budget(BudgetDim::Tokens)));
     }
 
     #[test]
@@ -926,7 +1152,7 @@ mod tests {
             input_micros_per_token: 5,
             output_micros_per_token: 7,
         };
-        let mut m = Meter::new(limits(u64::MAX, 150), Some(pricing));
+        let mut m = meter(limits(u64::MAX, 150), Some(pricing));
         // 10 input × 5 + 20 output × 7 = 190 > 150 → Budget(Cost).
         assert_eq!(
             m.record_tokens(
@@ -942,11 +1168,11 @@ mod tests {
         assert_eq!(m.cost_spent(), 190);
         // Estimated tokens are priced too: 3 prompt bytes + 3 reply bytes =
         // 1 + 1 tokens = 12 micros.
-        let mut est = Meter::new(limits(u64::MAX, u64::MAX), Some(pricing));
+        let mut est = meter(limits(u64::MAX, u64::MAX), Some(pricing));
         assert!(est.record_tokens(None, 3, 3).is_ok());
         assert_eq!(est.cost_spent(), 12);
         // No pricing = local model: cost stays 0, no latch.
-        let mut local = Meter::new(limits(u64::MAX, 0), None);
+        let mut local = meter(limits(u64::MAX, 0), None);
         assert!(local
             .record_tokens(
                 Some(TokenUsage {
@@ -962,6 +1188,7 @@ mod tests {
 
     #[test]
     fn meter_wall_is_only_advanced_by_tick_wall() {
+        let clock = ManualClock::default();
         let mut m = Meter::new(
             MeterLimits {
                 steps: 50,
@@ -972,14 +1199,26 @@ mod tests {
                 repair_rounds: 1,
             },
             None,
+            Box::new(clock.clone()),
         );
-        // Approval waits never tick: nothing else can advance time (INV-14).
-        assert!(m.tick_wall(Duration::from_secs(4)).is_ok());
-        assert!(m.tick_wall(Duration::from_secs(4)).is_ok());
-        assert_eq!(
-            m.tick_wall(Duration::from_secs(4)),
-            Err(StopCause::Budget(BudgetDim::Wall))
+        // The meter reads its own clock (F-10.9); an approval wait is
+        // excluded by pausing (INV-14).
+        clock.advance(Duration::from_secs(4));
+        assert!(m.tick_wall().is_ok());
+        assert!(m.pause_wall().is_ok());
+        clock.advance(Duration::from_secs(100)); // a long approval wait
+        assert!(
+            m.tick_wall().is_ok(),
+            "a tick during the wait charges nothing"
         );
+        assert_eq!(m.elapsed(), Duration::from_secs(4));
+        m.resume_wall();
+        assert!(m.tick_wall().is_ok());
+        assert_eq!(m.elapsed(), Duration::from_secs(4));
+        clock.advance(Duration::from_secs(4));
+        assert!(m.tick_wall().is_ok());
+        clock.advance(Duration::from_secs(4));
+        assert_eq!(m.tick_wall(), Err(StopCause::Budget(BudgetDim::Wall)));
         assert_eq!(
             m.first_exhaustion(),
             Some(&Exhausted {
@@ -992,7 +1231,7 @@ mod tests {
 
     #[test]
     fn meter_format_errors_stop_on_three_consecutive() {
-        let mut m = Meter::new(
+        let mut m = meter(
             MeterLimits {
                 steps: 50,
                 tokens: u64::MAX,
@@ -1018,7 +1257,7 @@ mod tests {
 
     #[test]
     fn meter_repair_rounds_exhaustion_is_not_a_stop() {
-        let mut m = Meter::new(
+        let mut m = meter(
             MeterLimits {
                 steps: 50,
                 tokens: u64::MAX,
@@ -1059,7 +1298,7 @@ mod tests {
     }
 
     #[test]
-    fn detector_repeat_window_expires_after_six_steps() {
+    fn detector_repeat_window_expires_after_six_steps_but_the_notice_is_per_run() {
         let mut d = LoopDetector::new();
         let action = || LoopEvent::Action {
             tool: "fs.write".to_string(),
@@ -1078,15 +1317,12 @@ mod tests {
         // ...and a NEW observation keeps the no-progress counter quiet so the
         // repeat machinery is the thing under test.
         d.observe(LoopEvent::Observation { digest: D3 });
-        // Three more identical hits are a fresh episode: Notice first.
+        // The window expired: two more hits are below the threshold again.
         assert_eq!(d.observe(action()), LoopSignal::Quiet);
         assert_eq!(d.observe(action()), LoopSignal::Quiet);
-        assert_eq!(
-            d.observe(action()),
-            LoopSignal::Notice(LoopNotice::IdenticalAction {
-                tool: "fs.write".to_string()
-            })
-        );
+        // The third reaches it again; this key was already noticed in this
+        // run, so the burst rule (§2.6, N-1) stops instead of noticing anew.
+        assert_eq!(d.observe(action()), LoopSignal::Stop(LoopKind::Repeat));
     }
 
     #[test]
@@ -1321,7 +1557,7 @@ mod tests {
     #[test]
     fn scripted_model_that_always_wants_another_step_hits_budget_steps() {
         // The §1.3 proof-of-life: a run loop bounded by Meter, not by trust.
-        let mut meter = Meter::new(
+        let mut meter = meter(
             MeterLimits {
                 steps: 5,
                 tokens: u64::MAX,

@@ -535,7 +535,7 @@ pub enum IndeterminateKind {
 ///
 /// # INV-4 (compile-fail): no literal Witness construction
 ///
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// let w = gate_outcome::Witness {
 ///     checked: 3,
 ///     digest: gate_outcome::Digest::from_bytes([0u8; 32]),
@@ -544,7 +544,7 @@ pub enum IndeterminateKind {
 ///
 /// # INV-4 (compile-fail): no public Witness constructor
 ///
-/// ```compile_fail
+/// ```compile_fail,E0624
 /// let w = gate_outcome::Witness::from_run_checked(
 ///     3,
 ///     gate_outcome::Digest::from_bytes([0u8; 32]),
@@ -556,7 +556,7 @@ pub enum IndeterminateKind {
 /// A witness minted for one report cannot be transplanted onto another by
 /// assignment: the report's fields are private.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0616
 /// fn transplant(mut other: gate_outcome::GateReport, good: &gate_outcome::GateReport) {
 ///     other.outcome = good.outcome().clone();
 /// }
@@ -613,7 +613,7 @@ impl serde::Serialize for GateOutcome {
 ///
 /// # Compile-fail: no struct-literal reports
 ///
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// let r = gate_outcome::GateReport {
 ///     gate: gate_outcome::GateId::new("g").unwrap(),
 ///     outcome: gate_outcome::GateOutcome::Failed,
@@ -625,7 +625,7 @@ impl serde::Serialize for GateOutcome {
 ///
 /// # Compile-fail: no pushing findings onto a built report
 ///
-/// ```compile_fail
+/// ```compile_fail,E0616
 /// fn add(r: &mut gate_outcome::GateReport, f: gate_outcome::Finding) {
 ///     r.findings.push(f);
 /// }

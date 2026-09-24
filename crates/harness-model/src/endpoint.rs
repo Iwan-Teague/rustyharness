@@ -80,6 +80,11 @@ impl Endpoint {
             "[::1]" => LoopbackHost::V6,
             _ => return Err(EndpointRefused::NotLoopback),
         };
+        // No percent-encoding in the base path: `%2e%2e` and `%0d%0a` would
+        // reach the request line raw (H1d review F-7).
+        if path.contains('%') {
+            return Err(EndpointRefused::Malformed("percent-encoding in the path"));
+        }
         let base_path = path.trim_end_matches('/').to_owned();
         if base_path.split('/').any(|seg| seg == ".." || seg == ".") {
             return Err(EndpointRefused::Malformed("dot segments in the path"));
@@ -120,7 +125,13 @@ fn split_host_port(authority: &str) -> Result<(&str, u16), EndpointRefused> {
     let port = match port {
         None => 80,
         Some(p) => {
-            if p.is_empty() || p.len() > 5 || !p.bytes().all(|b| b.is_ascii_digit()) {
+            // Canonical decimal only: no leading zero (`:080`), so a port
+            // has exactly one spelling (H1d review F-7).
+            if p.is_empty()
+                || p.len() > 5
+                || !p.bytes().all(|b| b.is_ascii_digit())
+                || (p.len() > 1 && p.starts_with('0'))
+            {
                 return Err(bad);
             }
             match p.parse::<u16>() {
@@ -184,6 +195,10 @@ mod tests {
             "http://127.0.0.1/v 1",
             "http://127.0.0.1/v1\r\nHost: x",
             "http://[::1/v1",
+            "http://127.0.0.1:080/v1",
+            "http://127.0.0.1:08080/v1",
+            "http://127.0.0.1/v1/%2e%2e/x",
+            "http://127.0.0.1/v1%0d%0aHost:x",
         ] {
             assert!(
                 matches!(Endpoint::parse(bad), Err(EndpointRefused::Malformed(_))),

@@ -216,6 +216,11 @@ fn parse_head(lines: &[Vec<u8>]) -> Result<(u16, Framing, Option<String>), HttpE
         let value = value.trim();
         match name.to_ascii_lowercase().as_str() {
             "content-length" => {
+                // Digits only: `usize::from_str` would accept a leading `+`
+                // (H1d review F-7).
+                if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(m("content-length"));
+                }
                 let n: usize = value.parse().map_err(|_| m("content-length"))?;
                 if length.is_some_and(|l| l != n) {
                     return Err(m("conflicting content-length"));
@@ -431,6 +436,9 @@ mod tests {
             "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5",
             "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6",
             "HTTP/1.1 200 OK\r\nContent-Length: -1",
+            "HTTP/1.1 200 OK\r\nContent-Length: +5",
+            "HTTP/1.1 200 OK\r\nContent-Length: 0x5",
+            "HTTP/1.1 200 OK\r\nContent-Length: ",
             "HTTP/1.1 200 OK\r\nNoColon",
             "HTTP/1.1 200 OK\r\n Folded: x",
         ] {

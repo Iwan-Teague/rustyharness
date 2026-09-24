@@ -400,6 +400,12 @@ mod tests {
 
     #[test]
     fn three_format_errors_in_a_row_stop_the_run() {
+        struct Still;
+        impl harness_core::MonoClock for Still {
+            fn now(&self) -> std::time::Duration {
+                std::time::Duration::ZERO
+            }
+        }
         use harness_core::{MeterLimits, StopCause};
         let mut m = Meter::new(
             MeterLimits {
@@ -411,6 +417,7 @@ mod tests {
                 repair_rounds: 1,
             },
             None,
+            Box::new(Still),
         );
         let bad = parse_reply(&reply("nothing", &[]), Protocol::Text, &tools());
         let good = parse_reply(&reply(ONE, &[]), Protocol::Text, &tools());

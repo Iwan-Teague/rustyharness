@@ -72,9 +72,9 @@ fn record() -> (Vec<u8>, MemBlobs, Profile) {
         file,
         blobs.clone(),
         Tick(Cell::new(0)),
-        Ident::new("run-replay").unwrap(),
+        harness_core::RunId::new(20, [0; 10]),
         1,
-        Header::new(Ident::new("0.0.1").unwrap()),
+        Header::new(Ident::of("0.0.1").unwrap()),
     )
     .unwrap();
     for turn in 0..4u64 {
@@ -173,5 +173,23 @@ fn replay_needs_the_blob_store() {
     assert!(matches!(
         ReplayBackend::from_journal(&v, &empty, profile),
         Err(harness_model::replay::ReplayError::MissingBlob(_))
+    ));
+}
+
+// H1d review F-6: replay re-hashes every payload against its record.
+#[test]
+fn replay_refuses_a_blob_that_is_not_the_recorded_one() {
+    let (bytes, blobs, profile) = record();
+    let v = verify(&bytes, &blobs).unwrap();
+    // A different blob store, with the same names but altered bytes.
+    let other = MemBlobs::default();
+    for (k, val) in blobs.map.borrow().iter() {
+        let mut val = val.clone();
+        val[0] ^= 1;
+        other.map.borrow_mut().insert(k.clone(), val);
+    }
+    assert!(matches!(
+        ReplayBackend::from_journal(&v, &other, profile),
+        Err(harness_model::replay::ReplayError::PayloadMismatch(_))
     ));
 }

@@ -56,7 +56,7 @@ fn rig(plan: FaultPlan) -> (Rig, Result<W, StartError>) {
         file,
         r.blobs.clone(),
         TestClock::default(),
-        id("run-0001"),
+        rid(1),
         1,
         Header::new(id("0.0.1")).field("os", Trusted::Text("test")),
     );
@@ -71,8 +71,21 @@ fn bytes(r: &Rig) -> Vec<u8> {
     r.buf.borrow().clone()
 }
 
+/// A call whose digest is computed from itself (the journal asks it).
+struct TestCall(&'static str);
+
+impl harness_core::CallDigest for TestCall {
+    fn call_digest(&self) -> Digest {
+        sha256(self.0.as_bytes())
+    }
+}
+
+fn rid(n: u64) -> harness_core::RunId {
+    harness_core::RunId::new(n, [0; 10])
+}
+
 fn call_digest() -> Digest {
-    sha256(b"harness.fs.read {\"path\":\"a\"}")
+    sha256(b"call")
 }
 
 fn intent() -> Event {
@@ -114,7 +127,7 @@ fn unreadable() -> GateOutcome {
 
 /// The §2.2 step 7-8 shape: only a `Journaled` call reaches the provider.
 fn step_once(w: &mut W, step: u64, invoked: &Cell<u32>) -> Result<(), JournalError> {
-    let j = w.append_intent(step, intent(), "call", call_digest())?;
+    let j = w.append_intent(step, intent(), TestCall("call"))?;
     invoked.set(invoked.get() + 1); // the provider runs only here
     let _ = j.call();
     w.append(step, result_event())?;
@@ -421,15 +434,14 @@ fn refused_events_do_not_poison() {
         ));
     }
     assert!(matches!(
-        w.append_intent(1, result_event(), (), call_digest()),
+        w.append_intent(1, result_event(), TestCall("x")),
         Err(JournalError::InvalidEvent(_))
     ));
     assert!(matches!(
         w.append_intent(
             1,
             intent().field("call", Trusted::Digest(sha256(b"forged"))),
-            (),
-            call_digest()
+            TestCall("x")
         ),
         Err(JournalError::InvalidEvent(_))
     ));
@@ -724,8 +736,7 @@ fn on_disk_journal_round_trips_through_the_reader() {
     let run_dir = t.0.join("runs").join("run-0001");
     std::fs::create_dir_all(&run_dir).unwrap();
     let (mut w, n) =
-        JournalWriter::create_next_attempt(&run_dir, id("run-0001"), Header::new(id("0.0.1")))
-            .unwrap();
+        JournalWriter::create_next_attempt(&run_dir, rid(1), Header::new(id("0.0.1"))).unwrap();
     assert_eq!(n, 1);
     let big = w
         .untrusted(&Untrusted::new(vec![7u8; 9000], Source::Model))
@@ -761,10 +772,10 @@ fn an_existing_journal_is_never_reopened_for_writing() {
     let t = TempDir::new("reopen");
     let dir = t.0.join("attempt-1");
     std::fs::create_dir_all(&dir).unwrap();
-    let w = JournalWriter::create(&dir, id("r"), 1, Header::new(id("0.0.1"))).unwrap();
+    let w = JournalWriter::create(&dir, rid(99), 1, Header::new(id("0.0.1"))).unwrap();
     drop(w);
     let before = std::fs::read(dir.join(layout::JOURNAL_FILE)).unwrap();
-    let err = JournalWriter::create(&dir, id("r"), 1, Header::new(id("0.0.1"))).unwrap_err();
+    let err = JournalWriter::create(&dir, rid(99), 1, Header::new(id("0.0.1"))).unwrap_err();
     assert_eq!(err.op, "create journal (create_new)");
     assert_eq!(
         std::fs::read(dir.join(layout::JOURNAL_FILE)).unwrap(),
@@ -778,15 +789,13 @@ fn resume_after_a_poisoned_attempt_opens_a_new_file() {
     let run_dir = t.0.join("run-0002");
     std::fs::create_dir_all(&run_dir).unwrap();
     let (w1, n1) =
-        JournalWriter::create_next_attempt(&run_dir, id("run-0002"), Header::new(id("0.0.1")))
-            .unwrap();
+        JournalWriter::create_next_attempt(&run_dir, rid(2), Header::new(id("0.0.1"))).unwrap();
     assert_eq!(n1, 1);
     drop(w1); // attempt 1 ends uncommitted (as after a crash or a poison)
     let a1 = layout::attempt_dir(&run_dir, 1).join(layout::JOURNAL_FILE);
     let before = std::fs::read(&a1).unwrap();
     let (w2, n2) =
-        JournalWriter::create_next_attempt(&run_dir, id("run-0002"), Header::new(id("0.0.1")))
-            .unwrap();
+        JournalWriter::create_next_attempt(&run_dir, rid(2), Header::new(id("0.0.1"))).unwrap();
     assert_eq!(n2, 2);
     let rel = w2.commit(0, &StopCause::Cancelled, unreadable(), None);
     assert!(rel.chain_head.is_some());
@@ -831,13 +840,9 @@ fn new_run_and_attempt_entries_are_fsynced_before_the_header() {
     let run_dir = t.0.join("run-0003");
     std::fs::create_dir_all(&run_dir).unwrap();
     let ds = spy(None);
-    let (w, n) = JournalWriter::create_next_attempt_with(
-        &run_dir,
-        id("run-0003"),
-        Header::new(id("0.0.1")),
-        &ds,
-    )
-    .unwrap();
+    let (w, n) =
+        JournalWriter::create_next_attempt_with(&run_dir, rid(3), Header::new(id("0.0.1")), &ds)
+            .unwrap();
     drop(w);
     let attempt = layout::attempt_dir(&run_dir, n);
     assert_eq!(
@@ -854,7 +859,7 @@ fn attempt_dir_fsync_failure_refuses_to_start() {
     std::fs::create_dir_all(&run_dir).unwrap();
     let err = JournalWriter::create_next_attempt_with(
         &run_dir,
-        id("run-0004"),
+        rid(4),
         Header::new(id("0.0.1")),
         &spy(Some("attempt-1")),
     )
@@ -878,7 +883,7 @@ fn run_dir_fsync_failure_refuses_to_start() {
     std::fs::create_dir_all(&run_dir).unwrap();
     let err = JournalWriter::create_next_attempt_with(
         &run_dir,
-        id("run-0005"),
+        rid(5),
         Header::new(id("0.0.1")),
         &spy(Some("run-0005")),
     )
@@ -909,7 +914,7 @@ fn a_planted_blobs_symlink_is_refused() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::create_dir_all(&elsewhere).unwrap();
     std::os::unix::fs::symlink(&elsewhere, dir.join(layout::BLOBS_DIR)).unwrap();
-    let err = JournalWriter::create(&dir, id("r"), 1, Header::new(id("0.0.1"))).unwrap_err();
+    let err = JournalWriter::create(&dir, rid(99), 1, Header::new(id("0.0.1"))).unwrap_err();
     assert_eq!(err.op, "create blobs dir");
     assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
 }
@@ -922,7 +927,7 @@ fn a_symlinked_attempt_dir_is_refused() {
     std::fs::create_dir_all(&real).unwrap();
     let link = t.0.join("attempt-1");
     std::os::unix::fs::symlink(&real, &link).unwrap();
-    let err = JournalWriter::create(&link, id("r"), 1, Header::new(id("0.0.1"))).unwrap_err();
+    let err = JournalWriter::create(&link, rid(99), 1, Header::new(id("0.0.1"))).unwrap_err();
     assert_eq!(err.op, "attempt dir");
     assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
 }
@@ -933,7 +938,7 @@ fn the_reader_refuses_a_blobs_symlink_swapped_in_later() {
     let t = TempDir::new("reader-link");
     let dir = t.0.join("attempt-1");
     std::fs::create_dir_all(&dir).unwrap();
-    let w = JournalWriter::create(&dir, id("r"), 1, Header::new(id("0.0.1"))).unwrap();
+    let w = JournalWriter::create(&dir, rid(99), 1, Header::new(id("0.0.1"))).unwrap();
     drop(w);
     let blobs = dir.join(layout::BLOBS_DIR);
     std::fs::rename(&blobs, t.0.join("moved")).unwrap();
@@ -964,13 +969,12 @@ fn a_journal_copied_into_another_attempt_is_refused() {
     let run_dir = t.0.join("run-0006");
     std::fs::create_dir_all(&run_dir).unwrap();
     let (w, _) =
-        JournalWriter::create_next_attempt(&run_dir, id("run-0006"), Header::new(id("0.0.1")))
-            .unwrap();
+        JournalWriter::create_next_attempt(&run_dir, rid(6), Header::new(id("0.0.1"))).unwrap();
     let _ = w.commit(1, &StopCause::Submitted, unreadable(), None);
     let a1 = layout::attempt_dir(&run_dir, 1);
     let v = JournalReader::open(&a1).unwrap();
-    assert_eq!((v.run.as_str(), v.attempt), ("run-0006", 1));
-    JournalReader::open_expecting(&a1, &id("run-0006")).unwrap();
+    assert_eq!((v.run.as_str(), v.attempt), (rid(6).as_str(), 1));
+    JournalReader::open_expecting(&a1, &rid(6)).unwrap();
 
     // The copy verifies as a chain, but not as attempt 2.
     let a2 = layout::attempt_dir(&run_dir, 2);
@@ -984,7 +988,7 @@ fn a_journal_copied_into_another_attempt_is_refused() {
     ));
     // Nor as another run's attempt 1.
     assert!(matches!(
-        JournalReader::open_expecting(&a1, &id("run-9999")),
+        JournalReader::open_expecting(&a1, &rid(9999)),
         Err(reader::ReadError::Broken(Broken {
             why: BreakKind::WrongAttempt,
             ..
@@ -997,4 +1001,44 @@ fn a_journal_copied_into_another_attempt_is_refused() {
         JournalReader::open(&odd),
         Err(reader::ReadError::NotAnAttemptDir)
     ));
+}
+
+// ---- H1c confirming review NF-3: run ids and the durable run directory ------
+
+#[test]
+fn run_directories_come_only_from_run_ids_and_are_created_durably() {
+    let t = TempDir::new("rundir");
+    let run = rid(42);
+    let dir = layout::create_run_dir(&t.0, &run).unwrap();
+    assert_eq!(dir, t.0.join("runs").join(run.as_str()));
+    assert!(dir.is_dir());
+    // The same run cannot be created twice.
+    assert!(layout::create_run_dir(&t.0, &run).is_err());
+    // A second run shares the existing `runs/`.
+    assert!(layout::create_run_dir(&t.0, &rid(43)).is_ok());
+    // Nothing that is not 32 hex characters is a run id at all.
+    for bad in ["..", ".", "../escape", "run-01", "a/b"] {
+        assert!(harness_core::RunId::parse(bad).is_none(), "{bad}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_runs_directory_is_refused() {
+    let t = TempDir::new("runs-link");
+    let elsewhere = t.0.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, t.0.join("runs")).unwrap();
+    assert!(layout::create_run_dir(&t.0, &rid(1)).is_err());
+    assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+}
+
+// ---- H1c review F-6: typed provenance for trusted fields ---------------------
+
+#[test]
+fn idents_come_from_static_text_or_trusted_types_only() {
+    assert!(Ident::of("userns-disabled").is_some());
+    assert!(Ident::of("..").is_none());
+    let run = rid(7);
+    assert_eq!(Ident::from_trusted(&run).unwrap().as_str(), run.as_str());
 }

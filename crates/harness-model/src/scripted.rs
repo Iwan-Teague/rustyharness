@@ -77,6 +77,7 @@ impl ModelBackend for ScriptedBackend {
             profile_id: self.profile.id().to_owned(),
             profile_sha256: self.profile.sha256().map(|d| d.to_string()),
             profile_validated: self.profile.validated(),
+            profile_stamp_sha256: self.profile.stamp_sha256().map(str::to_owned),
             api_key_handle: None,
         }
     }

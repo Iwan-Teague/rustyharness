@@ -102,9 +102,9 @@ fn writer(
         }),
         MemBlobs::default(),
         Tick(Cell::new(0)),
-        Ident::new("run-inv33").unwrap(),
+        harness_core::RunId::new(33, [0; 10]),
         1,
-        Header::new(Ident::new("0.0.1").unwrap()),
+        Header::new(Ident::of("0.0.1").unwrap()),
     )
 }
 
@@ -115,17 +115,12 @@ fn step(w: &mut W, s: &Session, p: &mut Spy, n: u64) -> Result<(), JournalError>
         capability: "harness.fs.read".into(),
         args: json!({"path": "src/lib.rs"}),
     };
-    let digest = sha256(
-        json!({"c": call.capability, "a": call.args})
-            .to_string()
-            .as_bytes(),
-    );
     let authorized = s.authorize(call).expect("policy allows a workspace read");
     let intent = Event::new(EventKind::ToolStarted).field(
         "capability",
-        Trusted::Id(Ident::new("harness.fs.read").unwrap()),
+        Trusted::Id(Ident::of("harness.fs.read").unwrap()),
     );
-    let journaled = w.append_intent(n, intent, authorized, digest)?;
+    let journaled = w.append_intent(n, intent, authorized)?;
     let ctx = InvokeCtx {
         step: n,
         deadline: Instant::now(),

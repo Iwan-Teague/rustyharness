@@ -54,6 +54,14 @@ pub mod layout;
 pub mod reader;
 #[cfg(any(test, feature = "fault-injection"))]
 pub mod testing;
+
+// The fault-injecting seams are for tests only (H1c confirming review NF-1):
+// no optimised build may contain them, whatever feature forwarding enabled
+// the feature. (`cargo test --release` would need debug assertions on.)
+#[cfg(all(feature = "fault-injection", not(debug_assertions)))]
+compile_error!(
+    "harness-journal's `fault-injection` feature is test-only and refused in optimised builds"
+);
 pub mod writer;
 
 pub use canon::{EventKind, Ident};

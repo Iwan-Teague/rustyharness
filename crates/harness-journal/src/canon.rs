@@ -39,17 +39,43 @@ pub const INLINE_MAX: usize = 4096;
 /// grammar. The grammar keeps paths and URLs out by construction; the rest
 /// of the rule is enforced by review until H1e gives `Ident` typed
 /// constructors from `RunId`/`CapId` (design doc, Changes since v0.2).
+///
+/// **Typed provenance (H1c review F-6, closed in H1e-1).** There is no
+/// public constructor from a runtime `&str`. An `Ident` comes from:
+/// - [`Ident::of`]: a `&'static str` (compile-time harness text), or
+/// - [`Ident::from_trusted`]: a value implementing
+///   `harness_core::TrustedName` (a `RunId`, a validated `CapId` or
+///   `ProviderName`, a render nonce), whose implementations the purity gate
+///   confines to the files that own those types.
+///
+/// The grammar also refuses a leading `.` or `-` (so never `.`, `..`,
+/// `.hidden` or `-rf`; H1c confirming review NF-3).
+///
+/// ```compile_fail,E0624
+/// let _ = harness_journal::Ident::new("from-runtime-text");
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Ident(String);
 
 impl Ident {
-    /// Check `s` against the identifier grammar.
-    pub fn new(s: &str) -> Option<Self> {
+    /// Check `s` against the identifier grammar (crate-internal).
+    pub(crate) fn new(s: &str) -> Option<Self> {
         let ok = !s.is_empty()
             && s.len() <= 128
+            && s.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
             && s.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
         ok.then(|| Self(s.to_owned()))
+    }
+
+    /// Compile-time harness text (a reason code, a key, a version).
+    pub fn of(s: &'static str) -> Option<Self> {
+        Self::new(s)
+    }
+
+    /// Text a trusted type vouches for (typed provenance).
+    pub fn from_trusted<T: harness_core::TrustedName + ?Sized>(t: &T) -> Option<Self> {
+        Self::new(t.trusted_name())
     }
 
     /// The text.
@@ -261,7 +287,7 @@ pub struct RecordFields {
     /// Wall clock, RFC 3339 UTC.
     pub t_wall: String,
     /// Run id.
-    pub run: Ident,
+    pub run: harness_core::RunId,
     /// Attempt number.
     pub attempt: u32,
     /// Loop step.
@@ -373,6 +399,10 @@ mod tests {
             "sha256:ab",
             "user@host",
             "a+b=c",
+            ".",
+            "..",
+            ".hidden",
+            "-rf",
             &"a".repeat(129),
         ] {
             assert!(Ident::new(bad).is_none(), "{bad:?}");

@@ -108,6 +108,7 @@ dependencies = [
 name = "harness-policy"
 version = "0.0.1"
 dependencies = [
+ "harness-core",
  "harness-manifest",
  "serde_json",
  "thiserror",

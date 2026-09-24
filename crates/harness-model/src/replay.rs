@@ -46,7 +46,7 @@ pub fn requested_event(rendered: &Value, nonce: &RenderNonce) -> Option<Event> {
     Some(
         Event::new(EventKind::ModelRequested)
             .field("request", Trusted::Digest(request_digest(rendered)))
-            .field("nonce", Trusted::Id(Ident::new(nonce.as_str())?)),
+            .field("nonce", Trusted::Id(Ident::from_trusted(nonce)?)),
     )
 }
 
@@ -56,9 +56,9 @@ fn error_fields(e: &ModelError) -> Vec<(&'static str, Trusted)> {
         ModelError::Empty => vec![("error", t("empty"))],
         ModelError::Truncated(why) => vec![("error", t("truncated")), ("why", t(why))],
         ModelError::Unusable(_) => vec![("error", t("unusable"))],
-        ModelError::RateLimited { attempts } => vec![
+        ModelError::RateLimited { statuses } => vec![
             ("error", t("rate_limited")),
-            ("attempts", Trusted::U64(u64::from(*attempts))),
+            ("statuses", statuses_list(statuses)),
         ],
         ModelError::ReplayDiverged { .. } => vec![("error", t("replay_diverged"))],
         ModelError::Unavailable(u) => {
@@ -67,16 +67,20 @@ fn error_fields(e: &ModelError) -> Vec<(&'static str, Trusted)> {
                 Unavailable::ConnectTimeout => ("connect_timeout", None),
                 Unavailable::ReadTimeout => ("read_timeout", None),
                 Unavailable::Deadline => ("deadline", None),
-                Unavailable::Status { code, attempts } => ("status", Some((*code, *attempts))),
+                Unavailable::Status { code, statuses } => ("status", Some((*code, statuses))),
             };
             let mut v = vec![("error", t("unavailable")), ("kind", t(kind))];
-            if let Some((code, attempts)) = extra {
+            if let Some((code, statuses)) = extra {
                 v.push(("code", Trusted::U64(u64::from(code))));
-                v.push(("attempts", Trusted::U64(u64::from(attempts))));
+                v.push(("statuses", statuses_list(statuses)));
             }
             v
         }
     }
+}
+
+fn statuses_list(s: &[u16]) -> Trusted {
+    Trusted::List(s.iter().map(|c| Trusted::U64(u64::from(*c))).collect())
 }
 
 /// The `ModelReplied` event for a call's result. Model-authored text goes
@@ -146,6 +150,9 @@ pub enum ReplayError {
     /// A payload's blob is missing.
     #[error("model record {0} references a missing blob")]
     MissingBlob(u64),
+    /// A payload does not hash to its recorded `sha256`/`len`.
+    #[error("model record {0}: a payload does not match its recorded digest")]
+    PayloadMismatch(u64),
 }
 
 #[derive(Debug, Clone)]
@@ -169,20 +176,39 @@ enum RecordedReply {
     Err(ModelError),
 }
 
+/// Read one untrusted payload back, and re-hash it against the record's
+/// `sha256` and `len` (H1d review F-6): whatever blob source the caller
+/// passes, a payload that is not the recorded one is refused.
 fn payload(v: &Value, blobs: &dyn BlobSource, seq: u64) -> Result<String, ReplayError> {
-    let o = v.as_object().ok_or(ReplayError::Malformed(seq))?;
+    let m = ReplayError::Malformed(seq);
+    let o = v.as_object().ok_or(m.clone())?;
     if o.get("untrusted") != Some(&Value::Bool(true)) {
-        return Err(ReplayError::Malformed(seq));
+        return Err(m);
     }
-    if let Some(i) = o.get("inline").and_then(Value::as_str) {
-        return unescape(i).ok_or(ReplayError::Malformed(seq));
-    }
-    let name = o
-        .get("blob")
+    let want: Digest = o
+        .get("sha256")
         .and_then(Value::as_str)
-        .ok_or(ReplayError::Malformed(seq))?;
-    let bytes = blobs.get(name).ok_or(ReplayError::MissingBlob(seq))?;
-    String::from_utf8(bytes).map_err(|_| ReplayError::Malformed(seq))
+        .and_then(|s| s.parse().ok())
+        .ok_or(m.clone())?;
+    let len = o.get("len").and_then(Value::as_u64).ok_or(m.clone())?;
+    let bytes = if let Some(i) = o.get("inline").and_then(Value::as_str) {
+        unescape(i).ok_or(m.clone())?.into_bytes()
+    } else {
+        let name = o.get("blob").and_then(Value::as_str).ok_or(m.clone())?;
+        blobs.get(name).ok_or(ReplayError::MissingBlob(seq))?
+    };
+    if harness_core::sha256(&bytes) != want || u64::try_from(bytes.len()).ok() != Some(len) {
+        return Err(ReplayError::PayloadMismatch(seq));
+    }
+    String::from_utf8(bytes).map_err(|_| m)
+}
+
+fn statuses_of(b: &Map<String, Value>) -> Option<Vec<u16>> {
+    b.get("statuses")?
+        .as_array()?
+        .iter()
+        .map(|v| v.as_u64().and_then(|x| u16::try_from(x).ok()))
+        .collect()
 }
 
 fn decode_error(b: &Map<String, Value>, seq: u64) -> Result<ModelError, ReplayError> {
@@ -202,7 +228,7 @@ fn decode_error(b: &Map<String, Value>, seq: u64) -> Result<ModelError, ReplayEr
         }),
         Some("unusable") => ModelError::Unusable("recorded unusable reply".into()),
         Some("rate_limited") => ModelError::RateLimited {
-            attempts: n("attempts").ok_or(m)?,
+            statuses: statuses_of(b).ok_or(m)?,
         },
         Some("unavailable") => ModelError::Unavailable(match s("kind") {
             Some("connect") => Unavailable::Connect("recorded".into()),
@@ -213,7 +239,7 @@ fn decode_error(b: &Map<String, Value>, seq: u64) -> Result<ModelError, ReplayEr
                 code: n("code")
                     .and_then(|c| u16::try_from(c).ok())
                     .ok_or(m.clone())?,
-                attempts: n("attempts").ok_or(m)?,
+                statuses: statuses_of(b).ok_or(m)?,
             },
             _ => return Err(m),
         }),
@@ -363,6 +389,7 @@ impl ModelBackend for ReplayBackend {
             profile_id: self.profile.id().to_owned(),
             profile_sha256: self.profile.sha256().map(|d| d.to_string()),
             profile_validated: self.profile.validated(),
+            profile_stamp_sha256: self.profile.stamp_sha256().map(str::to_owned),
             api_key_handle: None,
         }
     }
