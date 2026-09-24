@@ -1,6 +1,6 @@
 [package]
 name = "harness-model"
-description = "rustyharness model layer: loopback OpenAI-compatible client, both action protocols, profiles, replay. The model is a swappable part, never the harness."
+description = "rustyharness model layer, I/O half: the loopback OpenAI-compatible client, replay and scripted backends, the profile smoke test. The model is a swappable part, never the harness."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

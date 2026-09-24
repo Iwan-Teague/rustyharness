@@ -14,23 +14,29 @@ The model is a swappable part. The harness is what makes an agent reliable.
 ## Status
 
 **H1, the read-only agent, is built; its phase-exit review is next** (design
-[§9](docs/01-design-v0.1.md)). What works today:
+[§9](docs/01-design-v0.1.md#9-phasing)). What works today:
 
 - **A read-only agent loop** against a model served on loopback
   (`http://127.0.0.1`, `[::1]` or `localhost`; OpenAI-compatible, e.g. llama.cpp),
   with native tool calls or a text action protocol, hard budgets, loop detection,
   and three read tools confined to a workspace (`harness.fs.read`, `.search`,
   `.list`).
-- **Evidence, not claims.** Every run writes a hash-chained, write-ahead journal;
-  `replay` recomputes every record of a run or names the first divergence;
-  `resume` continues an interrupted run in a new attempt.
-- **No run can pass yet.** Checks arrive in H3, so every run ends
-  `Indeterminate { NothingChecked }` (exit 5), whatever the agent says.
+- **Evidence, not claims.** Every run that starts writes a hash-chained,
+  write-ahead journal. `replay` re-drives a run from its recorded model replies
+  and tool results, recomputes every context digest and policy decision, and
+  names the first divergence; only `--anchor` (the chain head `run` printed)
+  detects a replaced or consistently re-chained journal (design §7.1 and the
+  H1e-2b and H1f-3 rows). `resume` continues an interrupted run in a new attempt.
+- **No run can pass yet.** Checks arrive in H3, so no run ends `Passed`,
+  whatever the agent says: a run that starts ends `Indeterminate { NothingChecked }`
+  (`UnreadableEvidence` if its journal fails), exit 5; a refused run is
+  `CouldNotRun`.
 - **No sandbox, no execution.** No backend has passed conformance, so no execute
   capability can be granted and `rustyharness sandbox` refuses (H2).
-- **Local disks only.** A `state_root` must be on a filesystem positively
-  identified as local; on Windows every one is refused until spike S-W1, so runs
-  work on Linux and macOS.
+- **Local disks only.** `run` and `resume` refuse a `state_root` that is not on
+  a filesystem positively identified as local; on Windows every one is refused
+  until spike S-W1, so runs work on Linux and macOS. `replay` does not check yet
+  (an owner question, [OPEN-QUESTIONS](docs/OPEN-QUESTIONS.md) item 2).
 
 Invariants that hold throughout: tool and model output is `Untrusted` data;
 capability manifests are versioned, strictly parsed and refused when unknown;
@@ -64,7 +70,9 @@ cargo run -p harness-cli -- manifest check adapters/example/manifest.json
 cargo run -p harness-cli -- sandbox            # refuses: no confinement yet
 ```
 
-A run needs a task, a model profile (`model` is the id the server lists) and a model
+A run needs the binary (`cargo build --release -p harness-cli` puts it at
+`target/release/rustyharness`), a task, a model profile (`model` is the id the
+server lists), an existing state directory outside the workspace, and a model
 server on loopback:
 
 ```json
@@ -80,17 +88,20 @@ server on loopback:
 ```
 
 ```bash
+mkdir -p state
 rustyharness run --task task.json --profile profile.json \
-  --workspace <dir> --state-root <dir outside the workspace> \
+  --workspace <dir> --state-root state \
   --endpoint http://127.0.0.1:8080/v1
 rustyharness replay --run <run id> --task task.json --profile profile.json \
-  --state-root <same dir> --anchor <the chain_head line run printed>
+  --state-root state --anchor <chain head>
 ```
 
-`rustyharness` with no arguments prints every verb. The last stdout line of
-`run`, `resume` and `replay` is a JSON `GateReport` and the exit code agrees with
-it (design §7.7). `rustyharness profile check` scores a model on a smoke eval and
-prints a stamp for its profile.
+`run` prints the run id on stderr (`run <id> attempt 1: stopped …`) and, on
+stdout, `chain_head <hex>`: keep the hex, it is the anchor. `rustyharness` with no
+arguments prints every verb. The last stdout line of `run`, `resume` and `replay`
+is a JSON `GateReport` and the exit code agrees with it (design §7.7).
+`rustyharness profile check` scores a model on a smoke eval and prints a stamp
+for its profile when the model passes (exit 1 and no stamp otherwise).
 
 ## Read order
 
@@ -100,8 +111,9 @@ prints a stamp for its profile.
 4. [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md)
 5. [docs/research/README.md](docs/research/README.md) — the research pipeline that fed the design
 
-Portable by design: CI runs `scripts/ci/gates.sh` on Linux and macOS and every
-cargo step of it on Windows.
+Portable by design: CI runs `scripts/ci/gates.sh` on Linux and macOS; Windows
+runs its cargo steps except the error-code doctests (whose result does not depend
+on the target), and the purity gate checks Windows dependencies from Linux.
 
 ## Licence
 

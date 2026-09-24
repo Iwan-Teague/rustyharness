@@ -30,9 +30,10 @@ jobs:
       - name: Member gates (scripts/ci/gates.sh)
         run: sh scripts/ci/gates.sh
 
-  # Windows runs every cargo step of the gates. The purity scripts are POSIX
-  # sh and run in the job above; the compile-fail doctests check error codes,
-  # which do not depend on the target.
+  # Windows runs the gates' cargo steps except the RUSTC_BOOTSTRAP error-code
+  # doctests (their result does not depend on the target). The purity scripts
+  # are POSIX sh and run in the job above, where `cargo tree --target all`
+  # also checks Windows dependencies.
   gates-windows:
     runs-on: windows-latest
     steps:

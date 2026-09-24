@@ -9,11 +9,26 @@ these is a security bug.
 `rustyharness` binary drives a model on loopback through read-only workspace tools
 and writes a hash-chained journal. Nothing the agent asks for executes: no sandbox
 backend has passed conformance, so no execute capability can be granted, and no
-provider outside the built-in one can be admitted. In scope for reports today: a
-way for model or tool output to act as an instruction, to read outside the
-workspace, to reach a non-loopback endpoint, to alter or forge a journal
-undetectably beyond the residuals the design names (§7.1, §11), to make a run
-report a pass, or to put a payload on an argv.
+provider outside the built-in one can be admitted.
+
+In scope for reports today, a way to:
+
+- make model or tool output act as an instruction (only the model's own reply is
+  parsed for an action, INV-29);
+- invoke a capability the task did not grant or user policy denies, get a
+  provider other than the built-in one admitted, or cause any write through the
+  agent (H1 is read-only);
+- read outside the workspace, beyond the residuals the design names (hard links
+  and the check-then-open window, the design's H1e-2 "Read tools" row);
+- reach a model endpoint that is not loopback;
+- run with a `state_root` on a filesystem not identified as local (INV-35);
+  `replay`'s missing check is a known open question, not a finding;
+- outlast a budget (INV-14), or get outside text into a trusted journal field;
+- alter or forge a journal undetectably beyond the residuals the design names
+  (§7.1, §11, and the anchor-only residuals in rows H1e-2b and H1f-3);
+- make a run report a pass;
+- put a payload on an argv (INV-23), or redraw the terminal from a manifest,
+  a model reply or a tool result (§7.1 display paths).
 
 **Reporting:** do not open a public issue. Contact the maintainer privately
 (Iwan Teague, via the GitHub profile that owns this repository) with a description

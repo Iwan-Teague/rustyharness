@@ -6,6 +6,10 @@ must answer; it does not answer them. It will be superseded by the v0.1 design,
 which goes through the suite's two-eyes cycle (design → adversarial review →
 rework → confirming review → SOUND).
 
+**Since then:** the design is [01-design-v0.1.md](01-design-v0.1.md) (v0.2, reviewed
+SOUND), and H1 is built. This overview is kept as the project's original framing;
+where the two differ, the design governs.
+
 ## 1. What it is
 
 rustyharness is a standalone **agent harness**, built alongside rustysuite: the

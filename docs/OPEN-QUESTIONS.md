@@ -8,7 +8,9 @@ so the history stays readable. What is still open is listed first.
 ## Still open
 
 1. **(owner) The design's owner questions** (§11), each with the fail-closed default
-   that holds until answered:
+   that holds until answered. §9's H0 exit asks for these to be answered or their
+   defaults accepted in writing; no written acceptance is recorded in this
+   repository yet.
    1. `gate-outcome`'s licence: does ADR-0003 cover it, or is it a recorded
       exception? *Default:* PolyForm Noncommercial.
    2. May a hosted model ever see `personal` data? *Default:* no.
@@ -17,7 +19,9 @@ so the history stays readable. What is still open is listed first.
       Windows `state_root` is refused until S-W1 (design row H1f-1).
    5. Reviewer independence bar? *Default:* fresh context and distinct run always; a
       distinct model when two or more are configured.
-   6. Concurrency per model endpoint? *Default:* 1 for loopback.
+   6. Concurrency per model endpoint? *Default:* 1 for loopback (not enforced in
+      H1: §2.8's per-endpoint semaphore is not built, so nothing stops two runs
+      sharing a server).
    7. When to invest in a trifecta-breaking architecture? *Default:* never combine;
       revisit after H4.
    8. macOS if `sandbox-exec` disappears? *Default:* macOS execution refuses.
@@ -25,8 +29,9 @@ so the history stays readable. What is still open is listed first.
    writes `runs/<run-id>/replay-<k>/` under `state_root` without the locality check
    `run` applies (INV-35), so on Windows it writes where `run` refuses. Checking would
    make replay refuse on Windows until S-W1 too (design row H1f-1).
-3. **The H1 phase-exit review** (§9): every H1 slice has been reviewed; the phase
-   itself has not.
+3. **The H1 phase-exit review** (§9): each H1 slice has its own recorded review
+   (the H1a-H1e commits, and the H1f rows of the design); the phase as a whole has
+   not been reviewed.
 
 ## Answered by the design
 
@@ -45,9 +50,10 @@ so the history stays readable. What is still open is listed first.
 5. **Shared crates with rustybenchmark** — the sandbox backends and the conformance
    corpus are proposed as the shared crates; the harness takes no dependency on the
    benchmark (§6.3).
-6. **Hosted models** — off in the default build (feature `hosted`), opt-in per run,
-   never across privacy classes; the remaining owner question is item 1.2 above
-   (§3.2, §5.4).
+6. **Hosted models** — off in the default build (feature `hosted`), opt-in per run
+   (§3.2); a hosted profile only for sessions whose maximum sensitivity is at most
+   `operational`, `restricted` never (§5.4); a loopback profile never falls back to
+   a hosted one (§3.2). The remaining owner question is item 1.2 above.
 7. ~~**Membership (owner)**~~ — decided 2026-09-23: present-non-member dev/ops tool
    until the design is SOUND (ADR-0002).
 8. ~~**Licence (owner)**~~ — decided 2026-09-23: PolyForm Noncommercial 1.0.0,
@@ -58,10 +64,11 @@ so the history stays readable. What is still open is listed first.
     not core (§8).
 11. ~~**rustyharness vs the charter's "rustyai" (owner)**~~ — decided 2026-09-23:
     separate, standalone-first (ADR-0002).
-12. **Confinement mode** — per-OS in-process backends gated by a conformance token:
-    namespaces + Landlock + seccomp on Linux, deny-default Seatbelt on macOS,
-    AppContainer + Job Object on Windows (D12, §6); a separate OS account per agent
-    is the suite's host-level control (§8).
+12. **Confinement mode (owner, suite OI-24)** — the harness's half is answered:
+    per-OS backends gated by a conformance token, namespaces + Landlock + seccomp
+    on Linux, deny-default Seatbelt on macOS, AppContainer + Job Object on Windows
+    (D12, §6). A separate OS account per agent is the suite's confinement decision
+    (§8), still the suite owner's (OI-24).
 13. **Local-only vs cloud models** — local first: loopback by default, hosted only by
     feature and per-run opt-in (§3.2, §5.4).
 14. **Reuse rustyfin's assistant tool contract** — its confirmation-token pattern is

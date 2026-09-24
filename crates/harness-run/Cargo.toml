@@ -1,6 +1,6 @@
 [package]
 name = "harness-run"
-description = "rustyharness run driver: session planning, the run loop, per-call journaling. The embedding API for apps."
+description = "rustyharness run driver: session planning, the run loop, per-call journaling, audit replay and resume. The embedding API for apps."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

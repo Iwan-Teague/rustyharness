@@ -1,6 +1,6 @@
 [package]
 name = "harness-sandbox"
-description = "rustyharness execution confinement. Fail-closed: no containment, no execution."
+description = "rustyharness execution confinement (fail-closed: no containment, no execution) and host probes: filesystem locality, environment sample."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
