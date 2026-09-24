@@ -15,6 +15,8 @@
 //!
 //! Also here, because they measure the host: the filesystem-locality probe
 //! ([`locality`], §2.8) and the environment probe ([`environment`], §7.1).
+//! On macOS they run the harness's only unconfined children in H1: the three
+//! fixed read-only queries of the private `capture` module (§4.5, INV-23).
 
 #![forbid(unsafe_code)]
 // The panic-set lints ratchet production code; unit tests may assert loosely.
@@ -59,8 +61,11 @@ pub fn available() -> Containment {
     Containment::Unavailable("no backend has passed conformance yet (H2)")
 }
 
-/// Obtain a backend or refuse. Every execution path goes through here; there
-/// is no API that runs a command without a [`Backend`] in hand.
+/// Obtain a backend or refuse. Every execution an agent or a check can ask
+/// for goes through here; there is no API that runs one without a [`Backend`]
+/// in hand. (The harness's own three host queries in `capture` are fixed
+/// programs with fixed arguments, §4.5; nothing chosen at run time reaches
+/// them.)
 pub fn require() -> Result<Backend, Refused> {
     match available() {
         Containment::Available(b) => Ok(b),

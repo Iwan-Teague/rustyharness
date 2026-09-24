@@ -31,7 +31,12 @@ so the history stays readable. What is still open is listed first.
    make replay refuse on Windows until S-W1 too (design row H1f-1).
 3. **The H1 phase-exit review** (§9): each H1 slice has its own recorded review
    (the H1a-H1e commits, and the H1f rows of the design); the phase as a whole has
-   not been reviewed.
+   not been reviewed. Two items for it: INV-14's falsifying test ("hanging tool →
+   `Budget(Wall)` within budget + kill grace") has no H1 counterpart, because
+   in-process read tools are not interruptible (a named §11 residual that H2's
+   killable helper closes), so the review decides whether H1 exits with it named;
+   and `replay`'s "every record recomputed and matched" message, which should say
+   that replies, tool results and samples are re-fed.
 
 ## Answered by the design
 

@@ -16,14 +16,21 @@ In scope for reports today, a way to:
 - make model or tool output act as an instruction (only the model's own reply is
   parsed for an action, INV-29);
 - invoke a capability the task did not grant or user policy denies, get a
-  provider other than the built-in one admitted, or cause any write through the
-  agent (H1 is read-only);
+  provider other than the built-in one admitted, or cause any workspace write
+  through the agent (H1 is read-only; the one write-class capability is the
+  submit sentinel `harness.task.submit`, granted to every session, which only
+  ends the loop, §2.5);
 - read outside the workspace, beyond the residuals the design names (hard links
   and the check-then-open window, the design's H1e-2 "Read tools" row);
 - reach a model endpoint that is not loopback;
-- run with a `state_root` on a filesystem not identified as local (INV-35);
-  `replay`'s missing check is a known open question, not a finding;
-- outlast a budget (INV-14), or get outside text into a trusted journal field;
+- run with a `state_root` on a filesystem not identified as local (INV-35),
+  beyond the residuals the design names (the H1e-2c row: a mount placed over the
+  path between the probe's reads; §11: local filesystems on network block
+  storage); `replay`'s missing check is a known open question, not a finding;
+- outlast a budget (INV-14), beyond the residual the design names (§11: an
+  in-process read blocked in the kernel, e.g. on a network mount inside the
+  workspace, is not interrupted until H2); or get outside text into a trusted
+  journal field;
 - alter or forge a journal undetectably beyond the residuals the design names
   (§7.1, §11, and the anchor-only residuals in rows H1e-2b and H1f-3);
 - make a run report a pass;

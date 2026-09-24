@@ -7,7 +7,7 @@ else is required.
 
 Built alongside [rustysuite](https://github.com/Iwan-Teague), whose capabilities —
 developing and reviewing its code, operating its apps, assistants inside them —
-ship as optional add-ons, off unless enabled ([ADR-0002](docs/adr/0002-standalone-first.md)).
+will ship as optional add-ons (H5), off unless enabled ([ADR-0002](docs/adr/0002-standalone-first.md)).
 
 The model is a swappable part. The harness is what makes an agent reliable.
 
@@ -29,8 +29,8 @@ The model is a swappable part. The harness is what makes an agent reliable.
   H1e-2b and H1f-3 rows). `resume` continues an interrupted run in a new attempt.
 - **No run can pass yet.** Checks arrive in H3, so no run ends `Passed`,
   whatever the agent says: a run that starts ends `Indeterminate { NothingChecked }`
-  (`UnreadableEvidence` if its journal fails), exit 5; a refused run is
-  `CouldNotRun`.
+  (`UnreadableEvidence` if its journal fails or a resume's catch-up diverges),
+  exit 5; a refused run is `CouldNotRun`.
 - **No sandbox, no execution.** No backend has passed conformance, so no execute
   capability can be granted and `rustyharness sandbox` refuses (H2).
 - **Local disks only.** `run` and `resume` refuse a `state_root` that is not on
@@ -71,9 +71,9 @@ cargo run -p harness-cli -- sandbox            # refuses: no confinement yet
 ```
 
 A run needs the binary (`cargo build --release -p harness-cli` puts it at
-`target/release/rustyharness`), a task, a model profile (`model` is the id the
-server lists), an existing state directory outside the workspace, and a model
-server on loopback:
+`target/release/rustyharness`; the commands below assume it is on your `PATH`),
+a task, a model profile (`model` is the id the server lists), an existing state
+directory outside the workspace, and a model server on loopback:
 
 ```json
 {"task": "What is the codename in notes.txt?", "grants": ["harness.fs.read", "harness.fs.list"]}
@@ -101,7 +101,9 @@ stdout, `chain_head <hex>`: keep the hex, it is the anchor. `rustyharness` with 
 arguments prints every verb. The last stdout line of `run`, `resume` and `replay`
 is a JSON `GateReport` and the exit code agrees with it (design §7.7).
 `rustyharness profile check` scores a model on a smoke eval and prints a stamp
-for its profile when the model passes (exit 1 and no stamp otherwise).
+for its profile when the model passes (exit 0); a model that does not pass exits
+1 with no stamp, a failed server check 5, an unreadable profile or a refused
+endpoint 4.
 
 ## Read order
 

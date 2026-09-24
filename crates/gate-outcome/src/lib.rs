@@ -35,7 +35,7 @@
 //!   knowledge an `Indeterminate` cannot erase.
 //!
 //! The crate NEVER hashes. A [`Digest`] is an opaque 32-byte claim handed in
-//! by harness code; producing one is a future `harness_core::sha256`
+//! by harness code; producing one is `harness_core::sha256`'s
 //! responsibility, not this crate's.
 
 #![forbid(unsafe_code)]
