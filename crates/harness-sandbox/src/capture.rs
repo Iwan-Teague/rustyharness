@@ -4,18 +4,25 @@
 //! macOS probes use them: `/sbin/mount` (locality, §2.8), `/usr/sbin/sysctl`
 //! and `/usr/bin/vm_stat` (environment sample, §7.1).
 //!
-//! purity.sh §2f holds the rest of the tree to this: the word `Command` may
-//! appear in code only in this file (and its `#[cfg(test)]` tests), and this
-//! file may name no program but these three. So no caller can choose a
-//! program or an argument, however it is spelled (H1f-4 review F-1). The capture bounds what the child can
-//! do to the harness (H1f-3 review F-7), assuming it does not fork (none of
-//! the three does; a killed child's own children would outlive it, and
-//! `wait` after a kill is not time-limited): its environment is cleared
-//! and `LC_ALL=C` set (a locale cannot change the number format), stdin is
-//! null, stderr is discarded, at most [`CAPTURE_MAX_BYTES`] + 1 bytes of
-//! stdout are read, and past the deadline the child is killed. Anything but
-//! a clean exit within the bounds is an error, which the probes turn into a
-//! refusal or `read_failed`.
+//! `scripts/ci/purity.sh` holds the build to this. The word `Command` may
+//! appear in code only in this file and its `#[cfg(test)]` tests (its §2f),
+//! the binary is built from nothing that scan does not read or the gate
+//! has not reviewed (its section 5), and this file is pinned by its
+//! SHA-256, so its programs, argv and bounds change only with the gate. So
+//! no caller can choose a program or an argument, however it is spelled,
+//! and no dependency can spawn for it (H1f-4 review F-1, confirming review
+//! NF-1 and NF-2). Changing this file means updating `capture_sha256`
+//! there, by review.
+//!
+//! The capture bounds what the child can do to the harness (H1f-3 review
+//! F-7), assuming it does not fork (none of the three does; a killed
+//! child's own children would outlive it, and `wait` after a kill is not
+//! time-limited): its environment is cleared and `LC_ALL=C` set (a locale
+//! cannot change the number format), stdin is null, stderr is discarded, at
+//! most [`CAPTURE_MAX_BYTES`] + 1 bytes of stdout are read, and past the
+//! deadline the child is killed. Anything but a clean exit within the
+//! bounds is an error, which the probes turn into a refusal or
+//! `read_failed`.
 
 use std::io::Read;
 use std::process::{Command, Stdio};

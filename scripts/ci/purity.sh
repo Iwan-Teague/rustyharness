@@ -16,8 +16,10 @@
 # verdict lives in gate-outcome (gate-outcome itself is exempt: it IS the
 # outcome crate).
 #
-# INV-23 (§2f): every spawn in the harness is one of the fixed queries in
-# crates/harness-sandbox/src/capture.rs, so no payload reaches an argv.
+# INV-23 (sections 2f and 5): every spawn in the harness is one of the
+# fixed queries in crates/harness-sandbox/src/capture.rs, so no payload
+# reaches an argv; and the binary is built from nothing these scans do not
+# read or this gate has not reviewed.
 #
 # Fail closed: every tool call is checked. A tool that errors, or a check
 # that read nothing, fails the gate; it never prints OK.
@@ -476,11 +478,16 @@ fi
 #     of a spawn has to write one of them;
 #   - capture.rs declares its tests `#[cfg(test)]`, names `Command` (so the
 #     scan read it), and every absolute-path literal in it is one of the
-#     programs §4.5 lists: /sbin/mount, /usr/sbin/sysctl, /usr/bin/vm_stat.
-# Integration tests (crates/*/tests/) are separate test crates and may spawn
-# freely. Fails closed on legitimate code too: prose inside code, a type or
-# method named `Command` elsewhere, or another program in capture.rs are all
-# refused, and need a review of this gate to allow.
+#     programs §4.5 lists: /sbin/mount, /usr/sbin/sysctl, /usr/bin/vm_stat;
+#   - capture.rs is pinned by its SHA-256 (H1f-4 confirming review NF-2: a
+#     relative program name or an extra argument passed the literal check),
+#     so its programs, argv and bounds change only with this gate, by review.
+# Section 5 below closes what these scans cannot read: dependencies,
+# targets outside src/, foreign code, cargo configuration. Integration tests
+# (crates/*/tests/) are separate test crates and may spawn freely. Fails
+# closed on legitimate code too: prose inside code, a type or method named
+# `Command` elsewhere, or any change to capture.rs are all refused, and
+# need a review of this gate to allow.
 spawn_file=crates/harness-sandbox/src/capture.rs
 spawn_tests=crates/harness-sandbox/src/capture/tests.rs
 find crates -type l >"$tmpdir/links" || fail "find failed (INV-23 symlinks)"
@@ -536,6 +543,18 @@ if [ -s "$tmpdir/hits" ]; then
     fail "INV-23: spawns are confined to the closed query set in $spawn_file:
 $(cat "$tmpdir/hits")"
 fi
+# The one spawn site, pinned. Update only with a review of the change.
+capture_sha256=820d1e817b7430149ca644d4b8014636761facc17298b2e86a5883b0f14b0049
+if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum <"$spawn_file" >"$tmpdir/capture-sha" || fail "sha256sum failed on $spawn_file"
+elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 <"$spawn_file" >"$tmpdir/capture-sha" || fail "shasum failed on $spawn_file"
+else
+    fail "INV-23: neither sha256sum nor shasum is on PATH (cannot check $spawn_file)"
+fi
+read -r capture_got _ <"$tmpdir/capture-sha" || fail "could not read the digest of $spawn_file"
+[ "$capture_got" = "$capture_sha256" ] ||
+    fail "INV-23: $spawn_file is not the reviewed version (sha256 $capture_got, pinned $capture_sha256): the one spawn site changes only with this gate; review the change, then update capture_sha256 in scripts/ci/purity.sh"
 
 # --- 2d. compile-fail doctests pin their reason (H1a review N-6) -------------
 # Every compile_fail doctest names its expected error code; gates.sh runs the
@@ -596,5 +615,154 @@ $(cat "$tmpdir/fi-off")"
     [ "${fi_n:-0}" -eq 0 ] ||
         fail "the $crate/$feature compile_error! also fires with debug assertions on (tests would break)"
 done
+
+# --- 5. INV-23: the binary is built only from what this gate reads ----------
+# §2f reads the workspace's own sources, so a spawn in code it never reads
+# passed it (H1f-4 confirming review NF-1: a path dependency outside crates/
+# spawned with the task text on its argv, and purity passed). So:
+#   - every package in the normal and build tree, for every target, is a
+#     workspace crate at crates/<name> (read by §2f) or a crates.io crate on
+#     the reviewed list below. None of those can start a process (libc only
+#     through unsafe code, see below). A path dependency outside crates/, a
+#     [patch] onto a path, a git or another registry's crate is refused;
+#   - every target is a lib or bin whose root is under crates/*/src/ (read
+#     by §2f) or a test under crates/*/tests/ (a separate crate, never
+#     shipped). No build script (it can add linker arguments or generate
+#     code), proc macro (it writes code no scan reads), bench, example or
+#     other crate type (NF-3);
+#   - every lib and bin root opens with `#![forbid(unsafe_code)]`, which no
+#     inner attribute can lower: no crate calls foreign code (libc's exec
+#     family, a declared extern), uses `global_asm!` or places a static in
+#     a link section;
+#   - no `.cargo` directory in the repository (its config can add linker
+#     arguments or rustc flags).
+# Out of scope, named: the toolchain, the build environment (RUSTFLAGS, the
+# user's own cargo config, the libraries on the linker's path: a `#[link]`
+# can name one, and only its load-time code would run, since calling into it
+# needs unsafe), and the listed crates' own code at their locked versions
+# (supply chain, design §8; cargo-deny checks their advisories).
+# (Dev-dependencies are not in this tree: only tests can use them.)
+
+# grab OUT ERE FILE WHAT: every match of ERE in FILE, one per line; none, or
+# a grep error, fails the gate.
+grab() {
+    rc=0
+    grep -aoE "$2" "$3" >"$1" || rc=$?
+    case $rc in
+        0) ;;
+        1) fail "INV-23: $4: nothing found (read nothing?)" ;;
+        *) fail "grep error (rc=$rc) reading $4" ;;
+    esac
+}
+cargo metadata --no-deps --format-version 1 >"$tmpdir/meta" || fail "cargo metadata failed (INV-23)"
+grab "$tmpdir/meta-root" '"workspace_root":"[^"]*"' "$tmpdir/meta" "cargo metadata's workspace_root"
+ws_root=$(awk -F'"' 'NR == 1 { print $4 } END { if (NR != 1) exit 1 }' "$tmpdir/meta-root") ||
+    fail "INV-23: cargo metadata names more than one workspace_root"
+case $ws_root in
+    /*) ;;
+    *) fail "INV-23: the workspace root is not an absolute path: $ws_root" ;;
+esac
+case $ws_root in
+    *\\*) fail "INV-23: the workspace root has an escaped character this gate does not read: $ws_root" ;;
+esac
+
+# Packages. $tmpdir/ws-raw is the INV-24 section's tree (normal and build
+# edges, every target). cargo tree prints a crates.io crate as `name vX`,
+# any other source in parentheses: a path, a git URL, another registry.
+ws_root=$ws_root awk '
+    BEGIN { root = ENVIRON["ws_root"] }
+    NF == 0 { next }
+    {
+        line = $0
+        if (substr(line, length(line) - 3) == " (*)") line = substr(line, 1, length(line) - 4)
+        head = $1 " " $2
+        pm = head " (proc-macro)"
+        here = " (" root "/crates/" $1 ")"
+        if ($2 !~ /^v[0-9]/) print "other\t" $0
+        else if (line == head || line == pm) print "registry\t" $1
+        else if (line == head here || line == pm here) print "workspace\t" $1
+        else print "other\t" $0
+    }' "$tmpdir/ws-raw" >"$tmpdir/ws-class" || fail "awk failed classifying the workspace tree (INV-23)"
+awk -F'\t' '$1 == "other" { print $2 }' "$tmpdir/ws-class" >"$tmpdir/ws-other" || fail "awk failed (INV-23)"
+if [ -s "$tmpdir/ws-other" ]; then
+    fail "INV-23: crates in the build whose source this gate does not read (only crates.io crates on its list and workspace crates at crates/<name> are allowed):
+$(cat "$tmpdir/ws-other")"
+fi
+awk -F'\t' '$1 == "workspace" { print $2 }' "$tmpdir/ws-class" >"$tmpdir/ws-members" || fail "awk failed (INV-23)"
+for must in harness-cli harness-sandbox; do
+    grep -qxF "$must" "$tmpdir/ws-members" ||
+        fail "INV-23: the workspace tree does not show $must at crates/$must (read nothing?)"
+done
+awk -F'\t' '$1 == "registry" { print $2 }' "$tmpdir/ws-class" >"$tmpdir/ws-registry-raw" || fail "awk failed (INV-23)"
+sort -u "$tmpdir/ws-registry-raw" >"$tmpdir/ws-registry" || fail "sort failed (INV-23)"
+# The reviewed crates.io crates: the union of the pure crates' allowlists
+# above. None has a process API; a new one needs a review that it has none.
+printf '%s\n' \
+    serde serde_core serde_derive proc-macro2 quote syn unicode-ident \
+    serde_json itoa ryu memchr zmij thiserror thiserror-impl \
+    sha2 digest block-buffer hybrid-array typenum crypto-common cfg-if \
+    cpufeatures libc >"$tmpdir/allowed-registry-raw"
+sort -u "$tmpdir/allowed-registry-raw" >"$tmpdir/allowed-registry" || fail "sort failed (INV-23)"
+comm -23 "$tmpdir/ws-registry" "$tmpdir/allowed-registry" >"$tmpdir/ws-unlisted" || fail "comm failed (INV-23)"
+if [ -s "$tmpdir/ws-unlisted" ]; then
+    fail "INV-23: crates.io crates in the build that are not on this gate's reviewed list (each needs a review that it cannot start a process):
+$(cat "$tmpdir/ws-unlisted")"
+fi
+
+# Targets, from cargo metadata. Each is read in one shape; the count check
+# fails closed if cargo prints its fields in another order.
+grab "$tmpdir/meta-src" '"src_path":' "$tmpdir/meta" "cargo metadata's targets"
+grab "$tmpdir/meta-targets" '"kind":\[[^]]*\],"crate_types":\[[^]]*\],"name":"[^"]*","src_path":"[^"]*"' \
+    "$tmpdir/meta" "cargo metadata's targets"
+n_src=$(awk 'END { print NR }' "$tmpdir/meta-src") || fail "awk failed (INV-23)"
+n_read=$(awk 'END { print NR }' "$tmpdir/meta-targets") || fail "awk failed (INV-23)"
+[ "$n_src" = "$n_read" ] ||
+    fail "INV-23: cargo metadata lists $n_src targets and this gate read $n_read (a field order it does not know?)"
+ws_root=$ws_root awk '
+    BEGIN { root = ENVIRON["ws_root"] "/crates/" }
+    {
+        kind = $0; sub(/^"kind":\[/, "", kind); sub(/\],"crate_types":.*$/, "", kind)
+        ct = $0; sub(/^.*"crate_types":\[/, "", ct); sub(/\],"name":.*$/, "", ct)
+        path = $0; sub(/^.*"src_path":"/, "", path); sub(/"$/, "", path)
+        what = kind " target " path
+        if (kind == "\"lib\"" && ct == "\"lib\"") dir = "src/"
+        else if (kind == "\"bin\"" && ct == "\"bin\"") dir = "src/"
+        else if (kind == "\"test\"" && ct == "\"bin\"") dir = "tests/"
+        else { print "bad\t" what; next }
+        if (index(path, "\\") || index(path, "/../") || index(path, "/./") || index(path, root) != 1) {
+            print "bad\t" what; next
+        }
+        rest = substr(path, length(root) + 1)
+        slash = index(rest, "/")
+        if (slash < 2 || index(substr(rest, slash + 1), dir) != 1) { print "bad\t" what; next }
+        if (dir == "src/") print "root\t" path
+    }' "$tmpdir/meta-targets" >"$tmpdir/meta-class" || fail "awk failed classifying targets (INV-23)"
+awk -F'\t' '$1 == "bad" { print $2 }' "$tmpdir/meta-class" >"$tmpdir/meta-bad" || fail "awk failed (INV-23)"
+if [ -s "$tmpdir/meta-bad" ]; then
+    fail "INV-23: targets this gate does not read or allow (only lib and bin roots under crates/*/src/ and tests under crates/*/tests/):
+$(cat "$tmpdir/meta-bad")"
+fi
+awk -F'\t' '$1 == "root" { print $2 }' "$tmpdir/meta-class" >"$tmpdir/meta-roots" || fail "awk failed (INV-23)"
+grep -qxF "$ws_root/crates/harness-cli/src/main.rs" "$tmpdir/meta-roots" ||
+    fail "INV-23: no target has its root at crates/harness-cli/src/main.rs (read nothing?)"
+: >"$tmpdir/hits"
+while IFS= read -r f; do
+    strip_comments "$f" "$tmpdir/root-stripped"
+    normalise "$tmpdir/root-stripped" "$tmpdir/root-code"
+    awk '{ sub(/^ +/, ""); if (index($0, "#![forbid(unsafe_code)]") != 1) exit 1 }' "$tmpdir/root-code" ||
+        printf '%s: INV-23: does not open with #![forbid(unsafe_code)]\n' "$f" >>"$tmpdir/hits"
+done <"$tmpdir/meta-roots"
+if [ -s "$tmpdir/hits" ]; then
+    fail "INV-23: every crate root forbids unsafe code, first thing (no foreign code, no assembly):
+$(cat "$tmpdir/hits")"
+fi
+
+# Cargo configuration in the repository.
+find . \( -path ./target -o -path ./.git \) -prune -o -name .cargo -print >"$tmpdir/cargo-config" ||
+    fail "find failed (INV-23 cargo configuration)"
+if [ -s "$tmpdir/cargo-config" ]; then
+    fail "INV-23: cargo configuration in the repository (it can add linker arguments or rustc flags):
+$(cat "$tmpdir/cargo-config")"
+fi
 
 printf 'purity gate OK: dependency shape, pure-content, INV-23 argv, INV-28 all clean.\n'

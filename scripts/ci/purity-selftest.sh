@@ -338,6 +338,126 @@ run_purity
 $(cat "$tmpdir/out")"
 printf 'ok accepted: Command in a comment and a string literal\n'
 
+# INV-23 (purity.sh §2f, §5): the binary is built only from what the gate
+# reads (H1f-4 confirming review NF-1..NF-3), and capture.rs is pinned (NF-2).
+# plant_dep CRATE LINE: add LINE under CRATE's [dependencies].
+plant_dep() {
+    awk -v line="$2" '{ print } /^\[dependencies\]/ { print line }' \
+        "$copy/crates/$1/Cargo.toml" >"$tmpdir/Cargo.toml.planted" ||
+        fail "awk failed planting a dependency"
+    mv "$tmpdir/Cargo.toml.planted" "$copy/crates/$1/Cargo.toml" || fail "mv failed"
+    grep -qxF "$2" "$copy/crates/$1/Cargo.toml" || fail "dependency plant did not land"
+}
+# The review's plant: a spawning path dependency outside crates/.
+fresh
+plant vendorlib/zz-spawner/Cargo.toml \
+    '[package]\nname = "zz-spawner"\nversion = "0.0.0"\nedition = "2021"\npublish = false\nlicense = "MIT"\n'
+plant vendorlib/zz-spawner/src/lib.rs \
+    'pub fn run(p: &str, a: &[&str]) { let _ = std::process::Command::new(p).args(a).status(); }\n'
+plant_dep harness-cli 'zz-spawner = { path = "../../vendorlib/zz-spawner" }'
+expect_refusal "a spawning path dependency outside crates/" \
+    "INV-23: crates in the build whose source this gate does not read"
+# A listed crate's name does not admit its source: a [patch] onto a path.
+fresh
+itoa_v=$(awk '/^name = "itoa"$/ { getline; sub(/^version = "/, ""); sub(/"$/, ""); print; exit }' \
+    "$copy/Cargo.lock") || fail "awk failed reading Cargo.lock"
+[ -n "$itoa_v" ] || fail "no itoa in Cargo.lock (the patch plant needs a listed crate in the tree)"
+plant vendorlib/itoa/Cargo.toml \
+    "[package]\nname = \"itoa\"\nversion = \"$itoa_v\"\nedition = \"2021\"\npublish = false\nlicense = \"MIT\"\n"
+plant vendorlib/itoa/src/lib.rs 'pub fn zz() {}\n'
+printf '\n[patch.crates-io]\nitoa = { path = "vendorlib/itoa" }\n' >>"$copy/Cargo.toml" ||
+    fail "could not plant the patch"
+expect_refusal "a [patch] of a listed crate onto a path" \
+    "INV-23: crates in the build whose source this gate does not read"
+# A crates.io crate that is not on the reviewed list (added to the tree by a
+# cargo shim: the selftest runs offline, so it cannot fetch a real one).
+mkdir "$tmpdir/treeshim" || fail "mkdir treeshim failed"
+cat >"$tmpdir/treeshim/cargo" <<EOF
+#!/bin/sh
+# Adds a crates.io crate to the workspace's normal and build tree; everything
+# else is real cargo.
+if [ "\$*" = "tree --workspace --target all -e normal,build --prefix none" ]; then
+    "$real_cargo" "\$@" || exit \$?
+    echo "duct v0.13.7"
+    exit 0
+fi
+exec "$real_cargo" "\$@"
+EOF
+chmod +x "$tmpdir/treeshim/cargo" || fail "chmod treeshim failed"
+fresh
+expect_refusal "a crates.io crate not on the reviewed list" \
+    "INV-23: crates.io crates in the build that are not on this gate's reviewed list" \
+    PATH="$tmpdir/treeshim:$PATH"
+# Targets whose code the scan does not read (NF-3).
+fresh
+mkdir -p "$copy/crates/harness-cli/hidden" || fail "mkdir failed"
+cp "$copy/crates/harness-cli/src/main.rs" "$copy/crates/harness-cli/hidden/main.rs" || fail "cp failed"
+awk '{ if ($0 == "path = \"src/main.rs\"") print "path = \"hidden/main.rs\""; else print }' \
+    "$copy/crates/harness-cli/Cargo.toml" >"$tmpdir/Cargo.toml.planted" || fail "awk failed"
+mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-cli/Cargo.toml" || fail "mv failed"
+grep -qxF 'path = "hidden/main.rs"' "$copy/crates/harness-cli/Cargo.toml" || fail "target plant did not land"
+expect_refusal "the binary's root outside src/" "INV-23: targets this gate does not read or allow"
+fresh
+plant crates/harness-cli/build.rs 'fn main() {}\n'
+expect_refusal "a build script" "INV-23: targets this gate does not read or allow"
+fresh
+plant crates/zz-pm/Cargo.toml \
+    '[package]\nname = "zz-pm"\nversion = "0.0.0"\nedition = "2021"\npublish = false\nlicense = "MIT"\n\n[lib]\nproc-macro = true\n'
+plant crates/zz-pm/src/lib.rs '#![forbid(unsafe_code)]\n'
+expect_refusal "a proc-macro crate" "INV-23: targets this gate does not read or allow"
+# Foreign code: every crate root forbids unsafe code, first thing.
+forbid_case() {
+    fresh
+    awk -v to="$3" '{ if ($0 == "#![forbid(unsafe_code)]") { if (to != "") print to } else print }' \
+        "$copy/crates/$2" >"$tmpdir/root.planted" || fail "awk failed"
+    mv "$tmpdir/root.planted" "$copy/crates/$2" || fail "mv failed"
+    grep -qxF '#![forbid(unsafe_code)]' "$copy/crates/$2" && fail "forbid plant '$1' did not land"
+    expect_refusal "$1" "does not open with #![forbid(unsafe_code)]"
+}
+forbid_case "a crate root without forbid(unsafe_code)" harness-sandbox/src/lib.rs ''
+forbid_case "forbid(unsafe_code) switched off by cfg_attr" harness-tools/src/lib.rs \
+    '#![cfg_attr(any(), forbid(unsafe_code))]'
+# Cargo configuration can add linker arguments.
+fresh
+plant .cargo/config.toml '[build]\n'
+expect_refusal "cargo configuration in the repository" "INV-23: cargo configuration in the repository"
+# capture.rs is pinned: what the literal check cannot see (NF-2).
+capture_case() {
+    fresh
+    awk -v from="$2" -v to="$3" '{ i = index($0, from); if (i) $0 = substr($0, 1, i - 1) to substr($0, i + length(from)); print }' \
+        "$copy/crates/harness-sandbox/src/capture.rs" >"$tmpdir/capture.planted" || fail "awk failed"
+    mv "$tmpdir/capture.planted" "$copy/crates/harness-sandbox/src/capture.rs" || fail "mv failed"
+    grep -qF "$3" "$copy/crates/harness-sandbox/src/capture.rs" || fail "capture plant '$1' did not land"
+    expect_refusal "$1" "crates/harness-sandbox/src/capture.rs is not the reviewed version"
+}
+capture_case "a relative program in capture.rs" 'Command::new("/sbin/mount")' 'Command::new("mount")'
+capture_case "an extra argument in capture.rs" '"hw.logicalcpu"]' '"hw.logicalcpu", "-a"]'
+# cargo metadata failing, or printing targets in a shape the gate does not
+# read, fails the gate.
+mkdir "$tmpdir/metashim" || fail "mkdir metashim failed"
+cat >"$tmpdir/metashim/cargo" <<EOF
+#!/bin/sh
+# SHIM_META=fail: cargo metadata fails. SHIM_META=reshape: its first target
+# has a field renamed. Everything else is real cargo.
+if [ "\$1" = metadata ]; then
+    case \${SHIM_META:-} in
+        fail) echo "error: simulated cargo metadata failure" >&2; exit 101 ;;
+        reshape)
+            "$real_cargo" "\$@" >"$tmpdir/meta-real" || exit \$?
+            sed 's/"crate_types":/"crate_kinds":/' "$tmpdir/meta-real"
+            exit \$? ;;
+    esac
+fi
+exec "$real_cargo" "\$@"
+EOF
+chmod +x "$tmpdir/metashim/cargo" || fail "chmod metashim failed"
+fresh
+expect_refusal "cargo metadata fails" "cargo metadata failed (INV-23)" \
+    PATH="$tmpdir/metashim:$PATH" SHIM_META=fail
+fresh
+expect_refusal "cargo metadata prints a target in another shape" "a field order it does not know?" \
+    PATH="$tmpdir/metashim:$PATH" SHIM_META=reshape
+
 # H1a review N-3: the remaining name-scan gaps.
 n3_case() {
     fresh
