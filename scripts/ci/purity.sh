@@ -1,8 +1,9 @@
 #!/bin/sh
 # Purity + INV-28 gates (rustyharness design docs/01-design-v0.1.md §1.2).
 #
-# Two pure crates: gate-outcome and harness-core. Purity means no I/O, no
-# async, no clock reads, no global state — checked two ways:
+# Four pure crates: gate-outcome, harness-core, harness-manifest and
+# harness-policy. Purity means no I/O, no async, no clock reads, no global
+# state — checked two ways:
 #
 #   1. dependency shape: `cargo tree -e normal` of each pure crate must stay
 #      inside its reviewed allowlist (gate-outcome has ZERO default deps);
@@ -92,6 +93,30 @@ printf '%s\n' \
 sort -u "$tmpdir/allowed-core-raw" >"$tmpdir/allowed-core" || fail "sort failed"
 refuse_intruders "$tmpdir/core" "$tmpdir/allowed-core" "harness-core"
 
+# harness-manifest and harness-policy (design §1.2): serde, serde_json,
+# thiserror (+ its proc-macro), and policy -> manifest. No SHA-256 or
+# ed25519 crate yet (pinning and signing are H4); adding one is a review
+# decision recorded here with its reason.
+#   serde stack (serde, serde_core, serde_derive, proc-macro2, quote, syn,
+#     unicode-ident, serde_json, itoa, ryu, memchr, zmij): as above;
+#   thiserror, thiserror-impl: derive-only error Display, no runtime code.
+tree_names "$tmpdir/manifest" harness-manifest
+grep -qxF serde_json "$tmpdir/manifest" ||
+    fail "harness-manifest tree does not contain serde_json (read the wrong tree?)"
+printf '%s\n' \
+    harness-manifest serde serde_core serde_derive proc-macro2 quote syn \
+    unicode-ident serde_json itoa ryu memchr zmij thiserror thiserror-impl \
+    >"$tmpdir/allowed-manifest-raw"
+sort -u "$tmpdir/allowed-manifest-raw" >"$tmpdir/allowed-manifest" || fail "sort failed"
+refuse_intruders "$tmpdir/manifest" "$tmpdir/allowed-manifest" "harness-manifest"
+
+tree_names "$tmpdir/policy" harness-policy
+grep -qxF harness-manifest "$tmpdir/policy" ||
+    fail "harness-policy tree does not contain harness-manifest (read the wrong tree?)"
+printf '%s\n' harness-policy >>"$tmpdir/allowed-manifest-raw" || fail "printf failed"
+sort -u "$tmpdir/allowed-manifest-raw" >"$tmpdir/allowed-policy" || fail "sort failed"
+refuse_intruders "$tmpdir/policy" "$tmpdir/allowed-policy" "harness-policy"
+
 # --- shared: file lists and normalisation -----------------------------------
 
 # rust_files OUT DIR...: every .rs file under DIR... (src, tests, benches,
@@ -138,9 +163,14 @@ nb='[^A-Za-z0-9_]'
 # Refuse I/O, process, environment, thread, console, and clock facilities BY
 # NAME in the pure crates. (std::time::Duration is fine: it is a length of
 # time, not a clock read — time is passed IN, design §2.4.)
-facility='(fs|net|process|env|io|os|thread)'
-rust_files "$tmpdir/pure-files" crates/gate-outcome crates/harness-core
-for must in crates/gate-outcome/src/lib.rs crates/harness-core/src/lib.rs; do
+# `path` is in the list (review F-2): std::path::Path does filesystem I/O
+# through methods (exists, canonicalize, read_dir, ...) that never name
+# std::fs, so the pure crates may not import std::path at all.
+facility='(fs|net|process|env|io|os|thread|path)'
+rust_files "$tmpdir/pure-files" crates/gate-outcome crates/harness-core \
+    crates/harness-manifest crates/harness-policy
+for must in crates/gate-outcome/src/lib.rs crates/harness-core/src/lib.rs \
+    crates/harness-manifest/src/lib.rs crates/harness-policy/src/lib.rs; do
     grep -qxF "$must" "$tmpdir/pure-files" || fail "pure-content scan would miss $must"
 done
 : >"$tmpdir/hits"
@@ -156,6 +186,9 @@ while IFS= read -r f; do
     scan "renamed std" "(^|$nb)std as($nb|\$)" "$tmpdir/norm" "$f"
     scan "renamed std" "(^|$nb)std::\{([^;]*[^A-Za-z0-9_;])?self($nb|\$)" "$tmpdir/norm" "$f"
     scan "clock" "(^|$nb)(SystemTime|Instant|UNIX_EPOCH)($nb|\$)" "$tmpdir/norm" "$f"
+    # Path/PathBuf I/O methods, however the receiver was obtained (belt and
+    # braces for the `path` facility above).
+    scan "path I/O method" "\.(exists|try_exists|metadata|symlink_metadata|canonicalize|read_dir|read_link|is_file|is_dir|is_symlink) ?\(" "$tmpdir/norm" "$f"
     scan "console" "(^|$nb)(print|println|eprint|eprintln|dbg)!" "$tmpdir/norm" "$f"
     scan "thread" "(^|$nb)thread::spawn($nb|\$)" "$tmpdir/norm" "$f"
     scan "async" "(^|$nb)async ?(fn|move|\{)" "$tmpdir/norm" "$f"

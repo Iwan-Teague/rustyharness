@@ -53,14 +53,36 @@
 use std::fmt;
 
 /// Identity of the gate that produced a report (vocabulary §2).
+///
+/// Content-checked at construction (and therefore on the wire too): an id
+/// is non-empty and contains no whitespace and no control character. An
+/// empty id would let the marker content `"ok "` name it, and a trailing
+/// `\r` in an id would let a CRLF marker line match it (design §7.3,
+/// "Marker content"); both are refused here rather than special-cased in
+/// the marker matcher. The string is otherwise opaque to this crate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "json", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "json",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(try_from = "String", into = "String")
+)]
 pub struct GateId(String);
 
 impl GateId {
-    /// Names a gate. The string is opaque to this crate.
-    pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
+    /// Names a gate. Refuses an empty id and any id containing whitespace
+    /// or a control character.
+    pub fn new(id: impl Into<String>) -> Result<Self, GateIdError> {
+        let id = id.into();
+        if id.is_empty() {
+            return Err(GateIdError::Empty);
+        }
+        if let Some((at, _)) = id
+            .char_indices()
+            .find(|(_, c)| c.is_whitespace() || c.is_control())
+        {
+            return Err(GateIdError::ForbiddenChar { at });
+        }
+        Ok(Self(id))
     }
 
     /// Borrows the gate name.
@@ -74,6 +96,46 @@ impl fmt::Display for GateId {
         f.write_str(&self.0)
     }
 }
+
+impl TryFrom<String> for GateId {
+    type Error = GateIdError;
+
+    fn try_from(id: String) -> Result<Self, Self::Error> {
+        Self::new(id)
+    }
+}
+
+impl From<GateId> for String {
+    fn from(id: GateId) -> Self {
+        id.0
+    }
+}
+
+/// Why a gate id was refused at construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateIdError {
+    /// The id is the empty string.
+    Empty,
+    /// The id contains whitespace or a control character.
+    ForbiddenChar {
+        /// Byte offset of the first offending character.
+        at: usize,
+    },
+}
+
+impl fmt::Display for GateIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("gate id is empty"),
+            Self::ForbiddenChar { at } => write!(
+                f,
+                "gate id contains whitespace or a control character at byte {at}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GateIdError {}
 
 /// Opaque 32-byte content claim.
 ///
@@ -553,7 +615,7 @@ impl serde::Serialize for GateOutcome {
 ///
 /// ```compile_fail
 /// let r = gate_outcome::GateReport {
-///     gate: gate_outcome::GateId::new("g"),
+///     gate: gate_outcome::GateId::new("g").unwrap(),
 ///     outcome: gate_outcome::GateOutcome::Failed,
 ///     findings: Vec::new(),
 ///     coverage: gate_outcome::Coverage::Full,
@@ -1215,6 +1277,45 @@ mod tests {
     const D2: Digest = Digest([2u8; 32]);
     const D3: Digest = Digest([3u8; 32]);
 
+    /// A lawful gate id for tests (refusal cases call `GateId::new` directly).
+    fn gid(id: &str) -> GateId {
+        GateId::new(id).expect("test gate id is lawful")
+    }
+
+    // Carry-over N-2 (H1a confirming review): an empty id let the marker
+    // content "ok " pass. Refused at construction now, and on the wire.
+    #[test]
+    fn gate_id_refuses_empty_whitespace_and_control() {
+        assert_eq!(GateId::new(""), Err(GateIdError::Empty));
+        for (bad, at) in [
+            (" ", 0),
+            ("a b", 1),
+            ("g\r", 1),
+            ("g\n", 1),
+            ("\tg", 0),
+            ("g\0", 1),
+            ("g\u{85}", 1),
+            ("g\u{a0}", 1),
+            ("g\u{2028}", 1),
+        ] {
+            assert_eq!(
+                GateId::new(bad),
+                Err(GateIdError::ForbiddenChar { at }),
+                "id {bad:?} must be refused"
+            );
+        }
+        assert_eq!(gid("cargo-test.unit_1").as_str(), "cargo-test.unit_1");
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn gate_id_wire_form_refuses_empty() {
+        assert!(serde_json::from_str::<GateId>("\"\"").is_err());
+        assert!(serde_json::from_str::<GateId>("\"g\\r\"").is_err());
+        let g: GateId = serde_json::from_str("\"g\"").expect("lawful id parses");
+        assert_eq!(serde_json::to_string(&g).expect("serialises"), "\"g\"");
+    }
+
     fn finding(sev: Severity, code: &str) -> Finding {
         Finding::literal(
             sev,
@@ -1242,7 +1343,7 @@ mod tests {
     /// A lawful minted pass (crate-internal, as run_checked would build it).
     fn passed_report(gate: &str) -> GateReport {
         GateReport::build(
-            GateId::new(gate),
+            gid(gate),
             GateOutcome::Passed(Witness::from_run_checked(2, D1)),
             Vec::new(),
             Coverage::Full,
@@ -1252,7 +1353,7 @@ mod tests {
 
     fn failed_report(gate: &str) -> GateReport {
         GateReport::new(
-            GateId::new(gate),
+            gid(gate),
             GateOutcome::Failed,
             vec![finding(Severity::Blocking, "b")],
             Coverage::Full,
@@ -1263,7 +1364,7 @@ mod tests {
 
     fn indet_report(gate: &str, why: IndeterminateKind) -> GateReport {
         GateReport::new(
-            GateId::new(gate),
+            gid(gate),
             indet(why),
             Vec::new(),
             Coverage::Full,
@@ -1304,7 +1405,7 @@ mod tests {
         let good = passed_report("good");
         assert_eq!(
             GateReport::new(
-                GateId::new("other"),
+                gid("other"),
                 good.outcome().clone(),
                 Vec::new(),
                 Coverage::Full,
@@ -1320,7 +1421,7 @@ mod tests {
         // Failed needs a Blocking finding.
         assert_eq!(
             GateReport::new(
-                GateId::new("g"),
+                gid("g"),
                 GateOutcome::Failed,
                 vec![finding(Severity::High, "h")],
                 Coverage::Full,
@@ -1494,7 +1595,7 @@ mod tests {
         impl Check for Empty {
             type Input = ();
             fn gate(&self) -> GateId {
-                GateId::new("empty")
+                gid("empty")
             }
             fn examine(&self, _input: &()) -> Examination {
                 Examination {
@@ -1516,7 +1617,7 @@ mod tests {
         impl Check for RefutedEarly {
             type Input = ();
             fn gate(&self) -> GateId {
-                GateId::new("early")
+                gid("early")
             }
             fn examine(&self, _input: &()) -> Examination {
                 Examination {
@@ -1537,7 +1638,7 @@ mod tests {
         impl Check for Partial {
             type Input = ();
             fn gate(&self) -> GateId {
-                GateId::new("partial")
+                gid("partial")
             }
             fn examine(&self, _input: &()) -> Examination {
                 Examination {
@@ -1565,7 +1666,7 @@ mod tests {
         impl Check for Good {
             type Input = ();
             fn gate(&self) -> GateId {
-                GateId::new("good")
+                gid("good")
             }
             fn examine(&self, _input: &()) -> Examination {
                 Examination {
@@ -1593,7 +1694,7 @@ mod tests {
 
         fn legacy(exit: ExitKind, marker: Option<&str>, timed_out: bool) -> ChildRun {
             ChildRun::new(
-                GateId::new("c"),
+                gid("c"),
                 exit,
                 "last line".to_string(),
                 marker.map(str::to_string),
@@ -1629,6 +1730,26 @@ mod tests {
                 assert_eq!(w.checked(), 0);
                 assert_eq!(w.digest(), &D1);
             }
+        }
+
+        // Carry-over N-5 (H1a confirming review), decided: a CRLF marker is
+        // REFUSED. The marker is exactly `ok <gate-id>` with at most one
+        // trailing LF (design §7.3, "Marker content"). A Windows child must
+        // write LF; `\r\n` is `UnreadableEvidence`, never a pass, and a gate
+        // id cannot end in `\r` (N-2), so no id can absorb the CR either.
+        #[test]
+        fn crlf_marker_is_refused_not_tolerated() {
+            for marker in ["ok c\r\n", "ok c\r", "ok c\r\n\r\n"] {
+                let report = interpret(&legacy(ExitKind::Code(0), Some(marker), false));
+                assert_eq!(
+                    report.outcome,
+                    indet(IndeterminateKind::UnreadableEvidence),
+                    "CRLF marker {marker:?} must be refused"
+                );
+            }
+            // Control: the LF form of the same marker passes.
+            let report = interpret(&legacy(ExitKind::Code(0), Some("ok c\n"), false));
+            assert!(matches!(report.outcome, GateOutcome::Passed(_)));
         }
 
         #[test]
@@ -1688,7 +1809,7 @@ mod tests {
         #[test]
         fn could_not_run_records_child_evidence() {
             let run = ChildRun::new(
-                GateId::new("c"),
+                gid("c"),
                 ExitKind::Signal(15),
                 "aborted mid-check".to_string(),
                 None,
@@ -1712,7 +1833,7 @@ mod tests {
         #[test]
         fn protocol_report_without_json_feature_is_unreadable() {
             let run = ChildRun::new(
-                GateId::new("c"),
+                gid("c"),
                 ExitKind::Code(0),
                 "{}".to_string(),
                 Some("ok c".to_string()),
@@ -1751,7 +1872,7 @@ mod tests {
             }
 
             fn speaker(exit: ExitKind, line: String, timed_out: bool) -> ChildRun {
-                ChildRun::new(GateId::new("c"), exit, line, None, timed_out, D1, true)
+                ChildRun::new(gid("c"), exit, line, None, timed_out, D1, true)
             }
 
             #[test]
@@ -1983,7 +2104,7 @@ mod tests {
                 // Not declared a speaker: the line is ignored and the exit
                 // convention governs (no marker → NothingChecked).
                 let run = ChildRun::new(
-                    GateId::new("c"),
+                    gid("c"),
                     ExitKind::Code(0),
                     passing_wire(),
                     None,

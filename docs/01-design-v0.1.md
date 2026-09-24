@@ -1,6 +1,6 @@
 # 01 — rustyharness design v0.1
 
-**Status:** v0.2, 2026-09-23 — reviewed **SOUND** (first review NEEDS-FIXES; rework; confirming review SOUND with two LOW clarifications, applied). Not yet built; next: H1 read-only agent.
+**Status:** v0.2, 2026-09-23 — reviewed **SOUND** (first review NEEDS-FIXES; rework; confirming review SOUND with two LOW clarifications, applied). H1 in progress: clarifications made while building are listed in "Changes since v0.2"; none changes the architecture.
 
 Supersedes nothing yet. It answers the questions the overview framed
 ([00-overview.md](00-overview.md)) and most of [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md). Where a
@@ -48,6 +48,24 @@ v0.2 answers the first independent review (REVIEW-rustyharness-design-v01, verdi
 | Review Q7 note | coverage | A read-only Windows session with a verification plan is never `Passed`; this is stated to users. | §11 OQ4 |
 | (editorial) | — | Crate-map cycle removed: `harness-sandbox-windows` now holds Win32 primitives only and depends on `harness-core`, not `harness-sandbox`. The dependency list is redrawn as explicit edges. | §1.2 |
 
+## Changes since v0.2
+
+Clarifications made while building H1. None changes the architecture, a decision in §0 or an invariant; each narrows an open detail in the fail-closed direction.
+
+| Slice | What changed | Where |
+|---|---|---|
+| H1a | §7.3 gained five clarifications of the child-protocol table (run-level facts first, gate id, wire form, exit agreement, marker content). `gate-outcome` implements them; the H1a confirming review checked each against the code. | §7.3 |
+| H1b | The §1.4 sketch now shows what `ChildRun` carries (the marker's content, not a "marker seen" flag, and `speaks_protocol`) and that `GateId` is content-checked. | §1.4 |
+| H1b | Marker line endings decided: LF only; a CRLF marker is `UnreadableEvidence`. `GateId` refuses empty ids and ids with whitespace or control characters (an empty id let `ok ` pass). | §7.3 "Line endings", §1.4 |
+| H1b | Manifest v1 wire shapes fixed: `transport` is `{"kind": "builtin"}`, `{"kind": "mcp-stdio", "argv": […], "env_allow": […]}` or `{"kind": "in-process", "feature": "…"}`. Per-transport fields are present exactly when meaningful: `mcp_name` and a non-empty `mcp_protocols` only for mcp-stdio; `schema_sha256`/`description_sha256` required for every non-builtin transport and refused on built-ins. `min_harness` is a strict `MAJOR.MINOR.PATCH`. `summary` is an allowlist (printable ASCII plus letters). Only the compiled-in manifest may use `builtin`. No field is nullable: an explicit `null` anywhere is refused, never read as absent. An mcp-stdio `argv[0]` must be absolute, not UNC (two leading separators in any mix) and without a `..` component. | §4.1, §4.3 |
+| H1b | The §3.3 schema subset is enforced per type (a keyword is legal only on the type it constrains, so none is silently ignored), with nesting depth ≤ 4 and property names `[a-z][a-z0-9_]{0,63}`; `integer` bounds are compared exactly (as integers, not through floating point). | §3.3, §4.3 |
+| H1b | Admission in H1 admits only the `builtin` tier: `signed`, `pinned`, mcp-stdio, in-process and secret handles are refused with a typed "not in this build" error until the slice that can honour them (H2/H4). Shadowing and the `pinned` tier limits are checked before that gate. | §4.4 |
+| H1b | The built-in fs tools are labelled `content: third_party` (workspace text is other people's by default, §5.4). No default decision changes. Their `path` argument must be a normalised relative path with no `..`, `.`, empty component, `\`, `:`, control character, or component ending in `.` or space (the lexical half of INV-30). | §4.8 |
+| H1b | Policy for read classes: every decision carries a rule id; user policy is three selector lists (`<capability id>` or `<provider>.*`), and a selector repeated anywhere is refused as ambiguous. An `Ask` cannot mint `Authorized<Call>` until approval tokens exist (H2). | §5.1, §5.2 |
+| H1b | `harness-manifest` and `harness-policy` do not depend on `harness-core` yet: nothing in it is needed so far. The §1.2 edge stays allowed; using it later is a dependency-allowlist change in `scripts/ci/purity.sh`. No architecture change. | §1.2 |
+| H1b | The workspace path rule also refuses Windows reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM0`-`COM9`, `LPT0`-`LPT9`, `COM¹`-`COM³`, `LPT¹`-`LPT³`, `CONIN$`, `CONOUT$`) as the stem of any component, case-insensitively, with any extension, on every OS: Win32 opens them as devices, so `CONIN$` would read console input. The pure crates may not import `std::path` (its methods do I/O without naming `std::fs`); the purity gate refuses it and the `Path` I/O methods. | §4.8, §1.2 |
+| H1b | Filesystem locality is split: the pure allowlist decision lives in `harness-policy` (`locality::classify`), the measuring probe in `harness-sandbox` (after S-F1). Until a probe exists for an OS, the check refuses every `state_root` there. The probe takes the path as an opaque string, so the pure crate holds no `std::path`. | §2.8, §1.2 |
+
 ---
 
 ## 0. Decisions at a glance
@@ -89,12 +107,12 @@ The only channel from reasoning to action is the parsed action of the **model's 
 |---|---|---|---|---|
 | `gate-outcome` | **new, standalone repo** (§1.4) | yes, std-only | nothing | UNIFIED `GateOutcome`, `IndeterminateKind`, `Witness`, `GateReport`, `Finding`, `Severity`, `Coverage`, `Scope`, `verdict()`, `run_checked`, child-protocol interpretation |
 | `harness-core` | keep, extend | yes | `gate-outcome` | `Untrusted<T>`, `Source`, `Meter` (multi-dimension budgets, grown from `Budget`), `RunId`/`Attempt`, the turn state machine as a pure transition function, loop detection, `StopCause` |
-| `harness-manifest` | **split** from `harness-tools` (schema half) | yes | `harness-core` | Manifest v1 types, a duplicate-key-refusing parser, validation, hash pinning, signature verification (keys passed in) |
-| `harness-policy` | **new** | yes | `harness-core`, `harness-manifest` | Effective-class computation (max-rule), the decision function, trifecta computation, approval-token verification, the `Authorized<Call>` minting point |
+| `harness-manifest` | **split** from `harness-tools` (schema half) | yes | `harness-core` (allowed edge, unused so far; see Changes since v0.2) | Manifest v1 types, a duplicate-key-refusing parser, validation, hash pinning, signature verification (keys passed in) |
+| `harness-policy` | **new** | yes | `harness-core` (allowed edge, unused so far), `harness-manifest` | Effective-class computation (max-rule), the decision function, trifecta computation, approval-token verification, the `Authorized<Call>` minting point, the pure filesystem-locality decision (§2.8) |
 | `harness-model` | keep, change `Message` (F4) | no | `harness-core` | `ModelBackend`, message types, profiles, text-protocol parser, OpenAI-compatible client (feature `hosted` adds TLS), replay backend |
 | `harness-tools` | **split** (provider half) | no | `harness-core`, `harness-manifest`, `harness-policy`, `harness-sandbox`, `harness-journal` | `ToolProvider` trait (accepts only `Journaled<Authorized<Call>>`, §2.2), built-in tools (§4.8), edit engine (§4.9) |
 | `harness-mcp` | **new** | no | `harness-tools`, `rmcp` | MCP stdio client adapter, connect-time manifest comparator, quarantine state |
-| `harness-sandbox` | keep, change `Containment` (F5) | no | `harness-core`, `harness-sandbox-windows` (Windows targets only) | `Backend` trait, `Conformed` token, `ConfinedSpec`, Linux and macOS backends, egress proxy, confined file-op helper, filesystem-locality check (§2.8) |
+| `harness-sandbox` | keep, change `Containment` (F5) | no | `harness-core`, `harness-sandbox-windows` (Windows targets only) | `Backend` trait, `Conformed` token, `ConfinedSpec`, Linux and macOS backends, egress proxy, confined file-op helper, the filesystem-locality **probe** (§2.8; the allowlist decision is in `harness-policy`) |
 | `harness-sandbox-windows` | **new** | no | `harness-core`, `windows` | Win32 primitives only: AppContainer profile, Job Object, restricted spawn, volume-type query. `harness-sandbox` wraps them into the Windows `Backend`, so `Conformed` is still minted only in `harness-sandbox`. The **only** crate allowed `unsafe` (§6.7). |
 | `harness-conformance` | **new** (test crate, `publish = false`) | n/a | `harness-sandbox` | Hostile-task corpus (§6.6) as data plus a runner, and the committed per-OS pass matrix |
 | `harness-journal` | keep, replace `Sink` (F11) | no | `harness-core`, `gate-outcome` | Hash-chained append-only writer, verifying reader, blob store, replay source |
@@ -153,7 +171,9 @@ pub struct GateReport { /* gate id, outcome, findings: Vec<Finding>, coverage: C
 pub fn verdict(reports: &[GateReport]) -> GateOutcome;   // total, worst-wins, verdict(&[]) = Indeterminate{NothingChecked}
 pub trait Check { type Input; fn examine(&self, input: &Self::Input) -> Examination; }
 pub fn run_checked<C: Check>(check: &C, input: &C::Input) -> GateReport; // the ONLY Witness mint
-pub mod child { pub struct ChildRun { /* exit kind, last stdout line, marker seen, timed out, capture: Digest */ }
+pub struct GateId(String);                                // non-empty, no whitespace or control chars; GateId::new -> Result
+pub mod child { pub struct ChildRun { /* gate, exit kind, last stdout line, marker: Option<String> (GATE_OK_FILE content, §7.3),
+                                         timed out, capture: Digest, speaks_protocol: bool (from the check plan) */ }
                 pub fn interpret(run: &ChildRun) -> GateReport; }            // UNIFIED §6, verbatim
 ```
 
@@ -317,7 +337,7 @@ The **sentinel** is the `task.submit` tool call (the analogue of mini-SWE-agent'
 - **Concurrency.** A semaphore per model endpoint limits parallel runs, default 1 for loopback endpoints (R3 H-10). Launches beyond the limit queue; they never storm the server.
 - **Refusals.** A `state_root` inside a workspace is refused at startup. So is a `state_root` that is not **positively identified as a local filesystem**. The single-writer lock and the fsync durability of §7.1 do not hold reliably on network filesystems.
 
-**Filesystem-locality check** (`harness-sandbox::fs_locality(path) -> Result<LocalFs, Refused>`). It is an **allowlist**, not a network-FS denylist, so an unrecognised filesystem is refused rather than assumed local. It runs on the canonicalised `state_root` at startup and again on each new `attempt-<n>` directory, so a mount placed under `state_root` is caught:
+**Filesystem-locality check.** Split in two (see Changes since v0.2): a probe in `harness-sandbox` measures the filesystem (`LocalityProbe::query(path) -> FsQuery`), and the pure allowlist decision `harness_policy::locality::classify(&FsQuery) -> Result<LocalFs, LocalityRefused>` decides; `locality::check(probe, path)` runs both. It is an **allowlist**, not a network-FS denylist, so an unrecognised filesystem is refused rather than assumed local. It runs on the canonicalised `state_root` at startup and again on each new `attempt-<n>` directory, so a mount placed under `state_root` is caught:
 
 | OS | Mechanism | Admitted | Refused |
 |---|---|---|---|
@@ -898,6 +918,7 @@ Clarifications of this table (recorded during H1; `gate-outcome` implements them
 - **Wire form.** The report line is exactly the JSON that `GateReport`'s `Serialize` writes. Unknown fields at any level are refused (`UnreadableEvidence`). The parent re-checks the report laws and INV-18 (`checked: 0` gives `NothingChecked`) and never upgrades a declared non-pass.
 - **Exit agreement.** A declared `Passed` needs exit 0 and a declared `Failed` needs exit 1. A declared `Indeterminate` needs any other code. Disagreement is `UnreadableEvidence`.
 - **Marker content.** The marker counts only when the file reads exactly `ok <gate-id>` for this check (one trailing newline allowed). Any other content is `UnreadableEvidence`.
+- **Line endings: LF only.** The one tolerated trailing newline is `\n`. A CRLF marker (`ok <gate-id>\r\n`) is `UnreadableEvidence`, on every OS: a Windows child must write LF. This is the fail-closed choice; it costs availability for Windows children that write CRLF, never correctness. Gate ids are content-checked at construction (non-empty, no whitespace, no control characters), so no id can absorb a stray `\r` and the content `ok ` cannot name an empty id.
 
 **Built-in check adapters** cover common tools that do not speak the protocol, such as `cargo test` and `pytest`. Each implements `gate_outcome::Check` over captured output. For example, `cargo test` passes with `N` > 0 tests executed and 0 failed, and `N = 0` gives `NothingChecked`. The adapters are part of the trust base, reviewed like gates, and each carries a **refusal witness** test: a fixture where it must refuse (R3 H-04).
 

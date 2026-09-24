@@ -31,10 +31,28 @@ name = "harness-journal"
 version = "0.0.1"
 
 [[package]]
+name = "harness-manifest"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "harness-model"
 version = "0.0.1"
 dependencies = [
  "harness-core",
+ "thiserror",
+]
+
+[[package]]
+name = "harness-policy"
+version = "0.0.1"
+dependencies = [
+ "harness-manifest",
+ "serde_json",
  "thiserror",
 ]
 

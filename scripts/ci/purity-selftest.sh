@@ -88,6 +88,27 @@ content_case "async fn" 'async fn f() {}\n'
 fresh
 plant crates/gate-outcome/tests/zz_plant.rs 'use std::{env, fmt};\n'
 expect_refusal "gate-outcome integration test uses env" "pure sources name forbidden facilities"
+# The two H1b pure crates are scanned too (a plant in each must be refused).
+fresh
+plant crates/harness-manifest/src/zz_plant.rs 'fn f() { let _ = std::fs::read("m.json"); }\n'
+expect_refusal "harness-manifest reads a file" "pure sources name forbidden facilities"
+fresh
+plant crates/harness-policy/src/zz_plant.rs 'use std::time::SystemTime;\n'
+expect_refusal "harness-policy reads the clock" "pure sources name forbidden facilities"
+# Review F-2: filesystem I/O through std::path methods never names std::fs.
+fresh
+plant crates/harness-policy/src/zz_plant.rs 'use std::path::Path;\npub(crate) fn zz(p: &Path) -> bool { p.exists() || p.canonicalize().is_ok() || p.read_dir().is_ok() }\n'
+expect_refusal "harness-policy does I/O through Path methods" "pure sources name forbidden facilities"
+fresh
+plant crates/harness-manifest/src/zz_plant.rs 'fn zz(p: &str) -> bool { let q = std::path::PathBuf::from(p); q.is_file() }\n'
+expect_refusal "harness-manifest does I/O through PathBuf::is_file" "pure sources name forbidden facilities"
+fresh
+plant crates/harness-core/src/zz_plant.rs 'fn zz(p: &::std::path::Path) -> bool { p.try_exists().is_ok() || p.symlink_metadata().is_ok() || p.read_link().is_ok() || p.metadata().is_ok() || p.is_dir() }\n'
+expect_refusal "harness-core does I/O through Path methods" "pure sources name forbidden facilities"
+# The method scan alone (the receiver's type is never named here).
+fresh
+plant crates/harness-policy/src/zz_plant.rs 'fn zz<P: Sized>(p: P, f: impl Fn(&P) -> bool) -> bool { f(&p) }\nfn yy(q: &Q) -> bool { q.canonicalize ().is_ok() }\n'
+expect_refusal "Path I/O method on an unnamed receiver type" "path I/O method"
 
 # --- INV-28 plants ------------------------------------------------------------
 inv28_case() {
@@ -100,6 +121,7 @@ inv28_case "enum<TAB>RunOutcome" crates/harness-core/src/zz_plant.rs 'pub enum\t
 inv28_case "enum<NL>RunVerdict" crates/harness-core/src/zz_plant.rs 'pub enum\nRunVerdict { A }\n'
 inv28_case "enum in benches/" crates/harness-core/benches/zz_plant.rs 'enum RunOutcome { A }\n'
 inv28_case "enum in another harness crate" crates/harness-tools/src/zz_plant.rs 'enum ToolVerdict { A }\n'
+inv28_case "enum in harness-policy" crates/harness-policy/src/zz_plant.rs 'pub enum PolicyOutcome { Allow }\n'
 
 # --- dependency plant ---------------------------------------------------------
 fresh
@@ -110,6 +132,15 @@ mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-core/Cargo.toml" || fail "
 grep -qF 'harness-tools = { path' "$copy/crates/harness-core/Cargo.toml" ||
     fail "dependency plant did not land"
 expect_refusal "harness-core depends on harness-tools" "harness-core pulled in non-allowlisted crates"
+
+fresh
+awk '{ print } /^\[dependencies\]/ { print "harness-tools = { path = \"../harness-tools\" }" }' \
+    "$copy/crates/harness-policy/Cargo.toml" >"$tmpdir/Cargo.toml.planted" ||
+    fail "awk failed planting a dependency"
+mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-policy/Cargo.toml" || fail "mv failed"
+grep -qF 'harness-tools = { path' "$copy/crates/harness-policy/Cargo.toml" ||
+    fail "dependency plant did not land"
+expect_refusal "harness-policy depends on harness-tools" "harness-policy pulled in non-allowlisted crates"
 
 # --- tool failures must fail closed -------------------------------------------
 mkdir "$tmpdir/shim" || fail "mkdir shim failed"
@@ -140,6 +171,12 @@ expect_refusal "cargo tree fails (json tree only)" "cargo tree failed: -p gate-o
 fresh
 expect_refusal "cargo tree fails (harness-core tree only)" "cargo tree failed: -p harness-core" \
     PATH="$shim_path" SHIM_FAIL_ARG=harness-core
+fresh
+expect_refusal "cargo tree fails (harness-manifest tree only)" "cargo tree failed: -p harness-manifest" \
+    PATH="$shim_path" SHIM_FAIL_ARG=harness-manifest
+fresh
+expect_refusal "cargo tree fails (harness-policy tree only)" "cargo tree failed: -p harness-policy" \
+    PATH="$shim_path" SHIM_FAIL_ARG=harness-policy
 fresh
 expect_refusal "cargo tree prints nothing" "read nothing" \
     PATH="$shim_path" SHIM_EMPTY=1
