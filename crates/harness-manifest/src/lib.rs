@@ -7,7 +7,7 @@
 //! [`Manifest`] whose CONTENT was checked, or a typed [`ManifestError`].
 //!
 //! What parsing refuses (§4.3), each with a test:
-//! - duplicate JSON keys at any depth (INV-22, [`strict_json`]);
+//! - duplicate JSON keys at any depth (INV-22, `harness_core::strict_json`);
 //! - unknown fields and unknown dimension values (`deny_unknown_fields`);
 //! - a schema version outside [`SUPPORTED_SCHEMA_VERSIONS`], naming both;
 //!   v0 gets a migration message;
@@ -42,7 +42,7 @@ use serde_json::Value;
 pub mod admission;
 pub mod builtin;
 pub mod schema;
-mod strict_json;
+use harness_core::strict_json;
 
 pub use schema::{ArgsError, InputSchema, SchemaError};
 

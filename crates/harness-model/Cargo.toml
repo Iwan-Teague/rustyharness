@@ -1,6 +1,6 @@
 [package]
 name = "harness-model"
-description = "rustyharness model backends: the model is a swappable part, never the harness."
+description = "rustyharness model layer: loopback OpenAI-compatible client, both action protocols, profiles, replay. The model is a swappable part, never the harness."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,5 +11,15 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+# No HTTP or TLS crate: the loopback client is a small HTTP/1.1 client over
+# std::net (see http.rs for why). The replay backend reads journals, hence
+# harness-journal.
 harness-core = { path = "../harness-core" }
+harness-journal = { path = "../harness-journal" }
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+gate-outcome = { path = "../gate-outcome" }
+harness-journal = { path = "../harness-journal", features = ["fault-injection"] }

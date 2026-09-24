@@ -11,6 +11,8 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+# The shared strict JSON reader (harness_core::strict_json).
+harness-core = { path = "../harness-core" }
 # Pure-crate allowlist (design §1.2; scripts/ci/purity.sh): serde, serde_json,
 # thiserror only. No SHA-256 or ed25519 crate yet: pinning and signing are
 # H4, and this crate refuses tiers it cannot verify (see admission.rs).

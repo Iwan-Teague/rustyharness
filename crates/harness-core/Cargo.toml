@@ -15,3 +15,7 @@ workspace = true
 gate-outcome = { path = "../gate-outcome" }
 # harness_core::sha256, the one digest function (design §1.4).
 sha2.workspace = true
+# The strict (duplicate-key-refusing) JSON reader, shared by the manifest
+# and model-action parsers (INV-22).
+serde.workspace = true
+serde_json.workspace = true

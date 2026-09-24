@@ -156,6 +156,25 @@ grep -qF 'features = ["fault-injection"]' "$copy/crates/harness-cli/Cargo.toml" 
 expect_refusal "harness-cli enables the journal's fault-injection seam" \
     "a normal dependency edge enables harness-journal/fault-injection"
 
+# INV-24: a TLS crate in the default build is refused (planted as a local
+# crate named `rustls`, depended on by harness-model).
+fresh
+mkdir -p "$copy/crates/zz-rustls/src" || fail "mkdir failed"
+printf '[package]\nname = "rustls"\nversion = "0.0.0"\nedition = "2021"\npublish = false\nlicense = "MIT"\n' \
+    >"$copy/crates/zz-rustls/Cargo.toml" || fail "could not plant rustls"
+printf '' >"$copy/crates/zz-rustls/src/lib.rs" || fail "could not plant rustls lib"
+awk '{ print } /^\[dependencies\]/ { print "rustls = { path = \"../zz-rustls\" }" }' \
+    "$copy/crates/harness-model/Cargo.toml" >"$tmpdir/Cargo.toml.planted" ||
+    fail "awk failed planting a dependency"
+mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-model/Cargo.toml" || fail "mv failed"
+expect_refusal "harness-model depends on a TLS crate" "INV-24: TLS/HTTP-client crates in the default build"
+
+# A pure model file naming an I/O facility is refused like a pure crate.
+fresh
+printf 'fn zz() { let _ = std::net::TcpStream::connect("x"); }\n' >>"$copy/crates/harness-model/src/wire.rs" ||
+    fail "could not plant into wire.rs"
+expect_refusal "harness-model's pure wire.rs opens a socket" "pure sources name forbidden facilities"
+
 # --- tool failures must fail closed -------------------------------------------
 mkdir "$tmpdir/shim" || fail "mkdir shim failed"
 cat >"$tmpdir/shim/cargo" <<EOF

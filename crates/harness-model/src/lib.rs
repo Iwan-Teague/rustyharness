@@ -1,57 +1,306 @@
-//! Model backends. The harness drives a model; the model is a swappable part.
+//! The model layer (design `docs/01-design-v0.1.md` §3, §2.2 steps 3-4,
+//! §2.9, §5.5; H1 row of §9).
 //!
-//! SCAFFOLD (2026-09-23). First backend to build: OpenAI-compatible
-//! `/v1/chat/completions` (llama.cpp, Ollama, vLLM, LM Studio), the same seam
-//! rustybenchmark's `bench-model` uses. Open design questions: native tool
-//! calling vs a text protocol with grammar-constrained decoding for small
-//! local models; streaming; whether hosted backends are allowed at all by
-//! default (privacy posture says local-first).
+//! - [`ModelBackend`]: one call, one [`Completion`] or a typed
+//!   [`ModelError`]. Implementations: [`client::OpenAiCompatible`]
+//!   (loopback HTTP), [`replay::ReplayBackend`] (§2.9), and
+//!   [`scripted::ScriptedBackend`] (tests).
+//! - [`Message`] carries its trust mark across the loop boundary
+//!   (scaffold review F4): only harness templates and the task are trusted;
+//!   model replies and observations are [`Untrusted`]. [`wire::render_request`]
+//!   is the one place they are read for the wire.
+//! - [`protocol`]: both action protocols, parsed strictly; only the model's
+//!   own reply is ever parsed (INV-29), free text outside the action stays
+//!   untrusted reasoning, and a format error is charged to the meter.
+//! - [`profile`]: per-model profiles (§3.4) and the `profile check` scoring.
+//!
+//! **Pure and I/O parts.** `endpoint`, `wire`, `protocol` and `profile` do no
+//! I/O (the purity gate scans those four files); `http` and `client` own the
+//! sockets; `replay` and `smoke` are generic over a backend.
+//!
+//! **Blocking, not tokio (for now).** Design §3.2 sketches the client over
+//! tokio because rmcp (H4) needs a runtime. For loopback-only H1 a blocking
+//! client over `std::net` needs no dependency at all, and the trait is
+//! synchronous like `ToolProvider` (H1c); the async decision is H1e's, with
+//! the loop.
 
 #![forbid(unsafe_code)]
+// The panic-set lints ratchet production code; unit tests may assert loosely.
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
+)]
+
+use std::borrow::Cow;
+use std::fmt;
+use std::time::Instant;
 
 use harness_core::Untrusted;
 
-/// Who said a message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    /// Harness-authored instructions. Only the harness writes these.
-    System,
-    /// The task, as given by the person who started the run.
-    User,
-    /// A prior model turn.
-    Assistant,
-    /// A tool result. Always untrusted data.
-    Tool,
-}
+pub mod client;
+pub mod endpoint;
+pub mod http;
+pub mod profile;
+pub mod protocol;
+pub mod replay;
+pub mod scripted;
+pub mod smoke;
+pub mod wire;
 
-/// One message in a conversation sent to a model.
+/// Harness-authored text: system rules, protocol spec, repair messages,
+/// rendered tool definitions. Constructible only from `&'static` templates
+/// (and, inside this crate, from renderings of harness data), never from
+/// model or tool output.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Message {
-    /// Who said it.
-    pub role: Role,
-    /// What was said.
-    pub content: String,
+pub struct HarnessText(Cow<'static, str>);
+
+impl HarnessText {
+    /// A compile-time template.
+    pub fn from_static(s: &'static str) -> Self {
+        Self(Cow::Borrowed(s))
+    }
+
+    pub(crate) fn rendered(s: String) -> Self {
+        Self(Cow::Owned(s))
+    }
+
+    /// The text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
-/// Why a model call failed.
-#[derive(Debug, thiserror::Error)]
+/// The task as the user wrote it in the task spec: trusted intent (§2.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskText(String);
+
+impl TaskText {
+    /// The task spec's task text.
+    pub fn new(s: String) -> Self {
+        Self(s)
+    }
+
+    /// The text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One message in the context (design §1.3, scaffold review F4).
+#[derive(Debug)]
+pub enum Message {
+    /// Harness rules, protocol spec, tool definitions.
+    System(HarnessText),
+    /// The task.
+    Task(TaskText),
+    /// A prior reply of the model.
+    Assistant(Untrusted<String>),
+    /// A tool result, fed back as data.
+    Observation {
+        /// The capability id that produced it.
+        call: String,
+        /// Its output.
+        body: Untrusted<String>,
+    },
+}
+
+/// A tool as offered to the model: its manifest id, a harness-authored
+/// description, and its input schema (already validated, §3.3 subset).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolSpec {
+    /// Capability id, e.g. `harness.fs.read`.
+    pub id: String,
+    /// Description shown to the model.
+    pub description: HarnessText,
+    /// JSON Schema of the arguments.
+    pub parameters: serde_json::Value,
+}
+
+/// A per-turn random nonce for the untrusted-block delimiters (§2.3),
+/// 16..=64 lowercase hex characters, generated by the run driver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderNonce(String);
+
+impl RenderNonce {
+    /// Validate a nonce.
+    pub fn new(hex: &str) -> Option<Self> {
+        let ok = (16..=64).contains(&hex.len())
+            && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        ok.then(|| Self(hex.to_owned()))
+    }
+
+    /// The nonce.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One model request.
+#[derive(Debug)]
+pub struct ModelRequest {
+    /// The context, in order.
+    pub messages: Vec<Message>,
+    /// The active tools.
+    pub tools: Vec<ToolSpec>,
+    /// This turn's delimiter nonce.
+    pub nonce: RenderNonce,
+}
+
+/// A tool call as the server returned it (native protocol). Untrusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawToolCall {
+    /// The wire function name.
+    pub name: String,
+    /// The arguments, as the JSON text the server sent.
+    pub arguments: String,
+}
+
+/// Why generation stopped. Only these two are a usable completion;
+/// `length`, an absent reason and anything else are [`ModelError`]s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishReason {
+    /// `stop`.
+    Stop,
+    /// `tool_calls`.
+    ToolCalls,
+}
+
+impl FinishReason {
+    /// Wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FinishReason::Stop => "stop",
+            FinishReason::ToolCalls => "tool_calls",
+        }
+    }
+}
+
+/// Token usage as the server reported it; `None` in [`Completion::usage`]
+/// means it reported nothing and the meter estimates (§2.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerUsage {
+    /// Prompt tokens.
+    pub input: u64,
+    /// Completion tokens.
+    pub output: u64,
+}
+
+/// A usable completion.
+#[derive(Debug)]
+pub struct Completion {
+    /// The reply text (reasoning and, in text mode, the action block).
+    pub content: Untrusted<String>,
+    /// Native tool calls.
+    pub tool_calls: Vec<Untrusted<RawToolCall>>,
+    /// Why generation stopped.
+    pub finish: FinishReason,
+    /// Server-reported usage, if any.
+    pub usage: Option<ServerUsage>,
+    /// Bytes of the rendered request (for the meter's estimate).
+    pub request_bytes: u64,
+    /// Bytes of the reply content plus tool calls (for the meter's estimate).
+    pub reply_bytes: u64,
+    /// HTTP statuses of failed attempts retried before this success (§3.2:
+    /// each attempt is recorded).
+    pub retried: Vec<u16>,
+}
+
+/// Why a transport attempt did not produce a reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unavailable {
+    /// Connection refused or reset.
+    Connect(String),
+    /// The connect timeout elapsed.
+    ConnectTimeout,
+    /// No byte arrived within the read timeout.
+    ReadTimeout,
+    /// The call's total deadline elapsed.
+    Deadline,
+    /// A 5xx status, after the retry budget.
+    Status {
+        /// The last status.
+        code: u16,
+        /// Attempts made.
+        attempts: u32,
+    },
+}
+
+/// A model call that produced no usable completion (§2.2 step 3). None of
+/// these is ever an empty success (INV-3).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ModelError {
-    /// The backend could not be reached or returned an error.
-    #[error("model backend error: {0}")]
-    Backend(String),
-    /// The backend answered with something that is not a usable completion.
-    /// Never treated as an empty success.
+    /// No content and no tool call.
+    #[error("the model returned an empty completion")]
+    Empty,
+    /// `finish_reason` was `length`, or absent at the end of the stream.
+    #[error("the completion was truncated ({0})")]
+    Truncated(&'static str),
+    /// A reply that is not a well-formed completion: malformed JSON,
+    /// duplicate keys, an unexpected content type or finish reason, an
+    /// oversized response, a non-2xx status that is not retried.
     #[error("unusable completion: {0}")]
     Unusable(String),
+    /// The backend could not be reached in time.
+    #[error("model backend unavailable: {0:?}")]
+    Unavailable(Unavailable),
+    /// 429 after the retry budget.
+    #[error("rate limited after {attempts} attempts")]
+    RateLimited {
+        /// Attempts made.
+        attempts: u32,
+    },
+    /// Replay could not reproduce the recorded exchange (§2.9).
+    #[error("replay diverged at model exchange {exchange}: {why}")]
+    ReplayDiverged {
+        /// 0-based exchange index.
+        exchange: usize,
+        /// What differed.
+        why: &'static str,
+    },
 }
 
-/// A model backend. Completions come back [`Untrusted`]: model output is data
-/// until the harness has checked it.
-pub trait ModelBackend {
-    /// A stable identity for the model actually serving (for journals and
-    /// benchmark row keys).
-    fn identity(&self) -> String;
+/// Endpoint class (§3.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointClass {
+    /// Loopback HTTP.
+    Loopback,
+    /// Replay of a journal.
+    Replay,
+    /// Scripted (tests).
+    Scripted,
+}
 
-    /// Send one conversation, receive one completion.
-    fn complete(&self, messages: &[Message]) -> Result<Untrusted<String>, ModelError>;
+/// What the journal header records about the model (§3.5). Server claims
+/// (model id, software, template) join when the startup check records them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelIdentity {
+    /// Endpoint class.
+    pub endpoint: EndpointClass,
+    /// Profile id.
+    pub profile_id: String,
+    /// SHA-256 of the profile bytes (hex), when loaded from a file.
+    pub profile_sha256: Option<String>,
+    /// Whether the profile carries a `profile check` stamp.
+    pub profile_validated: bool,
+    /// The API key's handle name, never its value (§5.5).
+    pub api_key_handle: Option<String>,
+}
+
+impl fmt::Display for EndpointClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            EndpointClass::Loopback => "loopback",
+            EndpointClass::Replay => "replay",
+            EndpointClass::Scripted => "scripted",
+        })
+    }
+}
+
+/// A model backend (§3.1). Synchronous for now (see the crate docs).
+pub trait ModelBackend {
+    /// What the journal header records.
+    fn identity(&self) -> ModelIdentity;
+
+    /// One call under `deadline`.
+    fn complete(&self, req: &ModelRequest, deadline: Instant) -> Result<Completion, ModelError>;
 }

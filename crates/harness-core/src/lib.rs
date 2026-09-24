@@ -22,6 +22,8 @@
     allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
 )]
 
+pub mod strict_json;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::time::Duration;

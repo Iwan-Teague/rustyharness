@@ -83,8 +83,10 @@ refuse_intruders "$tmpdir/gate-json" "$tmpdir/allowed-json" "gate-outcome (json)
 
 # harness-core may depend only on gate-outcome and the ONE SHA-256
 # implementation (design §1.2, §1.4: `harness_core::sha256`). serde and
-# serde_json stay admitted for the child-protocol wire types; any new
-# dependency must be added to this allowlist BY REVIEW.
+# serde_json (with memchr and zmij, as for gate-outcome's json feature) are
+# admitted: since H1d harness-core hosts the shared strict JSON reader
+# (`harness_core::strict_json`). Any new dependency must be added to this
+# allowlist BY REVIEW.
 #   sha2 0.11 (RustCrypto, pure Rust, default features off) and its tree:
 #     digest, block-buffer, hybrid-array, typenum, crypto-common, cfg-if,
 #     cpufeatures (runtime CPU-feature detection for the SHA extensions),
@@ -97,26 +99,30 @@ grep -qxF sha2 "$tmpdir/core" ||
     fail "harness-core tree does not contain sha2 (read the wrong tree?)"
 printf '%s\n' \
     harness-core gate-outcome serde serde_core serde_derive proc-macro2 \
-    quote syn unicode-ident serde_json itoa ryu \
+    quote syn unicode-ident serde_json itoa ryu memchr zmij \
     sha2 digest block-buffer hybrid-array typenum crypto-common cfg-if \
     cpufeatures libc >"$tmpdir/allowed-core-raw"
 sort -u "$tmpdir/allowed-core-raw" >"$tmpdir/allowed-core" || fail "sort failed"
 refuse_intruders "$tmpdir/core" "$tmpdir/allowed-core" "harness-core"
 
 # harness-manifest and harness-policy (design §1.2): serde, serde_json,
-# thiserror (+ its proc-macro), and policy -> manifest. No SHA-256 or
-# ed25519 crate yet (pinning and signing are H4); adding one is a review
-# decision recorded here with its reason.
+# thiserror (+ its proc-macro), policy -> manifest, and (since H1d, for the
+# shared strict JSON reader harness_core::strict_json) manifest -> core,
+# which brings gate-outcome and the reviewed sha2 tree above. No ed25519
+# crate yet (signing is H4); adding one is a review decision recorded here
+# with its reason.
 #   serde stack (serde, serde_core, serde_derive, proc-macro2, quote, syn,
 #     unicode-ident, serde_json, itoa, ryu, memchr, zmij): as above;
-#   thiserror, thiserror-impl: derive-only error Display, no runtime code.
+#   thiserror, thiserror-impl: derive-only error Display, no runtime code;
+#   harness-core, gate-outcome and the sha2 tree: harness-core's allowlist.
 tree_names "$tmpdir/manifest" harness-manifest
 grep -qxF serde_json "$tmpdir/manifest" ||
     fail "harness-manifest tree does not contain serde_json (read the wrong tree?)"
 printf '%s\n' \
     harness-manifest serde serde_core serde_derive proc-macro2 quote syn \
     unicode-ident serde_json itoa ryu memchr zmij thiserror thiserror-impl \
-    >"$tmpdir/allowed-manifest-raw"
+    harness-core gate-outcome sha2 digest block-buffer hybrid-array typenum \
+    crypto-common cfg-if cpufeatures libc >"$tmpdir/allowed-manifest-raw"
 sort -u "$tmpdir/allowed-manifest-raw" >"$tmpdir/allowed-manifest" || fail "sort failed"
 refuse_intruders "$tmpdir/manifest" "$tmpdir/allowed-manifest" "harness-manifest"
 
@@ -126,6 +132,28 @@ grep -qxF harness-manifest "$tmpdir/policy" ||
 printf '%s\n' harness-policy >>"$tmpdir/allowed-manifest-raw" || fail "printf failed"
 sort -u "$tmpdir/allowed-manifest-raw" >"$tmpdir/allowed-policy" || fail "sort failed"
 refuse_intruders "$tmpdir/policy" "$tmpdir/allowed-policy" "harness-policy"
+
+# --- INV-24: no TLS in the default build ------------------------------------
+# The default build connects only to loopback over plain HTTP (design §3.2);
+# TLS arrives only with a future, off-by-default `hosted` feature. No crate
+# of a TLS or HTTP-client stack may appear on a normal edge anywhere in the
+# workspace. The tree must name harness-model, so the check reads something.
+cargo tree --workspace -e normal --prefix none >"$tmpdir/ws-raw" ||
+    fail "cargo tree failed: --workspace -e normal"
+awk '{print $1}' "$tmpdir/ws-raw" >"$tmpdir/ws-names" || fail "awk failed on the workspace tree"
+grep -qxF harness-model "$tmpdir/ws-names" ||
+    fail "the workspace tree does not name harness-model (read nothing?)"
+: >"$tmpdir/tls-hits"
+for c in rustls rustls-webpki webpki webpki-roots ring aws-lc-rs aws-lc-sys openssl openssl-sys \
+    native-tls tokio-rustls hyper-rustls reqwest hyper ureq curl curl-sys; do
+    if grep -qxF "$c" "$tmpdir/ws-names"; then
+        printf '%s\n' "$c" >>"$tmpdir/tls-hits"
+    fi
+done
+if [ -s "$tmpdir/tls-hits" ]; then
+    fail "INV-24: TLS/HTTP-client crates in the default build:
+$(cat "$tmpdir/tls-hits")"
+fi
 
 # --- test-only seams stay out of normal builds (H1c review F-3) -------------
 # harness-journal's `fault-injection` feature compiles a JournalFile that
@@ -197,6 +225,13 @@ nb='[^A-Za-z0-9_]'
 facility='(fs|net|process|env|io|os|thread|path)'
 rust_files "$tmpdir/pure-files" crates/gate-outcome crates/harness-core \
     crates/harness-manifest crates/harness-policy
+# harness-model is an I/O crate (design §1.2), but its parse/validate half is
+# pure by design (H1d): these four files are scanned like a pure crate.
+for f in crates/harness-model/src/endpoint.rs crates/harness-model/src/wire.rs \
+    crates/harness-model/src/protocol.rs crates/harness-model/src/profile.rs; do
+    [ -f "$f" ] || fail "pure model file $f is missing (renamed? read nothing?)"
+    printf '%s\n' "$f" >>"$tmpdir/pure-files" || fail "printf failed"
+done
 for must in crates/gate-outcome/src/lib.rs crates/harness-core/src/lib.rs \
     crates/harness-manifest/src/lib.rs crates/harness-policy/src/lib.rs; do
     grep -qxF "$must" "$tmpdir/pure-files" || fail "pure-content scan would miss $must"

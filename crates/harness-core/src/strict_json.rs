@@ -1,5 +1,6 @@
 //! Duplicate-key-refusing JSON reading (design §4.3, scaffold review F13,
-//! INV-22).
+//! INV-22). Shared by the manifest parser and the model-action parsers
+//! (moved here from `harness-manifest` in H1d, so both use one reader).
 //!
 //! serde_json keeps the LAST value of a duplicated key, so
 //! `{"schema_version":1, …, "schema_version":0}` would silently read as v0.
@@ -16,7 +17,7 @@ use serde_json::{Map, Number, Value};
 struct NoDup(Value);
 
 /// Marker prefix of the error the visitor raises, so the caller can type it.
-pub(crate) const DUPLICATE_KEY: &str = "duplicate JSON key";
+pub const DUPLICATE_KEY: &str = "duplicate JSON key";
 
 impl<'de> Deserialize<'de> for NoDup {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -93,7 +94,7 @@ impl<'de> Visitor<'de> for NoDupVisitor {
 /// Parse `bytes` as exactly one JSON value, refusing duplicate object keys at
 /// every depth, invalid UTF-8 and trailing content. serde_json's recursion
 /// limit (128) bounds nesting.
-pub(crate) fn parse(bytes: &[u8]) -> Result<Value, serde_json::Error> {
+pub fn parse(bytes: &[u8]) -> Result<Value, serde_json::Error> {
     let mut de = serde_json::Deserializer::from_slice(bytes);
     let NoDup(v) = NoDup::deserialize(&mut de)?;
     de.end()?;
