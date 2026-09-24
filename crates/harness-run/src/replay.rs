@@ -181,12 +181,16 @@ fn recorded(
                 } else {
                     (Vec::new(), false, harness_core::sha256(b""))
                 };
-                // §7.1: exactly the timeout and crashed results carry a
-                // sample, in exactly the shape the loop writes.
+                // §7.1: exactly the timeout, crashed and provider-failure
+                // (None) results carry a sample, in exactly the shape the
+                // loop writes; only an ok read carries a read digest.
                 let sampled = matches!(
                     status,
-                    Some(ToolStatus::Timeout | ToolStatus::Crashed { .. })
+                    None | Some(ToolStatus::Timeout | ToolStatus::Crashed { .. })
                 );
+                if r.body.contains_key("read_sha256") && status != Some(ToolStatus::Ok) {
+                    return Err(bad());
+                }
                 let environment = match (sampled, r.body.get("environment")) {
                     (true, Some(v)) => Some(sample::from_value(v).ok_or_else(bad)?),
                     (false, None) => None,
@@ -265,14 +269,29 @@ fn expected_inputs(
 fn check_header(recorded: &Record, expected: &Map<String, Value>) -> Result<(), Divergence> {
     for k in HEADER_INPUT_KEYS {
         if recorded.body.get(k) != expected.get(k) {
-            return Err(diverge(
-                0,
-                0,
-                "the task, grants, profile or policy given differ from the recorded header",
-            ));
+            return Err(diverge(0, 0, header_mismatch(k)));
         }
     }
     Ok(())
+}
+
+/// What a differing header input means (H1f-3 review F-5): most are the
+/// caller's inputs; `builtin_manifest` and `shell_enabled` belong to the
+/// harness build, so a journal written by another build (every journal
+/// from before H1f-3 included) cannot be audited or resumed by this one.
+fn header_mismatch(key: &str) -> &'static str {
+    match key {
+        "task" => "the task given differs from the recorded header",
+        "grants" => "the grants given differ from the recorded header",
+        "workspace_public" => "the workspace declaration differs from the recorded header",
+        "protocol" | "profile" => "the profile given differs from the recorded header",
+        "policy" => "the policy given differs from the recorded header",
+        "checks" => "the verification plan differs from the recorded header",
+        "builtin_manifest" | "shell_enabled" => {
+            "another harness build wrote this journal (its built-in manifest or shell setting differs)"
+        }
+        _ => "a header input differs from the recorded header",
+    }
 }
 
 fn recorded_facts(h: &Record) -> Option<WorkspaceFacts> {
@@ -574,9 +593,10 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
         facts,
         limits: &limits,
         resumed_from: None,
-        // The replay journal repeats the recorded sample: a past host
-        // cannot be re-measured, and the header is not compared.
+        // The replay journal repeats the recorded sample, marked as such:
+        // a past host cannot be re-measured, and the header is not compared.
         environment,
+        environment_recorded: true,
     })
     .map_err(AuditRefused::Plan)?;
     let (mut w, replay_dir) = JournalWriter::create_replay(&run_dir, a.run.clone(), attempt, hdr)
@@ -756,7 +776,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         head,
         &expected_inputs(r.spec, r.registry, r.policy, r.profile),
     )
-    .map_err(|_| nope("the task, grants, profile or policy differ from the recorded run"))?;
+    .map_err(|d| nope(d.why))?;
     if recorded_facts(head).map(|f| f.tree) != Some(pre.facts.tree) {
         return Err(nope(
             "the workspace changed since the attempt, and an H1 run keeps no snapshot to restore",
@@ -801,6 +821,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         limits: &limits,
         resumed_from: Some((n, v.head, carried_ms)),
         environment: r.env.sample(),
+        environment_recorded: false,
     })?;
     let (mut w, attempt) = JournalWriter::create_next_attempt_checked(
         &run_dir,

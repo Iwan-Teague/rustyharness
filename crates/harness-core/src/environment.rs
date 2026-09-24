@@ -31,9 +31,16 @@ impl EnvProbe for EnvSample {
 }
 
 /// One environment sample (design §7.1).
+///
+/// Scope: every field describes the HOST, the scope the load average has
+/// (H1f-3 review F-4: comparing a host-wide load with a CPU count limited
+/// by this process's affinity or cgroup quota would call an idle host
+/// pressed). **Named residual:** a container's own memory limit (cgroup
+/// `memory.max`) is not sampled, so memory pressure inside a limited
+/// container can go unflagged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnvSample {
-    /// Logical CPUs available to this process.
+    /// Logical CPUs online on the host.
     pub cpus: Reading,
     /// The 1-minute load average, in thousandths (1.5 is 1500).
     pub load_1m_milli: Reading,
@@ -106,8 +113,13 @@ pub enum Reading {
 /// How a field was measured (the closed set of producing methods).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
-    /// The standard library's `available_parallelism` (CPU affinity and
-    /// cgroup quotas included).
+    /// Linux `/sys/devices/system/cpu/online`: the host's online CPUs.
+    SysCpuOnline,
+    /// macOS `/usr/sbin/sysctl -n hw.logicalcpu`.
+    SysctlHwLogicalcpu,
+    /// The standard library's `available_parallelism` (this process's CPU
+    /// affinity and quota included): used only where no load average is
+    /// measured, so it never meets a host-wide load (Windows).
     AvailableParallelism,
     /// Linux `/proc/loadavg`, the first field.
     ProcLoadavg,
@@ -126,7 +138,9 @@ pub enum Method {
 
 impl Method {
     /// Every method.
-    pub const ALL: [Method; 7] = [
+    pub const ALL: [Method; 9] = [
+        Method::SysCpuOnline,
+        Method::SysctlHwLogicalcpu,
         Method::AvailableParallelism,
         Method::ProcLoadavg,
         Method::ProcMeminfoTotal,
@@ -139,6 +153,8 @@ impl Method {
     /// The journal name.
     pub fn as_str(self) -> &'static str {
         match self {
+            Method::SysCpuOnline => "/sys/devices/system/cpu/online",
+            Method::SysctlHwLogicalcpu => "sysctl hw.logicalcpu",
             Method::AvailableParallelism => "available_parallelism",
             Method::ProcLoadavg => "/proc/loadavg",
             Method::ProcMeminfoTotal => "/proc/meminfo MemTotal",
@@ -153,6 +169,23 @@ impl Method {
     pub fn parse(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|m| m.as_str() == s)
     }
+
+    /// The methods that may measure the field with this journal key
+    /// (H1f-3 review F-6: a method is only ever recorded on its own field).
+    /// An unknown key has none.
+    pub fn for_field(key: &str) -> &'static [Method] {
+        match key {
+            "cpus" => &[
+                Method::SysCpuOnline,
+                Method::SysctlHwLogicalcpu,
+                Method::AvailableParallelism,
+            ],
+            "load_1m_milli" => &[Method::ProcLoadavg, Method::SysctlVmLoadavg],
+            "mem_total_bytes" => &[Method::ProcMeminfoTotal, Method::SysctlHwMemsize],
+            "mem_available_bytes" => &[Method::ProcMeminfoAvailable, Method::VmStatFreeInactive],
+            _ => &[],
+        }
+    }
 }
 
 /// Why a field was not measured (the closed set of reasons).
@@ -166,14 +199,17 @@ pub enum Unmeasured {
     NoSuchMeasure,
     /// The source exists but could not be read or understood.
     ReadFailed,
+    /// This build has no probe for this OS.
+    NotImplemented,
 }
 
 impl Unmeasured {
     /// Every reason.
-    pub const ALL: [Unmeasured; 3] = [
+    pub const ALL: [Unmeasured; 4] = [
         Unmeasured::NoSafeApi,
         Unmeasured::NoSuchMeasure,
         Unmeasured::ReadFailed,
+        Unmeasured::NotImplemented,
     ];
 
     /// The journal name.
@@ -182,6 +218,7 @@ impl Unmeasured {
             Unmeasured::NoSafeApi => "no_safe_api",
             Unmeasured::NoSuchMeasure => "no_such_measure",
             Unmeasured::ReadFailed => "read_failed",
+            Unmeasured::NotImplemented => "not_implemented",
         }
     }
 
@@ -210,6 +247,23 @@ mod tests {
             mem_available_bytes: avail,
             state_root_free_bytes: Reading::Unmeasured(Unmeasured::NoSafeApi),
         }
+    }
+
+    #[test]
+    fn every_method_belongs_to_exactly_one_field() {
+        let keys = EnvSample::unmeasured(Unmeasured::ReadFailed)
+            .fields()
+            .map(|(k, _)| k);
+        for m in Method::ALL {
+            let owners = keys
+                .iter()
+                .filter(|k| Method::for_field(k).contains(&m))
+                .count();
+            assert_eq!(owners, 1, "{m:?}");
+        }
+        // Free disk space has no method in this build.
+        assert!(Method::for_field("state_root_free_bytes").is_empty());
+        assert!(Method::for_field("swap").is_empty());
     }
 
     #[test]

@@ -550,26 +550,12 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
     )
     .into_iter()
     .collect();
-    // §7.1: a timeout or crash that coincided with host pressure is marked,
-    // so a human can tell a pressed host from a broken tool. It never
-    // changes the outcome.
-    if !report.possibly_environmental.is_empty() {
-        let steps: Vec<String> = report
-            .possibly_environmental
-            .iter()
-            .map(u64::to_string)
-            .collect();
-        let observed = format!(
-            "a tool call timed out or crashed at step(s) {} while memory available was under 5% or the load above twice the CPUs",
-            steps.join(", ")
-        );
-        note!(cx, "possibly environmental: {observed}");
-        findings.extend(info(
-            "harness.possibly-environmental",
-            &format!("run {} attempt {}", report.run, report.attempt),
-            "tool calls on an unpressed host",
-            observed,
-        ));
+    if let Some(f) = possibly_environmental(
+        &format!("run {} attempt {}", report.run, report.attempt),
+        &report.possibly_environmental,
+    ) {
+        note!(cx, "possibly environmental: {}", f.observed);
+        findings.push(f);
     }
     Ok(Outcome {
         outcome: report.outcome,
@@ -577,6 +563,25 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
         chain_head: report.chain_head.map(|d| d.to_string()),
         exit_override: None,
     })
+}
+
+/// §7.1: a tool call that timed out, crashed or could not run while the
+/// host was under pressure is marked, so a human can tell a pressed host
+/// from a broken tool. An Info finding: it never changes the outcome.
+fn possibly_environmental(location: &str, steps: &[u64]) -> Option<Finding> {
+    if steps.is_empty() {
+        return None;
+    }
+    let steps: Vec<String> = steps.iter().map(u64::to_string).collect();
+    info(
+        "harness.possibly-environmental",
+        location,
+        "tool calls on an unpressed host",
+        format!(
+            "a tool call timed out, crashed or could not run at step(s) {} while memory available was under 5% or the load above twice the CPUs",
+            steps.join(", ")
+        ),
+    )
 }
 
 /// The run's outcome, said plainly for the person at the terminal.
@@ -932,4 +937,18 @@ fn manifest_check(cx: &Cx<'_>, path: &str) -> u8 {
         "  a pinned provider is always sandboxed, confirms at least user_confirm and never shares a session with personal or restricted capabilities (§4.4)"
     );
     exit::PASSED
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pressed_step_is_an_info_finding_and_no_step_is_none() {
+        assert!(possibly_environmental("run r attempt 1", &[]).is_none());
+        let f = possibly_environmental("run r attempt 1", &[3, 7]).unwrap();
+        assert_eq!(f.severity, Severity::Info);
+        assert_eq!(f.code.0, "harness.possibly-environmental");
+        assert!(f.observed.contains("step(s) 3, 7"), "{}", f.observed);
+    }
 }

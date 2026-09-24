@@ -16,7 +16,7 @@ use gate_outcome::{GateOutcome, IndeterminateKind};
 use harness_core::environment::{EnvSample, Unmeasured};
 use harness_core::StopCause;
 use harness_journal::{EventKind, JournalReader, Record};
-use harness_manifest::admission::{Registry, Tier};
+use harness_manifest::admission::{Registry, Resolved, Tier};
 use harness_manifest::{builtin, SemVer, ValidationContext};
 use harness_model::profile::Profile;
 use harness_model::scripted::{text_reply, ScriptedBackend};
@@ -368,6 +368,18 @@ fn the_header_records_the_host_the_manifest_and_the_environment() {
     );
     assert_eq!(h["shell_enabled"], false);
     assert_eq!(h["sandbox"]["backend"], "none");
+    // Both are constants in H1, true only while nothing admitted can run
+    // code (H1f-3 review F-10): the day an execute-class capability is
+    // admitted, this fails and the header must derive them instead.
+    let reg = registry();
+    let m = match reg.resolve("harness.fs.read") {
+        Resolved::One { manifest, .. } => manifest.clone(),
+        _ => unreachable!(),
+    };
+    assert!(m
+        .capabilities()
+        .iter()
+        .all(|c| c.effect() < harness_manifest::Effect::Execute));
     let env = h["environment"].as_object().unwrap();
     assert_eq!(env.len(), 5);
     for (key, v) in env {

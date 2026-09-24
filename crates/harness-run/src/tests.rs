@@ -51,8 +51,8 @@ impl MonoClock for Advancing {
 struct Spy {
     ns: ProviderName,
     invoked: Rc<Cell<u32>>,
-    /// The status every call ends with.
-    status: ToolStatus,
+    /// The status every call ends with; `None`: the provider fails.
+    status: Option<ToolStatus>,
 }
 impl ToolProvider for Spy {
     fn namespace(&self) -> &ProviderName {
@@ -64,13 +64,16 @@ impl ToolProvider for Spy {
         _ctx: &InvokeCtx,
     ) -> Result<ToolResult, ToolError> {
         self.invoked.set(self.invoked.get() + 1);
+        let Some(status) = self.status else {
+            return Err(ToolError("the spy fails".into()));
+        };
         let out = format!(
             "contents #{} of {}",
             self.invoked.get(),
             call.call().call().args
         );
         Ok(ToolResult {
-            status: self.status,
+            status,
             digest: sha256(out.as_bytes()),
             output: Untrusted::new(out.into_bytes(), Source::Tool("harness.fs.read".into())),
             truncated: false,
@@ -130,7 +133,7 @@ fn drive_with(
         plan_faults,
         limits,
         clock_step,
-        ToolStatus::Ok,
+        Some(ToolStatus::Ok),
         &EnvSample::unmeasured(Unmeasured::NoSafeApi),
     )
 }
@@ -140,7 +143,7 @@ fn drive_full(
     plan_faults: FaultPlan,
     limits: impl FnOnce(&mut RunConfig),
     clock_step: Duration,
-    status: ToolStatus,
+    status: Option<ToolStatus>,
     env: &EnvSample,
 ) -> Outcome {
     let reg = registry();
@@ -734,19 +737,33 @@ fn a_timeout_or_crash_records_the_host_and_flags_pressure() {
     for (what, status, env, sampled, flagged) in [
         (
             "timeout under pressure",
-            ToolStatus::Timeout,
+            Some(ToolStatus::Timeout),
             pressed(),
             true,
             true,
         ),
         (
             "crash on a calm host",
-            ToolStatus::Crashed { signal: Some(9) },
+            Some(ToolStatus::Crashed { signal: Some(9) }),
             calm,
             true,
             false,
         ),
-        ("ok under pressure", ToolStatus::Ok, pressed(), false, false),
+        // A provider failure is the tool-level "could not run" (§7.1).
+        (
+            "provider failure under pressure",
+            None,
+            pressed(),
+            true,
+            true,
+        ),
+        (
+            "ok under pressure",
+            Some(ToolStatus::Ok),
+            pressed(),
+            false,
+            false,
+        ),
     ] {
         let o = drive_full(
             vec![read("a.txt"), submit()],
@@ -758,11 +775,16 @@ fn a_timeout_or_crash_records_the_host_and_flags_pressure() {
         );
         assert_eq!(o.end.cause, StopCause::Submitted, "{what}");
         let v = verify(&o.journal, &o.blobs).unwrap();
-        // The read's result (the sentinel's ToolFinished has no output).
+        // The read's result (the sentinel's ToolFinished carries neither an
+        // output nor a provider_error status).
         let done: Vec<_> = v
             .records
             .iter()
-            .filter(|r| r.kind == EventKind::ToolFinished && r.body.get("output").is_some())
+            .filter(|r| {
+                r.kind == EventKind::ToolFinished
+                    && (r.body.get("output").is_some()
+                        || r.body.get("status").and_then(|s| s.as_str()) == Some("provider_error"))
+            })
             .collect();
         assert_eq!(done.len(), 1, "{what}");
         let rec = done[0];

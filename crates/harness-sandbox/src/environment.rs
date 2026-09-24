@@ -2,29 +2,33 @@
 //! vocabulary, the closed sets of methods and reasons, and the pressure
 //! rule are `harness_core::environment`. Nothing here decides an outcome.
 //!
-//! - **CPUs, every OS:** `std::thread::available_parallelism`.
-//! - **Linux:** `/proc/loadavg` (the first field) and `/proc/meminfo`
-//!   (`MemTotal`, `MemAvailable`), each read bounded and parsed strictly.
-//! - **macOS:** `/usr/sbin/sysctl -n vm.loadavg hw.memsize` and
-//!   `/usr/bin/vm_stat`, run by absolute path with fixed arguments, stdin
-//!   null, output bounded (the same pattern as the locality probe's
-//!   `/sbin/mount`; `statfs`/`sysctl(3)` would need FFI, §6.7).
-//!   Memory available is (pages free + pages inactive) times the page size
-//!   `vm_stat` reports: macOS has no single "available" figure, so the
-//!   method names the formula.
-//! - **Windows:** load average does not exist (`no_such_measure`); memory
-//!   needs `GlobalMemoryStatusEx`, i.e. `harness-sandbox-windows` (spike
-//!   S-W1), so it is `no_safe_api` until then.
+//! Every field is host-wide, the scope of the load average (H1f-3 review
+//! F-4):
+//! - **Linux:** `/sys/devices/system/cpu/online` (the host's online CPUs),
+//!   `/proc/loadavg` (the first field) and `/proc/meminfo` (`MemTotal`,
+//!   `MemAvailable`), each read bounded and parsed strictly.
+//! - **macOS:** `/usr/sbin/sysctl -n vm.loadavg hw.memsize hw.logicalcpu`
+//!   and `/usr/bin/vm_stat`, through [`crate::capture`] (absolute path,
+//!   fixed argv, cleared environment with `LC_ALL=C`, bounded output, a
+//!   deadline; `sysctl(3)` would need FFI, §6.7). Memory available is
+//!   (pages free + pages inactive) times the page size `vm_stat` reports:
+//!   macOS has no single "available" figure, so the method names the
+//!   formula.
+//! - **Windows:** CPUs from `available_parallelism` (no load average is
+//!   measured there, so it never meets one); load average does not exist
+//!   (`no_such_measure`); memory needs `GlobalMemoryStatusEx`, i.e.
+//!   `harness-sandbox-windows` (`no_safe_api` until spike S-W1).
+//! - **Any other OS:** CPUs from `available_parallelism`; the rest
+//!   `not_implemented`.
 //! - **Free bytes on the `state_root` volume, every OS:** `no_safe_api`
 //!   (`statvfs(2)` / `GetDiskFreeSpaceExW` need FFI, §6.7).
 //!
 //! Anything that cannot be read or does not parse exactly is
 //! `read_failed`, never a guessed or zero value.
 
-use harness_core::environment::{EnvProbe, EnvSample, Method, Reading, Unmeasured};
+use harness_core::environment::{EnvProbe, EnvSample};
 
-/// Cap on what a probe source may return (the files and command outputs
-/// here are a few KiB).
+/// Cap on a `/proc` or `/sys` source (each is a few hundred bytes).
 pub const SOURCE_MAX_BYTES: u64 = 64 * 1024;
 
 /// The real per-OS probe. The binary gives it to the run driver.
@@ -33,27 +37,8 @@ pub struct SystemEnv;
 
 impl EnvProbe for SystemEnv {
     fn sample(&self) -> EnvSample {
-        let mut s = os::sample();
-        s.cpus = match std::thread::available_parallelism()
-            .ok()
-            .and_then(|n| u64::try_from(n.get()).ok())
-        {
-            Some(n) => measured(n, Method::AvailableParallelism),
-            None => Reading::Unmeasured(Unmeasured::ReadFailed),
-        };
-        s.state_root_free_bytes = Reading::Unmeasured(Unmeasured::NoSafeApi);
-        s
+        os::sample()
     }
-}
-
-fn measured(value: u64, method: Method) -> Reading {
-    Reading::Measured { value, method }
-}
-
-fn or_failed(v: Option<u64>, method: Method) -> Reading {
-    v.map_or(Reading::Unmeasured(Unmeasured::ReadFailed), |value| {
-        measured(value, method)
-    })
 }
 
 /// A decimal like `1.52` in thousandths (`1520`): digits, then optionally
@@ -81,6 +66,39 @@ fn decimal_milli(s: &str) -> Option<u64> {
         .ok()?
         .checked_mul(1000)?
         .checked_add(milli)
+}
+
+/// A positive count of digits only.
+fn count(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<u64>().ok().filter(|n| *n > 0)
+}
+
+/// Linux `/sys/devices/system/cpu/online`: a CPU list like `0-3,8-11`,
+/// ranges ascending and disjoint; the number of CPUs it names.
+pub fn parse_cpu_list(text: &str) -> Option<u64> {
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    let mut total: u64 = 0;
+    let mut next_free: u64 = 0;
+    for part in text.split(',') {
+        let (a, b) = match part.split_once('-') {
+            Some((a, b)) => (a, b),
+            None => (part, part),
+        };
+        let digits = |t: &str| !t.is_empty() && t.bytes().all(|c| c.is_ascii_digit());
+        if !digits(a) || !digits(b) {
+            return None;
+        }
+        let (a, b) = (a.parse::<u64>().ok()?, b.parse::<u64>().ok()?);
+        if a > b || a < next_free {
+            return None;
+        }
+        total = total.checked_add(b - a + 1)?;
+        next_free = b.checked_add(1)?;
+    }
+    (total > 0).then_some(total)
 }
 
 /// Linux `/proc/loadavg`: the 1-minute load in thousandths.
@@ -115,25 +133,22 @@ pub fn parse_meminfo(text: &str) -> (Option<u64>, Option<u64>) {
     (field("MemTotal"), field("MemAvailable"))
 }
 
-/// macOS `sysctl -n vm.loadavg hw.memsize`: `(load in thousandths,
-/// memsize in bytes)`. The output is exactly two lines: `{ 1.52 1.70 1.78 }`
-/// and a byte count.
-pub fn parse_sysctl(text: &str) -> (Option<u64>, Option<u64>) {
+/// macOS `sysctl -n vm.loadavg hw.memsize hw.logicalcpu`: `(load in
+/// thousandths, memsize in bytes, logical CPUs)`. The output is exactly
+/// three lines: `{ 1.52 1.70 1.78 }`, a byte count and a CPU count.
+pub fn parse_sysctl(text: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
     let mut lines = text.lines();
-    let (Some(load), Some(mem), None) = (lines.next(), lines.next(), lines.next()) else {
-        return (None, None);
+    let (Some(load), Some(mem), Some(cpus), None) =
+        (lines.next(), lines.next(), lines.next(), lines.next())
+    else {
+        return (None, None, None);
     };
     let load = load
         .strip_prefix("{ ")
         .and_then(|l| l.strip_suffix(" }"))
         .and_then(|l| l.split(' ').next())
         .and_then(decimal_milli);
-    let mem = if !mem.is_empty() && mem.bytes().all(|b| b.is_ascii_digit()) {
-        mem.parse::<u64>().ok()
-    } else {
-        None
-    };
-    (load, mem)
+    (load, count(mem), count(cpus))
 }
 
 /// macOS `vm_stat`: (pages free + pages inactive) times the page size its
@@ -144,11 +159,8 @@ pub fn parse_vm_stat(text: &str) -> Option<u64> {
         .next()?
         .strip_prefix("Mach Virtual Memory Statistics: (page size of ")?
         .strip_suffix(" bytes)")?;
-    if page.is_empty() || !page.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let page: u64 = page.parse().ok()?;
-    let count = |key: &str| -> Option<u64> {
+    let page = count(page)?;
+    let counter = |key: &str| -> Option<u64> {
         let mut found = None;
         for line in text.lines() {
             let Some(rest) = line.strip_prefix(key) else {
@@ -165,8 +177,8 @@ pub fn parse_vm_stat(text: &str) -> Option<u64> {
         }
         found
     };
-    count("Pages free:")?
-        .checked_add(count("Pages inactive:")?)?
+    counter("Pages free:")?
+        .checked_add(counter("Pages inactive:")?)?
         .checked_mul(page)
 }
 
@@ -174,9 +186,9 @@ pub fn parse_vm_stat(text: &str) -> Option<u64> {
 mod os {
     use std::io::Read;
 
-    use harness_core::environment::{EnvSample, Method, Unmeasured};
+    use harness_core::environment::{EnvSample, Method, Reading, Unmeasured};
 
-    use super::{or_failed, parse_loadavg, parse_meminfo, SOURCE_MAX_BYTES};
+    use super::{parse_cpu_list, parse_loadavg, parse_meminfo, SOURCE_MAX_BYTES};
 
     fn read_small(path: &str) -> Option<String> {
         let mut text = String::new();
@@ -188,73 +200,95 @@ mod os {
         (text.len() as u64 <= SOURCE_MAX_BYTES).then_some(text)
     }
 
+    fn or_failed(v: Option<u64>, method: Method) -> Reading {
+        v.map_or(Reading::Unmeasured(Unmeasured::ReadFailed), |value| {
+            Reading::Measured { value, method }
+        })
+    }
+
     pub(super) fn sample() -> EnvSample {
-        let mut s = EnvSample::unmeasured(Unmeasured::ReadFailed);
-        s.load_1m_milli = or_failed(
-            read_small("/proc/loadavg").and_then(|t| parse_loadavg(&t)),
-            Method::ProcLoadavg,
-        );
         let (total, avail) = read_small("/proc/meminfo")
             .map(|t| parse_meminfo(&t))
             .unwrap_or((None, None));
-        s.mem_total_bytes = or_failed(total, Method::ProcMeminfoTotal);
-        s.mem_available_bytes = or_failed(avail, Method::ProcMeminfoAvailable);
-        s
+        EnvSample {
+            cpus: or_failed(
+                read_small("/sys/devices/system/cpu/online").and_then(|t| parse_cpu_list(&t)),
+                Method::SysCpuOnline,
+            ),
+            load_1m_milli: or_failed(
+                read_small("/proc/loadavg").and_then(|t| parse_loadavg(&t)),
+                Method::ProcLoadavg,
+            ),
+            mem_total_bytes: or_failed(total, Method::ProcMeminfoTotal),
+            mem_available_bytes: or_failed(avail, Method::ProcMeminfoAvailable),
+            state_root_free_bytes: Reading::Unmeasured(Unmeasured::NoSafeApi),
+        }
     }
 }
 
 #[cfg(target_os = "macos")]
 mod os {
-    use std::process::{Command, Output, Stdio};
+    use std::process::Command;
 
-    use harness_core::environment::{EnvSample, Method, Unmeasured};
+    use harness_core::environment::{EnvSample, Method, Reading, Unmeasured};
 
-    use super::{or_failed, parse_sysctl, parse_vm_stat, SOURCE_MAX_BYTES};
+    use super::{parse_sysctl, parse_vm_stat};
+    use crate::capture::{capture, CAPTURE_DEADLINE};
 
-    fn text(out: std::io::Result<Output>) -> Option<String> {
-        let out = out.ok().filter(|o| o.status.success())?;
-        if out.stdout.len() as u64 > SOURCE_MAX_BYTES {
-            return None;
-        }
-        String::from_utf8(out.stdout).ok()
+    fn or_failed(v: Option<u64>, method: Method) -> Reading {
+        v.map_or(Reading::Unmeasured(Unmeasured::ReadFailed), |value| {
+            Reading::Measured { value, method }
+        })
+    }
+
+    fn text(out: Result<Vec<u8>, String>) -> Option<String> {
+        String::from_utf8(out.ok()?).ok()
     }
 
     pub(super) fn sample() -> EnvSample {
-        let mut s = EnvSample::unmeasured(Unmeasured::ReadFailed);
-        let (load, mem) = text(
-            Command::new("/usr/sbin/sysctl")
-                .args(["-n", "vm.loadavg", "hw.memsize"])
-                .stdin(Stdio::null())
-                .stderr(Stdio::null())
-                .output(),
-        )
-        .map(|t| parse_sysctl(&t))
-        .unwrap_or((None, None));
-        s.load_1m_milli = or_failed(load, Method::SysctlVmLoadavg);
-        s.mem_total_bytes = or_failed(mem, Method::SysctlHwMemsize);
-        s.mem_available_bytes = or_failed(
-            text(
-                Command::new("/usr/bin/vm_stat")
-                    .stdin(Stdio::null())
-                    .stderr(Stdio::null())
-                    .output(),
-            )
-            .and_then(|t| parse_vm_stat(&t)),
-            Method::VmStatFreeInactive,
-        );
-        s
+        let mut sysctl = Command::new("/usr/sbin/sysctl");
+        sysctl.args(["-n", "vm.loadavg", "hw.memsize", "hw.logicalcpu"]);
+        let (load, mem, cpus) = text(capture(sysctl, CAPTURE_DEADLINE))
+            .map(|t| parse_sysctl(&t))
+            .unwrap_or((None, None, None));
+        let vm_stat = Command::new("/usr/bin/vm_stat");
+        let avail = text(capture(vm_stat, CAPTURE_DEADLINE)).and_then(|t| parse_vm_stat(&t));
+        EnvSample {
+            cpus: or_failed(cpus, Method::SysctlHwLogicalcpu),
+            load_1m_milli: or_failed(load, Method::SysctlVmLoadavg),
+            mem_total_bytes: or_failed(mem, Method::SysctlHwMemsize),
+            mem_available_bytes: or_failed(avail, Method::VmStatFreeInactive),
+            state_root_free_bytes: Reading::Unmeasured(Unmeasured::NoSafeApi),
+        }
     }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod os {
-    use harness_core::environment::{EnvSample, Reading, Unmeasured};
+    use harness_core::environment::{EnvSample, Method, Reading, Unmeasured};
 
     pub(super) fn sample() -> EnvSample {
-        let mut s = EnvSample::unmeasured(Unmeasured::NoSafeApi);
-        if cfg!(windows) {
-            s.load_1m_milli = Reading::Unmeasured(Unmeasured::NoSuchMeasure);
-        }
+        let rest = if cfg!(windows) {
+            Unmeasured::NoSafeApi
+        } else {
+            Unmeasured::NotImplemented
+        };
+        let mut s = EnvSample::unmeasured(rest);
+        s.cpus = std::thread::available_parallelism()
+            .ok()
+            .and_then(|n| u64::try_from(n.get()).ok())
+            .map_or(Reading::Unmeasured(Unmeasured::ReadFailed), |value| {
+                Reading::Measured {
+                    value,
+                    method: Method::AvailableParallelism,
+                }
+            });
+        s.load_1m_milli = Reading::Unmeasured(if cfg!(windows) {
+            Unmeasured::NoSuchMeasure
+        } else {
+            Unmeasured::NotImplemented
+        });
+        s.state_root_free_bytes = Reading::Unmeasured(Unmeasured::NoSafeApi);
         s
     }
 }
@@ -262,6 +296,7 @@ mod os {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_core::environment::{Method, Reading, Unmeasured};
 
     #[test]
     fn decimals_are_exact_thousandths_or_refused() {
@@ -286,6 +321,13 @@ mod tests {
 
     #[test]
     fn linux_sources_parse_strictly() {
+        assert_eq!(parse_cpu_list("0-3,8-11\n"), Some(8));
+        assert_eq!(parse_cpu_list("0\n"), Some(1));
+        for bad in [
+            "", "\n", "3-1", "0-3,2-5", "0-3,,5", "a-b", "0 -3", "0-3\n\n",
+        ] {
+            assert_eq!(parse_cpu_list(bad), None, "{bad:?}");
+        }
         assert_eq!(parse_loadavg("0.52 0.58 0.59 1/467 12345\n"), Some(520));
         assert_eq!(parse_loadavg(""), None);
         let mi = "MemTotal:       16318756 kB\nMemFree:          812344 kB\nMemAvailable:    9876543 kB\n";
@@ -307,13 +349,22 @@ mod tests {
     #[test]
     fn macos_sources_parse_strictly() {
         assert_eq!(
-            parse_sysctl("{ 1.52 1.70 1.78 }\n17179869184\n"),
-            (Some(1520), Some(17_179_869_184))
+            parse_sysctl("{ 1.52 1.70 1.78 }\n17179869184\n10\n"),
+            (Some(1520), Some(17_179_869_184), Some(10))
         );
-        assert_eq!(parse_sysctl("{ 1.52 1.70 1.78 }\n"), (None, None));
+        // Not exactly three lines: nothing is trusted.
         assert_eq!(
-            parse_sysctl("1.52 1.70 1.78\n17179869184\n"),
-            (None, Some(17_179_869_184))
+            parse_sysctl("{ 1.52 1.70 1.78 }\n17179869184\n"),
+            (None, None, None)
+        );
+        assert_eq!(
+            parse_sysctl("{ 1.52 1.70 1.78 }\n17179869184\n10\n4\n"),
+            (None, None, None)
+        );
+        // One bad line spoils only its own field; a zero CPU count is bad.
+        assert_eq!(
+            parse_sysctl("1.52 1.70 1.78\n17179869184\n0\n"),
+            (None, Some(17_179_869_184), None)
         );
         let vm = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
                   Pages free:                               12345.\n\
@@ -336,17 +387,30 @@ mod tests {
     #[test]
     fn this_host_is_sampled_with_named_methods_and_never_a_fake_zero() {
         let s = SystemEnv.sample();
+        let cpus_method = if cfg!(target_os = "linux") {
+            Method::SysCpuOnline
+        } else if cfg!(target_os = "macos") {
+            Method::SysctlHwLogicalcpu
+        } else {
+            Method::AvailableParallelism
+        };
         assert!(
-            matches!(
-                s.cpus,
-                Reading::Measured { value, method: Method::AvailableParallelism } if value > 0
-            ),
+            matches!(s.cpus, Reading::Measured { value, method } if value > 0 && method == cpus_method),
             "{s:?}"
         );
         assert_eq!(
             s.state_root_free_bytes,
             Reading::Unmeasured(Unmeasured::NoSafeApi)
         );
+        // Every measured field uses a method its field allows.
+        for (key, r) in s.fields() {
+            if let Reading::Measured { method, .. } = r {
+                assert!(
+                    Method::for_field(key).contains(&method),
+                    "{key}: {method:?}"
+                );
+            }
+        }
         if cfg!(any(target_os = "linux", target_os = "macos")) {
             for r in [s.load_1m_milli, s.mem_total_bytes, s.mem_available_bytes] {
                 assert!(matches!(r, Reading::Measured { .. }), "{s:?}");

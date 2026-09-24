@@ -20,6 +20,9 @@
     allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
 )]
 
+// The bounded spawn the macOS probes use (tested wherever /bin/sh exists).
+#[cfg(any(target_os = "macos", all(test, unix)))]
+mod capture;
 pub mod environment;
 pub mod locality;
 

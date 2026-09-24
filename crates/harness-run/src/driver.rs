@@ -208,9 +208,10 @@ pub struct RunReport {
     pub steps: u64,
     /// The journal failure, when there was one.
     pub journal_error: Option<JournalError>,
-    /// Steps whose tool timed out or crashed while the host was under
-    /// pressure (§7.1: memory available under 5% or load above twice the
-    /// CPUs), for the report's `possibly-environmental` Info finding.
+    /// Steps whose tool timed out, crashed or could not run (a provider
+    /// failure) while the host was under pressure (§7.1: memory available
+    /// under 5% or load above twice the CPUs), for the report's
+    /// `possibly-environmental` Info finding.
     pub possibly_environmental: Vec<u64>,
 }
 
@@ -248,6 +249,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         limits: &r.config.limits,
         resumed_from: None,
         environment: r.env.sample(),
+        environment_recorded: false,
     })?;
     let (mut w, attempt) = JournalWriter::create_next_attempt_checked(
         &run_dir,
@@ -464,6 +466,9 @@ pub(crate) struct HeaderInputs<'a> {
     /// The environment sample (§7.1): measured for a live attempt, the
     /// recorded one for an audit replay.
     pub(crate) environment: EnvSample,
+    /// Whether `environment` was copied from a recording (an audit replay's
+    /// header) rather than measured here (H1f-3 review F-9).
+    pub(crate) environment_recorded: bool,
 }
 
 /// The header keys an audit replay or a resume recomputes from its own
@@ -572,7 +577,15 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, RunRefused> {
         )
         .field("os", Trusted::Text(std::env::consts::OS))
         .field("arch", Trusted::Text(std::env::consts::ARCH))
-        .field("environment", sample::to_trusted(&h.environment));
+        .field("environment", sample::to_trusted(&h.environment))
+        .field(
+            "environment_source",
+            Trusted::Text(if h.environment_recorded {
+                "recorded"
+            } else {
+                "measured"
+            }),
+        );
     if let Some((attempt, head, carried_ms)) = h.resumed_from {
         hd = hd.field(
             "resumed_from",
@@ -680,7 +693,8 @@ pub(crate) struct RecordedResult {
     pub(crate) truncated: bool,
     pub(crate) digest: Digest,
     pub(crate) read_sha256: Option<Digest>,
-    /// The sample recorded with a `timeout` or `crashed` result (§7.1).
+    /// The sample recorded with a `timeout`, `crashed` or `provider_error`
+    /// result (§7.1).
     pub(crate) environment: Option<EnvSample>,
 }
 
@@ -1049,11 +1063,18 @@ impl<'a> Loop<'a> {
                 }
             }
             Err(_) => {
+                // A provider failure is the tool-level "could not run"
+                // (§7.1 samples on CouldNotRun; H1f-3 review F-2).
+                let s = fed_environment.unwrap_or_else(|| self.env.sample());
+                if s.possibly_environmental() {
+                    self.pressure.push(step);
+                }
                 w.append(
                     step,
                     Event::new(EventKind::ToolFinished)
                         .field("intent_seq", Trusted::U64(intent_seq))
-                        .field("status", Trusted::Text("provider_error")),
+                        .field("status", Trusted::Text("provider_error"))
+                        .field("environment", sample::to_trusted(&s)),
                 )
                 .map_err(journal)?;
                 Feedback::Harness(HarnessText::from_static(

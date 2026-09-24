@@ -6,8 +6,9 @@
 //! them, like recorded model replies: [`from_value`] accepts exactly the
 //! shape [`to_trusted`] writes (the five keys, each either
 //! `{"method", "value"}` or `{"unmeasured"}`, with names from the closed
-//! sets in `harness_core::environment`), so a re-fed sample re-encodes to
-//! the same bytes, and anything else is a record the loop did not write.
+//! sets in `harness_core::environment`, each method on its own field, and
+//! never zero CPUs), so a re-fed sample re-encodes to the same bytes, and
+//! anything else is a record the loop did not write.
 
 use harness_core::environment::{EnvSample, Method, Reading, Unmeasured};
 use harness_journal::Trusted;
@@ -49,10 +50,16 @@ pub(crate) fn from_value(v: &Value) -> Option<EnvSample> {
             1 => Some(Reading::Unmeasured(Unmeasured::parse(
                 f.get("unmeasured")?.as_str()?,
             )?)),
-            2 => Some(Reading::Measured {
-                value: f.get("value")?.as_u64()?,
-                method: Method::parse(f.get("method")?.as_str()?)?,
-            }),
+            2 => {
+                let value = f.get("value")?.as_u64()?;
+                let method = Method::parse(f.get("method")?.as_str()?)?;
+                // A method only ever measures its own field, and a host
+                // has at least one CPU (H1f-3 review F-6).
+                if !Method::for_field(key).contains(&method) || (key == "cpus" && value == 0) {
+                    return None;
+                }
+                Some(Reading::Measured { value, method })
+            }
             _ => None,
         }
     };
@@ -72,7 +79,7 @@ mod tests {
 
     fn good() -> Value {
         json!({
-            "cpus": {"method": "available_parallelism", "value": 8},
+            "cpus": {"method": "/sys/devices/system/cpu/online", "value": 8},
             "load_1m_milli": {"method": "/proc/loadavg", "value": 520},
             "mem_total_bytes": {"method": "/proc/meminfo MemTotal", "value": 1024},
             "mem_available_bytes": {"unmeasured": "read_failed"},
@@ -87,7 +94,7 @@ mod tests {
             s.cpus,
             Reading::Measured {
                 value: 8,
-                method: Method::AvailableParallelism
+                method: Method::SysCpuOnline
             }
         );
         assert_eq!(
@@ -110,6 +117,13 @@ mod tests {
         cases.push(v);
         let mut v = good();
         v["cpus"]["value"] = json!(-1);
+        cases.push(v);
+        // A real method on another field's key, and zero CPUs.
+        let mut v = good();
+        v["cpus"] = json!({"method": "vm_stat free+inactive", "value": 0});
+        cases.push(v);
+        let mut v = good();
+        v["cpus"]["value"] = json!(0);
         cases.push(v);
         let mut v = good();
         v["cpus"]["unmeasured"] = json!("read_failed");

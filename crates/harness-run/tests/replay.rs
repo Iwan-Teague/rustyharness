@@ -688,16 +688,17 @@ fn nf_1_chained_resumes_are_charged_every_earlier_attempts_wall_time() {
 
 // ---- the environment sample (§7.1, H1f-3) -------------------------------------------
 
-/// Turn the first read's `ToolFinished` into a `timeout` result carrying
-/// `environment`, re-chained. (A live timeout needs a walk the clock
-/// interrupts, which a test cannot time reliably; the loop's own sampling
-/// is tested in the crate's unit tests.)
-fn as_timeout(r: &RunReport, environment: Option<Value>) {
+/// Turn the first read's `ToolFinished` into a `status` result as the loop
+/// writes one (no read digest; `environment` when given), re-chained. A
+/// live timeout needs a walk the clock interrupts, which a test cannot time
+/// reliably; the loop's own sampling is tested in the crate's unit tests.
+fn as_failed(r: &RunReport, status: &'static str, environment: Option<Value>) {
     rechain(
         &journal_path(r, 1),
         |v| v["kind"] == "ToolFinished" && v["body"].get("output").is_some(),
         move |b| {
-            b["status"] = Value::from("timeout");
+            b["status"] = Value::from(status);
+            b.as_object_mut().unwrap().remove("read_sha256");
             if let Some(e) = &environment {
                 b["environment"] = e.clone();
             }
@@ -707,7 +708,7 @@ fn as_timeout(r: &RunReport, environment: Option<Value>) {
 
 fn pressed_sample() -> Value {
     serde_json::json!({
-        "cpus": {"method": "available_parallelism", "value": 4},
+        "cpus": {"method": "/sys/devices/system/cpu/online", "value": 4},
         "load_1m_milli": {"method": "/proc/loadavg", "value": 9000},
         "mem_total_bytes": {"method": "/proc/meminfo MemTotal", "value": 1000},
         "mem_available_bytes": {"method": "/proc/meminfo MemAvailable", "value": 10},
@@ -715,40 +716,83 @@ fn pressed_sample() -> Value {
     })
 }
 
-#[test]
-fn inv_20_a_recorded_sample_is_re_fed_exactly() {
-    // A past host cannot be re-measured: the replay re-feeds the sample
-    // recorded with a timed-out result, and re-encodes it byte for byte.
-    // (Like a tool result, a sample is an input to the replay: a
-    // self-consistent edit to one is caught only by an anchor, §7.1.)
-    let (state, ws) = scratch("env-refed");
-    let r = go(&state, &ws, vec![read("a.txt"), submit()]);
-    as_timeout(&r, Some(pressed_sample()));
-    let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
-    assert_eq!(a.divergence, None);
-    let replayed = fs::read_to_string(a.replay_dir.unwrap().join(layout::JOURNAL_FILE)).unwrap();
-    let rec: Value = replayed
+/// The replay journal's records (it lives in `replay-<k>/`, not an attempt).
+fn replay_records(a: &harness_run::AuditReport) -> Vec<Value> {
+    fs::read_to_string(a.replay_dir.clone().unwrap().join(layout::JOURNAL_FILE))
+        .unwrap()
         .lines()
         .map(|l| serde_json::from_str::<Value>(l).unwrap())
-        .find(|v| v["kind"] == "ToolFinished" && v["body"].get("environment").is_some())
-        .unwrap();
-    assert_eq!(rec["body"]["environment"], pressed_sample());
+        .collect()
 }
 
 #[test]
-fn inv_20_a_missing_or_misshapen_sample_is_unreadable() {
+fn inv_20_a_recorded_sample_is_re_fed_exactly() {
+    // A past host cannot be re-measured: the replay re-feeds the sample
+    // recorded with a timed-out or crashed result, re-encodes it byte for
+    // byte, and marks its own header's copy as recorded. (Like a tool
+    // result, a sample is an input to the replay: a self-consistent edit to
+    // one is caught only by an anchor, §7.1.)
+    for status in ["timeout", "crashed"] {
+        let (state, ws) = scratch(&format!("env-refed-{status}"));
+        let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+        as_failed(&r, status, Some(pressed_sample()));
+        let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+        assert_eq!(a.divergence, None, "{status}");
+        let recs = replay_records(&a);
+        assert_eq!(recs[0]["body"]["environment_source"], "recorded");
+        let rec = recs
+            .iter()
+            .find(|v| v["kind"] == "ToolFinished" && v["body"].get("environment").is_some())
+            .unwrap();
+        assert_eq!(rec["body"]["status"], status);
+        assert_eq!(rec["body"]["environment"], pressed_sample(), "{status}");
+    }
+}
+
+#[test]
+fn a_resume_re_feeds_a_timed_out_catch_up_step_with_its_sample() {
+    let (state, ws) = scratch("env-resume");
+    let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
+    // Step 1 timed out on a pressed host; the run died in step 2.
+    as_failed(&r, "timeout", Some(pressed_sample()));
+    crash_after(&journal_path(&r, 1), 3);
+    let res = resume_with(&state, &ws, &r.run, TASK, vec![read("b.txt"), submit()]).unwrap();
+    assert_eq!(res.attempt, 2);
+    // The catch-up re-fed step 1 with its recorded sample, which flags it.
+    assert_eq!(res.possibly_environmental, vec![1]);
+    let new = JournalReader::open(&layout::attempt_dir(&r.run_dir, 2)).unwrap();
+    assert_eq!(new.records[0].body["environment_source"], "measured");
+    let step1 = new
+        .records
+        .iter()
+        .find(|x| x.step == 1 && x.kind == EventKind::ToolFinished)
+        .unwrap();
+    assert_eq!(
+        Value::Object(step1.body.clone())["environment"],
+        pressed_sample()
+    );
+    let a = audit_with(&state, &r.run, Some(2), TASK, &UserPolicy::default());
+    assert_eq!(a.divergence, None, "{a:?}");
+}
+
+#[test]
+fn inv_20_a_missing_misplaced_or_misshapen_sample_is_unreadable() {
     let mut unknown_method = pressed_sample();
     unknown_method["mem_total_bytes"]["method"] = Value::from("free -b");
+    let mut wrong_field = pressed_sample();
+    wrong_field["cpus"] = serde_json::json!({"method": "vm_stat free+inactive", "value": 4});
     let mut extra_key = pressed_sample();
     extra_key["swap_bytes"] = serde_json::json!({"unmeasured": "no_safe_api"});
-    for (name, env) in [
-        ("missing", None),
-        ("unknown-method", Some(unknown_method)),
-        ("extra-key", Some(extra_key)),
+    for (name, status, env) in [
+        ("missing", "timeout", None),
+        ("unknown-method", "timeout", Some(unknown_method)),
+        ("method-on-another-field", "crashed", Some(wrong_field)),
+        ("extra-key", "timeout", Some(extra_key)),
+        ("on-an-ok-result", "ok", Some(pressed_sample())),
     ] {
         let (state, ws) = scratch(&format!("env-{name}"));
         let r = go(&state, &ws, vec![read("a.txt"), submit()]);
-        as_timeout(&r, env);
+        as_failed(&r, status, env);
         let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
         assert_eq!(a.outcome, UNREADABLE, "{name}");
         assert!(
@@ -759,14 +803,18 @@ fn inv_20_a_missing_or_misshapen_sample_is_unreadable() {
             "{name}"
         );
     }
-    // And an `ok` result must not carry one.
-    let (state, ws) = scratch("env-on-ok");
+}
+
+#[test]
+fn a_journal_from_another_harness_build_is_named_as_such() {
+    let (state, ws) = scratch("other-build");
     let r = go(&state, &ws, vec![read("a.txt"), submit()]);
     rechain(
         &journal_path(&r, 1),
-        |v| v["kind"] == "ToolFinished" && v["body"].get("output").is_some(),
-        |b| b["environment"] = pressed_sample(),
+        |v| v["kind"] == "RunStarted",
+        |b| b["builtin_manifest"] = Value::from("0".repeat(64)),
     );
     let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
     assert_eq!(a.outcome, UNREADABLE);
+    assert!(a.divergence.unwrap().why.contains("another harness build"));
 }

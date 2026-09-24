@@ -345,9 +345,11 @@ pub fn mac_measure(
 mod macos {
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
-    use std::process::{Command, Stdio};
+    use std::process::Command;
 
     use harness_policy::locality::FsQuery;
+
+    use crate::capture::{capture, CAPTURE_DEADLINE};
 
     use super::{failed, mac_measure, parse_mac_mount, MOUNT_TABLE_MAX_BYTES};
 
@@ -356,14 +358,11 @@ mod macos {
             Ok(m) => m.dev(),
             Err(e) => return failed(format!("the path cannot be examined: {e}")),
         };
-        let out = match Command::new("/sbin/mount")
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-        {
-            Ok(o) if o.status.success() => o.stdout,
-            Ok(o) => return failed(format!("/sbin/mount exited with {}", o.status)),
-            Err(e) => return failed(format!("/sbin/mount cannot run: {e}")),
+        // Bounded, with a deadline and a cleared environment (H1f-3 review
+        // F-7; see crate::capture).
+        let out = match capture(Command::new("/sbin/mount"), CAPTURE_DEADLINE) {
+            Ok(o) => o,
+            Err(e) => return failed(format!("/sbin/mount: {e}")),
         };
         if out.len() as u64 > MOUNT_TABLE_MAX_BYTES {
             return failed("the mount list is too large");
