@@ -85,8 +85,9 @@ so the history stays readable. What is still open is listed first.
     per-OS backends gated by a conformance token, namespaces + Landlock + seccomp
     on Linux, deny-default Seatbelt on macOS, AppContainer + Job Object on Windows
     (D12, §6). A separate OS account per agent is the suite's confinement decision
-    (§8), still the suite owner's (OI-24). *Owner (2026-09-24):* no VM or container
-    confinement, because a VM reserves memory the local model needs (design OD-6).
+    (§8), still the suite owner's (OI-24). *Owner (2026-09-24):* no VMs and no external
+    container runtimes (Docker, Podman), because a VM reserves memory the local model
+    needs. The native backends above stay, container-like or not (design OD-6).
 13. **Local-only vs cloud models** — local first: loopback by default, hosted only by
     feature and per-run opt-in (§3.2, §5.4).
 14. **Reuse rustyfin's assistant tool contract** — its confirmation-token pattern is
