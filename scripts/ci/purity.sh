@@ -1,11 +1,12 @@
 #!/bin/sh
 # Purity + INV-28 gates (rustyharness design docs/01-design-v0.1.md §1.2).
 #
-# Four pure crates: gate-outcome, harness-core, harness-manifest and
-# harness-policy. Purity means no I/O, no async, no clock reads, no global
+# Five pure crates: gate-outcome, harness-core, harness-manifest,
+# harness-policy and harness-model-core. Purity means no I/O, no async, no clock reads, no global
 # state — checked two ways:
 #
-#   1. dependency shape: `cargo tree -e normal` of each pure crate must stay
+#   1. dependency shape: `cargo tree --target all -e normal,build` of each
+#      pure crate (and of harness-model) must stay
 #      inside its reviewed allowlist (gate-outcome has ZERO default deps);
 #   2. content: the pure crates' Rust files must not so much as NAME an I/O,
 #      process, environment, thread, console, or clock facility.
@@ -33,13 +34,15 @@ trap 'rm -rf "$tmpdir"' EXIT INT TERM
 # --- 1. dependency shape ---------------------------------------------------
 
 # tree_names OUT CRATE [ARGS...]: the sorted crate names in CRATE's normal
-# dependency tree, written to OUT. No pipelines: POSIX sh has no pipefail,
+# AND build dependency tree for EVERY target (H1e-1 review NF-D: a
+# Windows-only, Linux-only or build dependency must not pass because the
+# gate host does not build it), written to OUT. No pipelines: POSIX sh has no pipefail,
 # so each step writes a file and its exit status is checked.
 tree_names() {
     out=$1
     crate=$2
     shift 2
-    cargo tree -e normal --prefix none -p "$crate" "$@" >"$tmpdir/tree-raw" ||
+    cargo tree --target all -e normal,build --prefix none -p "$crate" "$@" >"$tmpdir/tree-raw" ||
         fail "cargo tree failed: -p $crate $*"
     awk '{print $1}' "$tmpdir/tree-raw" >"$tmpdir/tree-names" ||
         fail "awk failed on cargo tree output for $crate"
@@ -133,6 +136,19 @@ printf '%s\n' harness-policy >>"$tmpdir/allowed-manifest-raw" || fail "printf fa
 sort -u "$tmpdir/allowed-manifest-raw" >"$tmpdir/allowed-policy" || fail "sort failed"
 refuse_intruders "$tmpdir/policy" "$tmpdir/allowed-policy" "harness-policy"
 
+# harness-model-core (H1e-1 review NF-A: the pure half of the model layer as
+# its own crate, so no I/O module is ever a sibling): exactly the manifest
+# allowlist's reviewed crates plus harness-manifest itself (since H1e-2: a
+# tool definition is built from an admitted Capability, never from loose
+# text), and never harness-policy or anything else.
+tree_names "$tmpdir/modelcore" harness-model-core
+grep -qxF harness-core "$tmpdir/modelcore" ||
+    fail "harness-model-core tree does not contain harness-core (read the wrong tree?)"
+grep -vxF harness-policy "$tmpdir/allowed-manifest-raw" >"$tmpdir/allowed-modelcore-raw" || true
+printf '%s\n' harness-model-core >>"$tmpdir/allowed-modelcore-raw" || fail "printf failed"
+sort -u "$tmpdir/allowed-modelcore-raw" >"$tmpdir/allowed-modelcore" || fail "sort failed"
+refuse_intruders "$tmpdir/modelcore" "$tmpdir/allowed-modelcore" "harness-model-core"
+
 # --- INV-24 / H1d review F-4: harness-model's dependency tree is allowlisted --
 # harness-model is the crate that talks to the network. Its normal tree may
 # contain only the reviewed crates below; anything else (a TLS stack, an HTTP
@@ -142,7 +158,7 @@ tree_names "$tmpdir/model" harness-model
 grep -qxF harness-journal "$tmpdir/model" ||
     fail "harness-model tree does not contain harness-journal (read the wrong tree?)"
 printf '%s\n' \
-    harness-model harness-core harness-journal gate-outcome \
+    harness-model harness-model-core harness-core harness-journal harness-manifest gate-outcome \
     serde serde_core serde_derive proc-macro2 quote syn unicode-ident \
     serde_json itoa ryu memchr zmij thiserror thiserror-impl \
     sha2 digest block-buffer hybrid-array typenum crypto-common cfg-if \
@@ -154,8 +170,8 @@ sort -u "$tmpdir/allowed-model-raw" >"$tmpdir/allowed-model" || fail "sort faile
 # TLS arrives only with a future, off-by-default `hosted` feature. No crate
 # of a TLS or HTTP-client stack may appear on a normal edge anywhere in the
 # workspace. The tree must name harness-model, so the check reads something.
-cargo tree --workspace -e normal --prefix none >"$tmpdir/ws-raw" ||
-    fail "cargo tree failed: --workspace -e normal"
+cargo tree --workspace --target all -e normal,build --prefix none >"$tmpdir/ws-raw" ||
+    fail "cargo tree failed: --workspace --target all -e normal,build"
 awk '{print $1}' "$tmpdir/ws-raw" >"$tmpdir/ws-names" || fail "awk failed on the workspace tree"
 grep -qxF harness-model "$tmpdir/ws-names" ||
     fail "the workspace tree does not name harness-model (read nothing?)"
@@ -182,8 +198,8 @@ cargo tree --workspace -e all,features >"$tmpdir/feat-all" ||
     fail "cargo tree failed: --workspace -e all,features"
 grep -qF 'harness-journal feature "fault-injection"' "$tmpdir/feat-all" ||
     fail "the fault-injection feature is not in the all-edges tree (renamed? read nothing?)"
-cargo tree --workspace -e normal,features >"$tmpdir/feat-normal" ||
-    fail "cargo tree failed: --workspace -e normal,features"
+cargo tree --workspace --target all -e normal,build,features >"$tmpdir/feat-normal" ||
+    fail "cargo tree failed: --workspace --target all -e normal,build,features"
 grep -q 'harness-journal' "$tmpdir/feat-normal" ||
     fail "the normal feature tree does not name harness-journal (read nothing?)"
 if grep -qF 'fault-injection' "$tmpdir/feat-normal"; then
@@ -231,25 +247,64 @@ normalise() {
         "$tmpdir/joined" >"$2" || fail "awk could not normalise $1"
 }
 
-# strip_comments FILE OUT: the file with `//` line comments and (non-nested)
-# `/* */` block comments removed (H1a review N-3: `std::/*x*/fs` and
-# `enum /*c*/ RunOutcome` hid from the scans). A `//` inside a string
-# literal also cuts the rest of that line, so every scan runs on BOTH the
-# raw and the stripped text: neither form can hide from both.
+# strip_comments FILE OUT: the file's CODE: `//` line comments and nested
+# `/* */` block comments removed, and the contents of string, raw-string,
+# byte-string and char literals removed (the delimiters stay). H1a review
+# N-3 added the comment stripping; H1e-1 review NF-B showed a plain stripper
+# can be fooled by `"/*"` … `"*/"` or `"//"` inside literals, so this one
+# tracks literals: `"…"` with escapes, `r#*"…"#*` and `br…`, `b"…"`, and
+# `'x'`/`'\n'`/`'é'` char literals (a `'` not closing within one character
+# is a lifetime). Every scan runs on BOTH the raw text and this code view.
 strip_comments() {
-    awk '
+    LC_ALL=C awk '
+    function ident_before(line, i,    pc) {
+        if (i <= 1) return 0
+        pc = substr(line, i - 1, 1)
+        return pc ~ /[A-Za-z0-9_]/
+    }
+    BEGIN { mode = "code"; depth = 0; hashes = 0; hs = "" }
     {
-        line = $0; out = ""
-        while (length(line) > 0) {
-            if (inb) {
-                i = index(line, "*/")
-                if (i == 0) { line = ""; break }
-                line = substr(line, i + 2); inb = 0; continue
+        line = $0; n = length(line); out = ""; i = 1
+        while (i <= n) {
+            c = substr(line, i, 1); c2 = substr(line, i, 2)
+            if (mode == "block") {
+                if (c2 == "/*") { depth++; i += 2; continue }
+                if (c2 == "*/") { depth--; i += 2; if (depth == 0) { mode = "code"; out = out " " }; continue }
+                i++; continue
             }
-            a = index(line, "/*"); b = index(line, "//")
-            if (b > 0 && (a == 0 || b < a)) { out = out substr(line, 1, b - 1); line = ""; break }
-            if (a > 0) { out = out substr(line, 1, a - 1) " "; line = substr(line, a + 2); inb = 1; continue }
-            out = out line; line = ""
+            if (mode == "str") {
+                if (c == "\\") { i += 2; continue }
+                if (c == "\"") { out = out "\""; mode = "code"; i++; continue }
+                i++; continue
+            }
+            if (mode == "raw") {
+                if (c == "\"" && substr(line, i + 1, hashes) == hs) {
+                    out = out "\"" hs; i += 1 + hashes; mode = "code"; continue
+                }
+                i++; continue
+            }
+            if (c2 == "//") break
+            if (c2 == "/*") { mode = "block"; depth = 1; i += 2; continue }
+            if (c == "\"") { out = out "\""; mode = "str"; i++; continue }
+            if ((c == "r" || c2 == "br") && !ident_before(line, i)) {
+                j = i + (c == "b" ? 2 : 1); h = 0
+                while (substr(line, j, 1) == "#") { h++; j++ }
+                if (substr(line, j, 1) == "\"") {
+                    hashes = h; hs = ""; for (k = 0; k < h; k++) hs = hs "#"
+                    out = out substr(line, i, j - i + 1); mode = "raw"; i = j + 1; continue
+                }
+            }
+            if (c == "\047") {
+                if (substr(line, i + 1, 1) == "\\") {
+                    k = i + 3
+                    while (k <= n && substr(line, k, 1) != "\047") { if (substr(line, k, 1) == "\\") k++; k++ }
+                    out = out "\047\047"; i = k + 1; continue
+                }
+                if (substr(line, i + 2, 1) == "\047") { out = out "\047\047"; i += 3; continue }
+                if (match(substr(line, i + 1, 6), /^[\200-\377]+\047/)) { out = out "\047\047"; i += 1 + RLENGTH; continue }
+                out = out c; i++; continue
+            }
+            out = out c; i++
         }
         print out
     }' "$1" >"$2" || fail "awk could not read $1 (stripping comments)"
@@ -283,16 +338,10 @@ nb='[^A-Za-z0-9_]'
 # std::fs, so the pure crates may not import std::path at all.
 facility='(fs|net|process|env|io|os|thread|path)'
 rust_files "$tmpdir/pure-files" crates/gate-outcome crates/harness-core \
-    crates/harness-manifest crates/harness-policy
-# harness-model is an I/O crate (design §1.2), but its parse/validate half is
-# pure by design (H1d): these four files are scanned like a pure crate.
-for f in crates/harness-model/src/endpoint.rs crates/harness-model/src/wire.rs \
-    crates/harness-model/src/protocol.rs crates/harness-model/src/profile.rs; do
-    [ -f "$f" ] || fail "pure model file $f is missing (renamed? read nothing?)"
-    printf '%s\n' "$f" >>"$tmpdir/pure-files" || fail "printf failed"
-done
+    crates/harness-manifest crates/harness-policy crates/harness-model-core
 for must in crates/gate-outcome/src/lib.rs crates/harness-core/src/lib.rs \
-    crates/harness-manifest/src/lib.rs crates/harness-policy/src/lib.rs; do
+    crates/harness-manifest/src/lib.rs crates/harness-policy/src/lib.rs \
+    crates/harness-model-core/src/lib.rs crates/harness-model-core/src/wire.rs; do
     grep -qxF "$must" "$tmpdir/pure-files" || fail "pure-content scan would miss $must"
 done
 : >"$tmpdir/hits"
@@ -334,56 +383,49 @@ $(cat "$tmpdir/hits")"
 fi
 
 
-# --- 2b. harness-model: pure files cannot reach I/O modules (H1d review F-3) -
-# The four pure model files share a crate with the socket code, so an I/O
-# path is one `crate::` away. Every module of harness-model must be
-# classified here, and the pure files may not name a non-pure one, through
-# `crate::`, `super::`, a `use crate::{…}` group, or `extern crate self`.
-model_pure='endpoint wire protocol profile'
-model_io='http client replay smoke scripted'
+# --- 2b. harness-model: no pure file shares a crate with sockets ----------------
+# H1d review F-3 / H1e-1 review NF-A: the pure half of the model layer is the
+# separate pure crate harness-model-core (scanned and allowlisted above), so
+# it has no I/O sibling to reach by any path, alias or glob. harness-model
+# itself must not grow pure-looking modules again: its modules are exactly
+# the I/O ones.
 grep -oE '^(pub(\(crate\))? )?mod [a-z_]+;' crates/harness-model/src/lib.rs >"$tmpdir/model-mods-raw" ||
     fail "no module declarations found in harness-model/src/lib.rs (read nothing?)"
 awk '{ print $NF }' "$tmpdir/model-mods-raw" | tr -d ';' >"$tmpdir/model-mods" ||
     fail "awk failed on the module list"
 while IFS= read -r m; do
-    case " $model_pure $model_io " in
+    case " http client replay smoke scripted " in
         *" $m "*) ;;
-        *) fail "harness-model module '$m' is not classified as pure or I/O in scripts/ci/purity.sh" ;;
+        *) fail "harness-model module '$m' is not one of its I/O modules (pure code belongs in harness-model-core)" ;;
     esac
 done <"$tmpdir/model-mods"
-io_alt=$(printf '%s' "$model_io" | tr ' ' '|')
-: >"$tmpdir/hits"
-for f in crates/harness-model/src/endpoint.rs crates/harness-model/src/wire.rs \
-    crates/harness-model/src/protocol.rs crates/harness-model/src/profile.rs; do
-    for view in raw code; do
-        if [ "$view" = raw ]; then normalise "$f" "$tmpdir/norm"; else
-            strip_comments "$f" "$tmpdir/stripped"; normalise "$tmpdir/stripped" "$tmpdir/norm"; fi
-        scan "I/O sibling module" "(^|$nb)(crate|super|harness_model)::($io_alt)($nb|\$)" "$tmpdir/norm" "$f"
-        scan "I/O sibling module (group)" "(^|$nb)(crate|super)::\{([^;]*[^A-Za-z0-9_;])?($io_alt)($nb|\$)" "$tmpdir/norm" "$f"
-        scan "extern crate self" "(^|$nb)extern crate self($nb|\$)" "$tmpdir/norm" "$f"
-    done
-done
-if [ -s "$tmpdir/hits" ]; then
-    fail "a pure harness-model file reaches a non-pure module:
-$(cat "$tmpdir/hits")"
-fi
 
-# --- 2c. typed provenance: who may vouch for trusted journal text ------------
-# `harness_core::TrustedName` lets a type put text into a TRUSTED journal
-# field (H1c review F-6). Implementing it is a provenance claim, so it may
-# appear only in the files that own the vouched-for types.
+# --- 2c. typed provenance and single construction sites ----------------------
+# `harness_core::TrustedName` is SEALED (H1e-1 review NF-C): the compiler
+# refuses an implementation outside harness-core whatever the trait is called.
+# As a second, readable fence the token itself may appear in CODE only in
+# the trait's owner and its one consumer. `Box::leak`/`.leak()` is refused
+# everywhere: it is how runtime text could become the `&'static str` that
+# `Ident::of` takes. `Meter::new` appears only where the one real Meter is
+# built (the run driver, with the real clock) and in the meter's own tests.
 rust_files "$tmpdir/all-files" crates
 : >"$tmpdir/hits"
 while IFS= read -r f; do
-    case "$f" in
-        crates/harness-core/src/lib.rs|crates/harness-manifest/src/lib.rs|crates/harness-model/src/lib.rs) continue ;;
-    esac
     strip_comments "$f" "$tmpdir/stripped"
     normalise "$tmpdir/stripped" "$tmpdir/norm"
-    scan "TrustedName impl" "(^|$nb)impl[^{;]*TrustedName for($nb|\$)" "$tmpdir/norm" "$f"
+    case "$f" in
+        crates/harness-core/src/lib.rs|crates/harness-journal/src/canon.rs) ;;
+        *) scan "TrustedName outside its owner" "(^|$nb)TrustedName($nb|\$)" "$tmpdir/norm" "$f" ;;
+    esac
+    scan "leak" "(^|$nb)(Box::leak|String::leak|Vec::leak)($nb|\$)" "$tmpdir/norm" "$f"
+    scan "leak" "\.leak ?\(" "$tmpdir/norm" "$f"
+    case "$f" in
+        crates/harness-core/src/lib.rs|crates/harness-model-core/src/protocol.rs|crates/harness-run/src/driver.rs) ;;
+        *) scan "Meter construction" "(^|$nb)Meter::new ?\(" "$tmpdir/norm" "$f" ;;
+    esac
 done <"$tmpdir/all-files"
 if [ -s "$tmpdir/hits" ]; then
-    fail "TrustedName implemented outside the files that own vouched-for types:
+    fail "provenance or construction-site fence:
 $(cat "$tmpdir/hits")"
 fi
 

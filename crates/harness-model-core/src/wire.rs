@@ -77,7 +77,7 @@ pub fn fold(s: &str) -> String {
 
 /// A call label is rendered outside the untrusted block's body, so it must
 /// be a capability id (`[a-z0-9._-]{1,128}`): no newline, no delimiter.
-fn is_call_label(s: &str) -> bool {
+pub(crate) fn is_call_label(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
         && s.bytes().all(|b| {

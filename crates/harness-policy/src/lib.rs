@@ -8,7 +8,10 @@
 //!   user policy).
 //! - [`Session::plan`]: session-level refusals before anything runs:
 //!   unknown or duplicate grants, `restricted` (INV-27), the trifecta
-//!   (INV-9, pure half), and every class this slice does not decide.
+//!   (INV-9, pure half), and every class this slice does not decide. The
+//!   one write-class capability it does decide is the built-in submit
+//!   sentinel [`SUBMIT_ID`] (§2.5), allowed by the named rule
+//!   `allow.task-submit` after every deny rule and schema check.
 //! - [`Session::decide`]: the §5.1 order — deny rules (first match wins,
 //!   cannot be overridden), then ask rules, then allow rules, then DENY by
 //!   default. Every decision carries the id of the rule that produced it.
@@ -446,6 +449,9 @@ struct Active {
     user_allow: Option<usize>,
     /// A built-in file tool: its `path` argument must stay in the workspace.
     fs_tool: bool,
+    /// The built-in submit sentinel (§2.5), the one write-class capability
+    /// this slice decides.
+    submit: bool,
 }
 
 /// A planned session: the active set with each capability's effective
@@ -459,6 +465,25 @@ pub struct Session {
 }
 
 const FS_PREFIX: &str = "harness.fs.";
+
+/// The submit sentinel's id (§2.5, §4.8). Only the compiled-in `harness`
+/// manifest can declare it (the namespace is reserved, §4.3).
+pub const SUBMIT_ID: &str = "harness.task.submit";
+
+/// Whether `c` is the built-in submit sentinel with exactly the labels §4.8
+/// gives it (write / public / own / none, content own, no confirmation). A
+/// manifest that labelled it anything else would not be the sentinel, and
+/// its write class is then out of scope like any other.
+fn is_submit_sentinel(c: &Capability) -> bool {
+    c.id().as_str() == SUBMIT_ID
+        && c.id().provider() == BUILTIN_NAMESPACE
+        && c.effect() == Effect::Write
+        && c.sensitivity() == Sensitivity::Public
+        && c.blast_radius() == BlastRadius::Own
+        && c.egress() == Egress::None
+        && c.content() == Content::Own
+        && c.confirmation() == Confirmation::None
+}
 
 /// A grant's resolution (private mirror of `Resolved` without provenance).
 enum Lookup<'a> {
@@ -529,7 +554,7 @@ impl Session {
             classes.iter().map(|(id, cl, _)| (*id, *cl)).collect();
         trifecta(&labels, spec.workspace)?;
 
-        for (id, cl, _) in &classes {
+        for (c, (id, cl, _)) in resolved.iter().zip(&classes) {
             let out = |what| SessionRefused::OutOfScope {
                 capability: id.to_string(),
                 what,
@@ -537,7 +562,7 @@ impl Session {
             if id.as_str().starts_with(FS_PREFIX) && spec.workspace.is_none() {
                 return Err(SessionRefused::NoWorkspace(id.to_string()));
             }
-            if cl.effect != Effect::Read {
+            if cl.effect != Effect::Read && !is_submit_sentinel(c) {
                 return Err(out("a non-read effect class"));
             }
             if cl.egress != Egress::None {
@@ -557,6 +582,7 @@ impl Session {
                     user_allow: UserPolicy::first_match(&policy.allow, c.id()),
                     fs_tool: c.id().provider() == BUILTIN_NAMESPACE
                         && c.id().as_str().starts_with(FS_PREFIX),
+                    submit: is_submit_sentinel(c),
                 },
             );
         }
@@ -601,7 +627,7 @@ impl Session {
             return deny(DenyReason::Quarantined, "deny.quarantined");
         }
         let cl = a.class;
-        if cl.effect != Effect::Read {
+        if cl.effect != Effect::Read && !a.submit {
             return deny(
                 DenyReason::ClassOutOfScope(cl.effect),
                 "deny.class-out-of-scope",
@@ -671,6 +697,11 @@ impl Session {
         if cl.effect == Effect::Read && cl.sensitivity <= Sensitivity::Operational {
             return PolicyDecision::Allow {
                 rule: RuleId::Builtin("allow.default.read"),
+            };
+        }
+        if a.submit {
+            return PolicyDecision::Allow {
+                rule: RuleId::Builtin("allow.task-submit"),
             };
         }
 

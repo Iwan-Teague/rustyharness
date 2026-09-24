@@ -169,27 +169,37 @@ awk '{ print } /^\[dependencies\]/ { print "rustls = { path = \"../zz-rustls\" }
 mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-model/Cargo.toml" || fail "mv failed"
 expect_refusal "harness-model depends on a TLS crate" "INV-24: TLS/HTTP-client crates in the default build"
 
-# A pure model file naming an I/O facility is refused like a pure crate.
+# The pure model crate naming an I/O facility is refused like any pure crate.
 fresh
-printf 'fn zz() { let _ = std::net::TcpStream::connect("x"); }\n' >>"$copy/crates/harness-model/src/wire.rs" ||
+printf 'fn zz() { let _ = std::net::TcpStream::connect("x"); }\n' >>"$copy/crates/harness-model-core/src/wire.rs" ||
     fail "could not plant into wire.rs"
-expect_refusal "harness-model's pure wire.rs opens a socket" "pure sources name forbidden facilities"
+expect_refusal "harness-model-core's wire.rs opens a socket" "pure sources name forbidden facilities"
 
 # --- H1e-1 plants --------------------------------------------------------------
 
-# H1d review F-3: a pure model file reaching a sibling I/O module.
+# H1d review F-3 / H1e-1 review NF-A: the pure model code is its own crate.
+# The only way for it to reach I/O code is a dependency on an I/O crate
+# (harness-model itself would be a cycle), which the allowlist refuses; and
+# harness-model may not grow a non-I/O module again. (`use crate::*;
+# http::exchange` inside the pure crate does not compile: there is no `http`
+# there.)
 fresh
-printf 'fn zz() { let _ = crate::http::exchange; }\n' >>"$copy/crates/harness-model/src/wire.rs" ||
-    fail "could not plant into wire.rs"
-expect_refusal "pure wire.rs names crate::http" "a pure harness-model file reaches a non-pure module"
+awk '{ print } /^\[dependencies\]/ { print "harness-journal = { path = \"../harness-journal\" }" }' \
+    "$copy/crates/harness-model-core/Cargo.toml" >"$tmpdir/Cargo.toml.planted" || fail "awk failed"
+mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-model-core/Cargo.toml" || fail "mv failed"
+expect_refusal "harness-model-core depends on an I/O crate" "harness-model-core pulled in non-allowlisted crates"
+# H1e-2: harness-model-core may use harness-manifest (tool definitions from
+# admitted capabilities) but not harness-policy.
 fresh
-printf 'use crate::{profile::Profile as _P, client::OpenAiCompatible as _C};\n' \
-    >>"$copy/crates/harness-model/src/protocol.rs" || fail "could not plant into protocol.rs"
-expect_refusal "pure protocol.rs imports client in a use group" "a pure harness-model file reaches a non-pure module"
+awk '{ print } /^\[dependencies\]/ { print "harness-policy = { path = \"../harness-policy\" }" }' \
+    "$copy/crates/harness-model-core/Cargo.toml" >"$tmpdir/Cargo.toml.planted" || fail "awk failed"
+mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-model-core/Cargo.toml" || fail "mv failed"
+expect_refusal "harness-model-core depends on harness-policy" "harness-model-core pulled in non-allowlisted crates"
 fresh
 printf 'pub mod zz;\n' >>"$copy/crates/harness-model/src/lib.rs" || fail "could not plant a module"
-printf '' >"$copy/crates/harness-model/src/zz.rs" || fail "could not plant zz.rs"
-expect_refusal "an unclassified harness-model module" "is not classified as pure or I/O"
+printf 'use crate::*;\npub fn zz() { let _ = http::exchange; }\n' >"$copy/crates/harness-model/src/zz.rs" ||
+    fail "could not plant zz.rs"
+expect_refusal "a non-I/O module in harness-model" "is not one of its I/O modules"
 
 # H1d review F-4: any crate outside harness-model's allowlist, whatever its name.
 fresh
@@ -236,10 +246,61 @@ fresh
 plant crates/harness-core/src/zz_plant.rs 'pub enum /*c*/ RunOutcome { A }\n'
 expect_refusal "INV-28 with a comment inside" "INV-28"
 
-# H1c review F-6: TrustedName implemented outside the owning files.
+# H1c review F-6 / H1e-1 review NF-C: TrustedName is sealed (the compiler
+# refuses outside impls); the gate also refuses the token outside its owner,
+# however it is imported. And no `.leak()` (runtime text to &'static str).
 fresh
 plant crates/harness-tools/src/zz_plant.rs 'struct S(String);\nimpl harness_core::TrustedName for S { fn trusted_name(&self) -> &str { &self.0 } }\n'
-expect_refusal "TrustedName vouched for by an unlisted file" "TrustedName implemented outside the files that own"
+expect_refusal "TrustedName named outside its owner" "TrustedName outside its owner"
+fresh
+plant crates/harness-tools/src/zz_plant.rs 'use harness_core::TrustedName as Tn;\nstruct S(String);\nimpl Tn for S { fn trusted_name(&self) -> &str { &self.0 } }\n'
+expect_refusal "TrustedName through an alias" "TrustedName outside its owner"
+fresh
+plant crates/harness-tools/src/zz_plant.rs 'pub fn zz(s: String) -> &'"'"'static str { Box::leak(s.into_boxed_str()) }\n'
+expect_refusal "Box::leak of runtime text" "leak"
+fresh
+plant crates/harness-tools/src/zz_plant.rs 'pub fn zz(s: String) -> &'"'"'static str { s.leak() }\n'
+expect_refusal "String .leak()" "leak"
+# One Meter, built by the run driver only.
+fresh
+plant crates/harness-tools/src/zz_plant.rs 'pub fn zz(l: harness_core::MeterLimits, c: Box<dyn harness_core::MonoClock>) -> harness_core::Meter { harness_core::Meter::new(l, None, c) }\n'
+expect_refusal "a second Meter construction site" "Meter construction"
+# ...and inside the run crate only driver.rs is exempt (H1e-2: its tests
+# call the driver's own constructor, never Meter::new).
+fresh
+plant crates/harness-run/tests/zz_plant.rs 'pub fn zz(l: harness_core::MeterLimits, c: Box<dyn harness_core::MonoClock>) -> harness_core::Meter { harness_core::Meter::new(l, None, c) }\n'
+expect_refusal "a Meter built in the run crate outside driver.rs" "Meter construction"
+
+# H1e-1 review NF-B: literals must not hide code from the code-only scans.
+n3b_case() {
+    fresh
+    plant crates/harness-core/src/zz_plant.rs "$2"
+    expect_refusal "$1" "pure sources name forbidden facilities"
+}
+n3b_case "static between \"/*\" and \"*/\" strings" 'pub const A: &str = "/*"; pub static G: u8 = 0; pub const B: &str = "*/";\n'
+n3b_case "static after a \"//\" string" 'pub const A: &str = "//"; pub static G: u8 = 0;\n'
+n3b_case "include_str! between raw strings" 'pub const A: &str = r"/*"; pub const X: &str = include_str!("lib.rs"); pub const B: &str = r"*/";\n'
+n3b_case "macro_rules! between byte strings" 'pub const A: &[u8] = b"/*"; macro_rules! m { () => {} } pub const B: &[u8] = b"*/";\n'
+n3b_case "static after a quote char" 'pub const Q: char = '"'"'"'"'"'; pub static G: u8 = 0; pub const R: &str = "x";\n'
+
+# H1e-1 review NF-D: target-specific and build dependencies are allowlisted too.
+fresh
+mkdir -p "$copy/crates/zz-extra/src" || fail "mkdir failed"
+printf '[package]\nname = "zz-innocuous"\nversion = "0.0.0"\nedition = "2021"\npublish = false\nlicense = "MIT"\n' \
+    >"$copy/crates/zz-extra/Cargo.toml" || fail "could not plant zz-innocuous"
+printf '' >"$copy/crates/zz-extra/src/lib.rs" || fail "could not plant zz-innocuous lib"
+printf '\n[target.'"'"'cfg(windows)'"'"'.dependencies]\nzz-innocuous = { path = "../zz-extra" }\n' \
+    >>"$copy/crates/harness-model/Cargo.toml" || fail "could not plant a windows dependency"
+expect_refusal "a Windows-only dependency of harness-model" "harness-model pulled in non-allowlisted crates"
+fresh
+mkdir -p "$copy/crates/zz-extra/src" || fail "mkdir failed"
+printf '[package]\nname = "zz-innocuous"\nversion = "0.0.0"\nedition = "2021"\npublish = false\nlicense = "MIT"\n' \
+    >"$copy/crates/zz-extra/Cargo.toml" || fail "could not plant zz-innocuous"
+printf '' >"$copy/crates/zz-extra/src/lib.rs" || fail "could not plant zz-innocuous lib"
+printf '\n[build-dependencies]\nzz-innocuous = { path = "../zz-extra" }\n' \
+    >>"$copy/crates/harness-core/Cargo.toml" || fail "could not plant a build dependency"
+printf 'fn main() {}\n' >"$copy/crates/harness-core/build.rs" || fail "could not plant build.rs"
+expect_refusal "a build dependency of harness-core" "harness-core pulled in non-allowlisted crates"
 
 # H1a review N-6: a compile_fail doctest without its error code.
 fresh

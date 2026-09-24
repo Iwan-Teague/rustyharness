@@ -54,6 +54,10 @@ pub fn run(
     };
     for (i, path) in SMOKE_PATHS.iter().enumerate() {
         r.cases += 1;
+        let Some(nonce) = RenderNonce::new(&format!("{:016x}", i + 1)) else {
+            r.call_failures += 1;
+            continue;
+        };
         let req = ModelRequest {
             messages: vec![
                 Message::System(protocol_system_text(profile.protocol(), &tools)),
@@ -62,7 +66,7 @@ pub fn run(
                 ))),
             ],
             tools: tools.clone(),
-            nonce: RenderNonce::new(&format!("{:016x}", i + 1)).unwrap_or_else(fallback_nonce),
+            nonce,
         };
         let completion = match backend.complete(&req, Instant::now() + per_call) {
             Ok(c) => c,
@@ -85,11 +89,6 @@ pub fn run(
     }
     let verdict = score(profile, &r);
     (r, verdict)
-}
-
-/// Unreachable in practice: 16 lowercase hex digits always validate.
-fn fallback_nonce() -> RenderNonce {
-    RenderNonce(String::from("0000000000000000"))
 }
 
 #[cfg(test)]

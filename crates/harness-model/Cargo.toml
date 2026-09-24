@@ -15,6 +15,8 @@ workspace = true
 # std::net (see http.rs for why). The replay backend reads journals, hence
 # harness-journal.
 harness-core = { path = "../harness-core" }
+# The pure half of the model layer (H1e-1 review NF-A), re-exported.
+harness-model-core = { path = "../harness-model-core" }
 harness-journal = { path = "../harness-journal" }
 serde.workspace = true
 serde_json.workspace = true

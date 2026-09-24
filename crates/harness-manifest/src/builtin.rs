@@ -6,15 +6,23 @@
 //! the origin: this text is compiled in, so it alone may use the reserved
 //! `harness` namespace and the `builtin` transport.
 //!
-//! H1 declares only the three read tools. `harness.edit.*`, `harness.exec.run`,
-//! `harness.notes.write` and `harness.task.submit` are write/execute class and
-//! arrive with the slices that implement their policy (H1e for the submit
-//! sentinel and notes, H2 for edits and exec).
+//! H1 declares the three read tools and the submit sentinel
+//! `harness.task.submit` (§2.5, H1e-2). `harness.edit.*`, `harness.exec.run`
+//! and `harness.notes.write` are write/execute class and arrive with the
+//! slices that implement their policy (H2).
 //!
-//! Labels: read / operational / own / none, as §4.8's table says; `content`
-//! is `third_party` because file contents in a workspace are other people's
-//! text by default (§5.4). That changes no default decision (§5.2 allows both
-//! read rows) and only makes the trifecta label honest.
+//! Read tools: read / operational / own / none, as §4.8's table says;
+//! `content` is `third_party` because file contents in a workspace are other
+//! people's text by default (§5.4). That changes no default decision (§5.2
+//! allows both read rows) and only makes the trifecta label honest.
+//!
+//! The sentinel: write / public / own / none (§4.8), `content: own`. It
+//! changes nothing but the run's phase; policy allows it by one named rule
+//! (`allow.task-submit`), the only write-class capability H1 decides.
+//!
+//! `harness.fs.search` matches a literal substring, not a regular
+//! expression: H1 adds no regex crate (§4.8 deviation, recorded in the
+//! design's changes table).
 
 use crate::{parse_with_origin, Manifest, ManifestError, Origin, ValidationContext};
 
@@ -48,7 +56,7 @@ pub const BUILTIN_MANIFEST_JSON: &str = r#"{
     },
     {
       "id": "harness.fs.search",
-      "summary": "Search files inside the workspace with a regular expression",
+      "summary": "Search files inside the workspace for a literal text",
       "effect": "read",
       "sensitivity": "operational",
       "blast_radius": "own",
@@ -82,6 +90,24 @@ pub const BUILTIN_MANIFEST_JSON: &str = r#"{
           "depth": { "type": "integer", "minimum": 1, "maximum": 4 }
         },
         "required": ["path"]
+      }
+    },
+    {
+      "id": "harness.task.submit",
+      "summary": "Submit the task for verification with a short note",
+      "effect": "write",
+      "sensitivity": "public",
+      "blast_radius": "own",
+      "egress": "none",
+      "content": "own",
+      "confirmation": "none",
+      "input_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "note": { "type": "string", "maxLength": 2000 }
+        },
+        "required": ["note"]
       }
     }
   ]

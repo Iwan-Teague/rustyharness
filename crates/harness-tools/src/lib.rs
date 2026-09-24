@@ -20,7 +20,9 @@
 
 use serde::Deserialize;
 
+pub mod builtin;
 pub mod provider;
+pub use builtin::ReadTools;
 pub use provider::{InvokeCtx, RefusalKind, ToolError, ToolProvider, ToolResult, ToolStatus};
 
 /// The manifest schema version this harness understands.

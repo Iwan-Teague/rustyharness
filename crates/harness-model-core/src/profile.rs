@@ -72,6 +72,14 @@ pub struct Sampling {
 /// itself. [`Profile::validated`] recomputes it, so a stamp copied into
 /// another profile, a made-up stamp, or a profile edited after
 /// `profile check` is simply unvalidated.
+///
+/// **What it is and is not (H1e-1 review NF-E).** It is a STALENESS check:
+/// it proves the stamp was computed for exactly this content. It is NOT
+/// authentication: the digest is unkeyed and public, so whoever can edit
+/// the profile file can also compute a matching stamp. `profile_validated`
+/// therefore means "stamp consistent with content", never "the harness saw
+/// this profile pass". Authenticity (the smoke report stored under
+/// `state_root` and re-verified) arrives with the `profile check` CLI verb.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Stamp {
@@ -359,7 +367,9 @@ impl Profile {
     }
 
     /// The stamp `profile check` writes for a passing report on THIS content.
-    pub fn stamp_for(&self, report: &Digest) -> Stamp {
+    /// Crate-private (H1e-1 review NF-E): outside code gets a stamp only
+    /// through [`score`] over smoke results.
+    pub(crate) fn stamp_for(&self, report: &Digest) -> Stamp {
         let bound = format!("{}:{}", self.content_sha256(), report);
         Stamp {
             report_sha256: report.to_string(),

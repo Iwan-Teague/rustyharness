@@ -19,17 +19,29 @@ pub fn run_dir(state_root: &Path, run: &RunId) -> PathBuf {
 }
 
 /// Create `state_root/runs/<run-id>` durably: `runs/` is created if absent
-/// (and `state_root` fsynced), the run directory is created with
+/// (and `state_root` is fsynced every time), the run directory is created with
 /// `create_dir` (it must not exist), and `runs/` is fsynced so the new entry
 /// survives a crash (the H1c F-1 rule, applied one level up). Neither
 /// `runs/` nor the run directory may be a symlink.
 pub fn create_run_dir(state_root: &Path, run: &RunId) -> io::Result<PathBuf> {
+    create_run_dir_with(state_root, run, &crate::writer::RealDirSync)
+}
+
+pub(crate) fn create_run_dir_with(
+    state_root: &Path,
+    run: &RunId,
+    ds: &dyn crate::writer::DirSync,
+) -> io::Result<PathBuf> {
     let runs = state_root.join("runs");
     match fs::create_dir(&runs) {
-        Ok(()) => crate::writer::sync_dir(state_root)?,
+        Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
     }
+    // Always, not only when `runs/` was just created: if an earlier attempt
+    // created it and then failed to sync `state_root`, this call must not
+    // skip the sync (H1e-1 review, durability edge).
+    ds.sync(state_root)?;
     let m = fs::symlink_metadata(&runs)?;
     if m.file_type().is_symlink() || !m.is_dir() {
         return Err(io::Error::new(
@@ -39,7 +51,7 @@ pub fn create_run_dir(state_root: &Path, run: &RunId) -> io::Result<PathBuf> {
     }
     let dir = runs.join(run.as_str());
     fs::create_dir(&dir)?;
-    crate::writer::sync_dir(&runs)?;
+    ds.sync(&runs)?;
     Ok(dir)
 }
 

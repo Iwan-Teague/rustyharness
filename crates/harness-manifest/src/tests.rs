@@ -72,7 +72,7 @@ fn fixture_manifest_validates() {
 // ---- built-in manifest ------------------------------------------------------
 
 #[test]
-fn builtin_manifest_declares_exactly_the_h1_read_tools() {
+fn builtin_manifest_declares_exactly_the_h1_read_tools_and_the_sentinel() {
     let m = builtin::manifest(&ctx()).unwrap();
     assert_eq!(m.provider().as_str(), BUILTIN_NAMESPACE);
     assert_eq!(m.origin(), Origin::Compiled);
@@ -80,9 +80,19 @@ fn builtin_manifest_declares_exactly_the_h1_read_tools() {
     let ids: Vec<&str> = m.capabilities().iter().map(|c| c.id.as_str()).collect();
     assert_eq!(
         ids,
-        ["harness.fs.read", "harness.fs.search", "harness.fs.list"]
+        [
+            "harness.fs.read",
+            "harness.fs.search",
+            "harness.fs.list",
+            "harness.task.submit"
+        ]
     );
-    for c in m.capabilities() {
+    let submit = &m.capabilities()[3];
+    assert_eq!(
+        (submit.effect, submit.sensitivity, submit.content),
+        (Effect::Write, Sensitivity::Public, Content::Own)
+    );
+    for c in m.capabilities().iter().take(3) {
         assert_eq!(c.effect, Effect::Read, "{}", c.id);
         assert_eq!(c.sensitivity, Sensitivity::Operational, "{}", c.id);
         assert_eq!(c.blast_radius, BlastRadius::Own, "{}", c.id);

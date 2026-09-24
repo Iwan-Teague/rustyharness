@@ -34,6 +34,10 @@ printf '%s\n' '--- compile-fail doctests with their expected error codes enforce
 # it believes it is a nightly build; RUSTC_BOOTSTRAP=1 turns that check on
 # (H1a review N-6). It enables no unstable feature in the code under test:
 # the crates build on stable without it, as every other step shows.
-RUSTC_BOOTSTRAP=1 cargo test --locked --workspace --doc --features gate-outcome/json
+# Its own target directory (H1e-1 review NF-F): dependency build scripts
+# (proc-macro2, thiserror) probe RUSTC_BOOTSTRAP and may build nightly code
+# paths, which must not mix with the stable cache every other step uses.
+RUSTC_BOOTSTRAP=1 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}/rustc-bootstrap-doctests" \
+    cargo test --locked --workspace --doc --features gate-outcome/json
 
 printf 'All 5 rustyharness gates passed.\n'

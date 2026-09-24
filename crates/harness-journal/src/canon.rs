@@ -43,10 +43,9 @@ pub const INLINE_MAX: usize = 4096;
 /// **Typed provenance (H1c review F-6, closed in H1e-1).** There is no
 /// public constructor from a runtime `&str`. An `Ident` comes from:
 /// - [`Ident::of`]: a `&'static str` (compile-time harness text), or
-/// - [`Ident::from_trusted`]: a value implementing
-///   `harness_core::TrustedName` (a `RunId`, a validated `CapId` or
-///   `ProviderName`, a render nonce), whose implementations the purity gate
-///   confines to the files that own those types.
+/// - [`Ident::from_trusted`]: a value implementing the sealed
+///   `harness_core::TrustedName` (a `RunId` or a `Nonce`), or
+/// - [`Ident::from_capability`]: an admitted manifest's `Capability`.
 ///
 /// The grammar also refuses a leading `.` or `-` (so never `.`, `..`,
 /// `.hidden` or `-rf`; H1c confirming review NF-3).
@@ -73,9 +72,29 @@ impl Ident {
         Self::new(s)
     }
 
-    /// Text a trusted type vouches for (typed provenance).
+    /// Text a trusted type vouches for (typed provenance). `TrustedName`
+    /// is sealed in `harness-core` (H1e-1 review NF-C): only `RunId` and
+    /// `Nonce` implement it.
+    ///
+    /// A `CapId` cannot vouch: `CapId::new` accepts any text that fits the
+    /// id grammar, model text included (NF-C).
+    ///
+    /// ```compile_fail,E0277
+    /// let id = harness_manifest::CapId::new("fixture.any.text").unwrap();
+    /// let _ = harness_journal::Ident::from_trusted(&id);
+    /// ```
     pub fn from_trusted<T: harness_core::TrustedName + ?Sized>(t: &T) -> Option<Self> {
         Self::new(t.trusted_name())
+    }
+
+    /// A capability's id. A `Capability` exists only as part of a manifest
+    /// that parsed and validated (trust-base input; private fields, no
+    /// public constructor), so model or tool text cannot reach a trusted
+    /// field this way, even when it happens to fit the id grammar
+    /// (H1e-1 review NF-C: vouch for resolved capabilities, not for any
+    /// grammatical `CapId`).
+    pub fn from_capability(c: &harness_manifest::Capability) -> Option<Self> {
+        Self::new(c.id().as_str())
     }
 
     /// The text.

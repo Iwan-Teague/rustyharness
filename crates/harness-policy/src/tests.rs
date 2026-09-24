@@ -244,6 +244,7 @@ fn raw_session(c: &Capability, allow_idx: Option<usize>) -> Session {
             user_ask: None,
             user_allow: allow_idx,
             fs_tool: false,
+            submit: false,
         },
     );
     Session {
@@ -660,5 +661,80 @@ fn the_call_digest_is_computed_from_the_authorised_call() {
     assert_eq!(
         a.call_digest(),
         harness_core::sha256(br#"{"args":{"lines":5,"path":"a"},"capability":"harness.fs.read"}"#)
+    );
+}
+
+// ---- the submit sentinel (§2.5, H1e-2) ------------------------------------------
+
+#[test]
+fn the_submit_sentinel_is_allowed_by_its_own_rule_and_nothing_else_is() {
+    let r = builtin_registry();
+    let mut sp = spec(&["harness.task.submit"]);
+    // Not a file tool: it needs no workspace.
+    sp.workspace = None;
+    let s = Session::plan(&sp, &r, &UserPolicy::default()).unwrap();
+    let ok = call("harness.task.submit", json!({"note": "done"}));
+    assert_eq!(
+        s.decide(&ok),
+        PolicyDecision::Allow {
+            rule: RuleId::Builtin("allow.task-submit")
+        }
+    );
+    assert_eq!(
+        s.authorize(ok).unwrap().rule(),
+        RuleId::Builtin("allow.task-submit")
+    );
+    // Its arguments are schema-checked like any other call.
+    for bad in [
+        json!({}),
+        json!({"note": 1}),
+        json!({"note": "x", "extra": true}),
+        json!({"note": "x".repeat(2001)}),
+    ] {
+        let d = s.decide(&call("harness.task.submit", bad.clone()));
+        assert!(
+            matches!(
+                d,
+                PolicyDecision::Deny {
+                    reason: DenyReason::Args(_),
+                    ..
+                }
+            ),
+            "{bad}: {d:?}"
+        );
+    }
+}
+
+#[test]
+fn a_user_deny_still_beats_the_submit_rule() {
+    let p = UserPolicy::new(&["harness.task.submit"], &[], &[]).unwrap();
+    let s = Session::plan(&spec(&["harness.task.submit"]), &builtin_registry(), &p).unwrap();
+    let d = s.decide(&call("harness.task.submit", json!({"note": "x"})));
+    assert!(is_deny(&d, &DenyReason::UserDenied), "{d:?}");
+}
+
+#[test]
+fn a_write_capability_that_merely_looks_like_submit_stays_out_of_scope() {
+    // Same verb, other provider: not the sentinel, so its write class is
+    // refused at planning like every other write.
+    let m = fixture(vec![cap_json(
+        "task.submit",
+        ["write", "public", "own", "none", "own", "none"],
+    )]);
+    let err = plan_over(
+        &[m],
+        &spec(&["fixture.task.submit"]),
+        &UserPolicy::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SessionRefused::OutOfScope {
+                what: "a non-read effect class",
+                ..
+            }
+        ),
+        "{err:?}"
     );
 }

@@ -78,6 +78,7 @@ version = "0.0.1"
 dependencies = [
  "gate-outcome",
  "harness-core",
+ "harness-manifest",
  "serde_json",
  "thiserror",
 ]
@@ -99,6 +100,18 @@ dependencies = [
  "gate-outcome",
  "harness-core",
  "harness-journal",
+ "harness-model-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "harness-model-core"
+version = "0.0.1"
+dependencies = [
+ "harness-core",
+ "harness-manifest",
  "serde",
  "serde_json",
  "thiserror",
@@ -110,6 +123,21 @@ version = "0.0.1"
 dependencies = [
  "harness-core",
  "harness-manifest",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "harness-run"
+version = "0.0.1"
+dependencies = [
+ "gate-outcome",
+ "harness-core",
+ "harness-journal",
+ "harness-manifest",
+ "harness-model",
+ "harness-policy",
+ "harness-tools",
  "serde_json",
  "thiserror",
 ]

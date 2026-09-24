@@ -1042,3 +1042,43 @@ fn idents_come_from_static_text_or_trusted_types_only() {
     let run = rid(7);
     assert_eq!(Ident::from_trusted(&run).unwrap().as_str(), run.as_str());
 }
+
+// H1e-1 review: a retry after a failed state_root sync must sync it again.
+struct PathSpy {
+    fail: Option<std::path::PathBuf>,
+    synced: RefCell<Vec<std::path::PathBuf>>,
+}
+
+impl crate::writer::DirSync for PathSpy {
+    fn sync(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        self.synced.borrow_mut().push(dir.to_path_buf());
+        if self.fail.as_deref() == Some(dir) {
+            return Err(std::io::Error::other("injected directory fsync failure"));
+        }
+        crate::writer::sync_dir(dir)
+    }
+}
+
+#[test]
+fn create_run_dir_syncs_state_root_even_when_runs_already_exists() {
+    let t = TempDir::new("rundir-sync");
+    // First call: runs/ is created, but the state_root sync fails.
+    let failing = PathSpy {
+        fail: Some(t.0.clone()),
+        synced: RefCell::new(Vec::new()),
+    };
+    assert!(layout::create_run_dir_with(&t.0, &rid(1), &failing).is_err());
+    assert!(
+        t.0.join("runs").is_dir(),
+        "runs/ exists after the failed call"
+    );
+    // Retry: runs/ now exists; state_root must still be synced first.
+    let ok = PathSpy {
+        fail: None,
+        synced: RefCell::new(Vec::new()),
+    };
+    let dir = layout::create_run_dir_with(&t.0, &rid(2), &ok).unwrap();
+    let synced = ok.synced.borrow().clone();
+    assert_eq!(synced, vec![t.0.clone(), t.0.join("runs")]);
+    assert!(dir.is_dir());
+}

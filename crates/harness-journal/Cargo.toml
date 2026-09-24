@@ -21,5 +21,8 @@ fault-injection = []
 # `reader::verify`, and take no I/O.
 harness-core = { path = "../harness-core" }
 gate-outcome = { path = "../gate-outcome" }
+# Ident::from_capability: a capability id reaches a trusted field only from
+# an admitted manifest's Capability (H1e-1 review NF-C).
+harness-manifest = { path = "../harness-manifest" }
 serde_json.workspace = true
 thiserror.workspace = true
