@@ -301,7 +301,7 @@ fn assert_refused_as_not_local(o: &Output, m: &Mock, state_root: &Path, marker: 
 }
 
 #[test]
-fn inv_35_the_binary_refuses_a_state_root_that_is_not_a_local_disk() {
+fn inv_35_the_binary_refuses_a_state_root_not_identified_as_local() {
     // Where the real probe measures, `/dev` is devfs (macOS) or devtmpfs
     // (Linux): not an admitted local filesystem. Where it does not (Windows
     // until spike S-W1), every state root is refused, so the fixture's own

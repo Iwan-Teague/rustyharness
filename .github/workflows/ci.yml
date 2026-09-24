@@ -11,10 +11,12 @@ permissions:
 jobs:
   # The member gate entrypoint itself, exactly as tooling/dev-push.sh runs
   # it (scripts/ci/gates.sh): fmt, the purity gate and its refusal
-  # witnesses, cargo-deny, clippy and tests with and without
-  # gate-outcome/json, and the compile-fail doctests with their error codes.
-  # The purity gate reads `cargo tree --target all`, so the dependency shape
-  # of every target, Windows included, is checked here.
+  # witnesses, cargo-deny, clippy and tests over the workspace, clippy and
+  # tests of gate-outcome alone (the only build without gate-outcome/json:
+  # harness-cli enables it, so every workspace build has it), and the
+  # compile-fail doctests with their error codes. The purity gate reads
+  # `cargo tree --target all`, so the dependency shape of every target,
+  # Windows included, is checked here.
   gates:
     strategy:
       fail-fast: false
@@ -43,10 +45,12 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - name: Clippy (gate-outcome/json)
-        run: cargo clippy --locked --workspace --all-targets --features gate-outcome/json -- -D warnings
+      - name: Clippy (gate-outcome alone, without json)
+        run: cargo clippy --locked -p gate-outcome --all-targets -- -D warnings
       # --no-fail-fast: one failing test binary must not hide the others.
       - name: Test
         run: cargo test --locked --workspace --no-fail-fast
-      - name: Test (gate-outcome/json)
-        run: cargo test --locked --workspace --no-fail-fast --features gate-outcome/json
+      # Runs even when the workspace tests failed, so its result is seen too.
+      - name: Test (gate-outcome alone, without json)
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p gate-outcome --no-fail-fast

@@ -1,7 +1,8 @@
 //! `rustyharness`: the command line (design §7.7, §2.9, §2.10, §3.4), as a
-//! library the binary (`src/main.rs`) calls with the refusing default
-//! locality probe. Tests call [`main_with`] in process with their own probe;
-//! no build of the binary can switch its probe (H1e-2b review F-2).
+//! library the binary (`src/main.rs`) calls with the real per-OS locality
+//! probe (`harness_sandbox::locality::SystemProbe`). Tests call
+//! [`main_with`] in process with their own probe; no build of the binary
+//! can switch its probe (H1e-2b review F-2).
 //!
 //! `run`, `resume` and `replay` are **gate children** (§7.7): whatever
 //! happens after the arguments are read, the LAST stdout line is the
