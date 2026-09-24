@@ -56,7 +56,7 @@ Constraint on U5: the personal-data app currently makes ask-model un-grantable b
 
 The working idea (now manifest v1 in `crates/harness-manifest`; design §4):
 
-- **Each tool provider ships a versioned capability manifest** — rustysuite apps are the first providers, not the only ones (`adapters/<app>/manifest.json`): capability ids namespaced under the app (`rustydns.zone.read`), a human summary, and an **effect class** (`read`, `write`, `execute`, `irreversible`).
+- **Each tool provider ships a versioned capability manifest** — rustysuite apps are the first providers, not the only ones; each ships its manifest with itself (`adapters/` holds fixtures only, design §4.10): capability ids namespaced under the app (`rustydns.zone.read`), a human summary, and an **effect class** (`read`, `write`, `execute`, `irreversible`).
 - **The core knows effect classes, never apps.** Policy, approval and confinement are written against effect classes, so adding an app adds a manifest and an adapter — no core change.
 - **Unknown means refused.** Unknown fields, future schema versions, foreign namespaces and empty manifests are rejected, not skipped.
 - **Versioned schema** with explicit negotiation, so old apps keep working when the schema grows.
