@@ -1032,7 +1032,9 @@ impl<'a> Loop<'a> {
                 if let ToolStatus::Error { code } = res.status {
                     ev = ev.field("code", Trusted::U64(u64::from(code)));
                 }
-                if let Some(r) = &res.read {
+                // Only an ok result records a read (the reader refuses a read
+                // digest on anything else; confirming review NF-3).
+                if let (Some(r), ToolStatus::Ok) = (&res.read, res.status) {
                     ev = ev.field("read_sha256", Trusted::Digest(r.sha256));
                     self.reads.record(r.path.as_str(), r.sha256);
                 }

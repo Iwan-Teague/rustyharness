@@ -63,13 +63,25 @@ pub(crate) fn from_value(v: &Value) -> Option<EnvSample> {
             _ => None,
         }
     };
-    Some(EnvSample {
+    let s = EnvSample {
         cpus: field("cpus")?,
         load_1m_milli: field("load_1m_milli")?,
         mem_total_bytes: field("mem_total_bytes")?,
         mem_available_bytes: field("mem_available_bytes")?,
         state_root_free_bytes: field("state_root_free_bytes")?,
-    })
+    };
+    // Every measured field from one probe: no sample the probe writes
+    // mixes OSes, or puts a process-scoped CPU count next to a load.
+    let mut families = s.fields().into_iter().filter_map(|(_, r)| match r {
+        Reading::Measured { method, .. } => Some(method.family()),
+        Reading::Unmeasured(_) => None,
+    });
+    if let Some(first) = families.next() {
+        if families.any(|f| f != first) {
+            return None;
+        }
+    }
+    Some(s)
 }
 
 #[cfg(test)]
@@ -117,6 +129,13 @@ mod tests {
         cases.push(v);
         let mut v = good();
         v["cpus"]["value"] = json!(-1);
+        cases.push(v);
+        // Two probes' methods in one sample.
+        let mut v = good();
+        v["cpus"] = json!({"method": "sysctl hw.logicalcpu", "value": 8});
+        cases.push(v);
+        let mut v = good();
+        v["cpus"] = json!({"method": "available_parallelism", "value": 8});
         cases.push(v);
         // A real method on another field's key, and zero CPUs.
         let mut v = good();

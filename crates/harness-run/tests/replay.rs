@@ -693,12 +693,32 @@ fn nf_1_chained_resumes_are_charged_every_earlier_attempts_wall_time() {
 /// live timeout needs a walk the clock interrupts, which a test cannot time
 /// reliably; the loop's own sampling is tested in the crate's unit tests.
 fn as_failed(r: &RunReport, status: &'static str, environment: Option<Value>) {
+    as_failed_keeping(r, status, environment, false);
+}
+
+/// [`as_failed`]; `keep_read` leaves the read digest in place (a shape the
+/// loop never writes on a non-ok result). A `provider_error` carries no
+/// output, as the loop writes it.
+fn as_failed_keeping(
+    r: &RunReport,
+    status: &'static str,
+    environment: Option<Value>,
+    keep_read: bool,
+) {
     rechain(
         &journal_path(r, 1),
         |v| v["kind"] == "ToolFinished" && v["body"].get("output").is_some(),
         move |b| {
             b["status"] = Value::from(status);
-            b.as_object_mut().unwrap().remove("read_sha256");
+            let o = b.as_object_mut().unwrap();
+            if !keep_read {
+                o.remove("read_sha256");
+            }
+            if status == "provider_error" {
+                for k in ["output", "truncated", "digest", "read_sha256"] {
+                    o.remove(k);
+                }
+            }
             if let Some(e) = &environment {
                 b["environment"] = e.clone();
             }
@@ -750,6 +770,59 @@ fn inv_20_a_recorded_sample_is_re_fed_exactly() {
 }
 
 #[test]
+fn inv_20_a_recorded_provider_failure_is_re_fed_with_its_sample() {
+    // A provider failure feeds the model a harness notice, not the
+    // observation, so the recording is cut after that step (a crash): the
+    // audit re-feeds the failure and its sample exactly (confirming NF-6).
+    let (state, ws) = scratch("env-provider-error");
+    let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+    as_failed(&r, "provider_error", Some(pressed_sample()));
+    crash_after(&journal_path(&r, 1), 2);
+    let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+    assert_eq!(a.divergence, None, "{a:?}");
+    let rec = replay_records(&a)
+        .into_iter()
+        .find(|v| v["kind"] == "ToolFinished" && v["body"]["status"] == "provider_error")
+        .unwrap();
+    assert_eq!(rec["body"]["environment"], pressed_sample());
+}
+
+#[test]
+fn a_cut_intent_is_replayed_as_not_sampled() {
+    // An intent a crash cut before its result has no recorded sample; the
+    // replay's provider failure for it says so instead of borrowing the
+    // header's (confirming NF-1).
+    let (state, ws) = scratch("env-cut-intent");
+    let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+    let text = fs::read_to_string(journal_path(&r, 1)).unwrap();
+    let cut: String = text
+        .lines()
+        .take_while(|l| !l.contains("\"kind\":\"ToolFinished\""))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    fs::write(journal_path(&r, 1), cut).unwrap();
+    let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+    assert_eq!(a.divergence, None, "{a:?}");
+    let rec = replay_records(&a)
+        .into_iter()
+        .find(|v| v["kind"] == "ToolFinished")
+        .unwrap();
+    assert_eq!(rec["body"]["status"], "provider_error");
+    for (k, v) in rec["body"]["environment"].as_object().unwrap() {
+        assert_eq!(v["unmeasured"], "not_sampled", "{k}");
+    }
+}
+
+#[test]
+fn a_read_digest_on_a_failed_result_is_unreadable() {
+    let (state, ws) = scratch("env-read-on-timeout");
+    let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+    as_failed_keeping(&r, "timeout", Some(pressed_sample()), true);
+    let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+    assert_eq!(a.outcome, UNREADABLE);
+}
+
+#[test]
 fn a_resume_re_feeds_a_timed_out_catch_up_step_with_its_sample() {
     let (state, ws) = scratch("env-resume");
     let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
@@ -789,6 +862,7 @@ fn inv_20_a_missing_misplaced_or_misshapen_sample_is_unreadable() {
         ("method-on-another-field", "crashed", Some(wrong_field)),
         ("extra-key", "timeout", Some(extra_key)),
         ("on-an-ok-result", "ok", Some(pressed_sample())),
+        ("provider-error-without-one", "provider_error", None),
     ] {
         let (state, ws) = scratch(&format!("env-{name}"));
         let r = go(&state, &ws, vec![read("a.txt"), submit()]);

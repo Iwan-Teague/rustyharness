@@ -170,6 +170,24 @@ impl Method {
         Self::ALL.into_iter().find(|m| m.as_str() == s)
     }
 
+    /// Which probe writes this method: one sample's measured fields all
+    /// come from one (H1f-3 confirming review NF-7: a recorded sample
+    /// mixing OSes, or a process-scoped CPU count next to a host-wide
+    /// load, is not one the probe writes).
+    pub fn family(self) -> Family {
+        match self {
+            Method::SysCpuOnline
+            | Method::ProcLoadavg
+            | Method::ProcMeminfoTotal
+            | Method::ProcMeminfoAvailable => Family::Linux,
+            Method::SysctlHwLogicalcpu
+            | Method::SysctlVmLoadavg
+            | Method::SysctlHwMemsize
+            | Method::VmStatFreeInactive => Family::MacOs,
+            Method::AvailableParallelism => Family::CpusOnly,
+        }
+    }
+
     /// The methods that may measure the field with this journal key
     /// (H1f-3 review F-6: a method is only ever recorded on its own field).
     /// An unknown key has none.
@@ -188,6 +206,17 @@ impl Method {
     }
 }
 
+/// The probe that writes a method (see [`Method::family`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    /// Linux: `/sys` and `/proc`.
+    Linux,
+    /// macOS: `sysctl` and `vm_stat`.
+    MacOs,
+    /// Windows and other OSes: a CPU count only, never next to a load.
+    CpusOnly,
+}
+
 /// Why a field was not measured (the closed set of reasons).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unmeasured {
@@ -201,15 +230,19 @@ pub enum Unmeasured {
     ReadFailed,
     /// This build has no probe for this OS.
     NotImplemented,
+    /// An audit replay's step with no recorded sample (e.g. an intent a
+    /// crash cut before its result): a past host cannot be measured.
+    NotSampled,
 }
 
 impl Unmeasured {
     /// Every reason.
-    pub const ALL: [Unmeasured; 4] = [
+    pub const ALL: [Unmeasured; 5] = [
         Unmeasured::NoSafeApi,
         Unmeasured::NoSuchMeasure,
         Unmeasured::ReadFailed,
         Unmeasured::NotImplemented,
+        Unmeasured::NotSampled,
     ];
 
     /// The journal name.
@@ -219,6 +252,7 @@ impl Unmeasured {
             Unmeasured::NoSuchMeasure => "no_such_measure",
             Unmeasured::ReadFailed => "read_failed",
             Unmeasured::NotImplemented => "not_implemented",
+            Unmeasured::NotSampled => "not_sampled",
         }
     }
 

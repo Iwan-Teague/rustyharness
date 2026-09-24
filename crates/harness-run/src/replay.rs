@@ -53,7 +53,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gate_outcome::{Digest, GateOutcome, IndeterminateKind};
-use harness_core::environment::EnvProbe;
+use harness_core::environment::{EnvProbe, EnvSample, Unmeasured};
 use harness_core::{LoopDetector, MeterLimits, Nonce, RunId};
 use harness_journal::reader::DirBlobSource;
 use harness_journal::writer::SystemClock;
@@ -77,6 +77,9 @@ use crate::driver::{
     HEADER_INPUT_KEYS,
 };
 use crate::sample;
+
+/// The audit's probe: a replay never measures a host.
+const NOT_SAMPLED: EnvSample = EnvSample::unmeasured(Unmeasured::NotSampled);
 use crate::{RunConfig, RunRefused, RunReport, TaskSpec};
 
 // ---------------------------------------------------------------------------
@@ -630,9 +633,11 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
         },
         feed: rec.feed,
         reads: ReadLog::default(),
-        // No provider runs in an audit (every result is re-fed with its
-        // recorded sample), so this probe is never asked.
-        env: &environment,
+        // No provider runs in an audit: a recorded result is re-fed with its
+        // recorded sample. A step with no recorded result (an intent a crash
+        // cut) ends as a provider failure, whose sample says it was not
+        // sampled rather than borrowing the header's (confirming NF-1).
+        env: &NOT_SAMPLED,
         pressure: Vec::new(),
     };
     let end = lp.drive(&mut w);
