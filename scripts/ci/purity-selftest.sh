@@ -252,6 +252,41 @@ probe_case "the probe imported from another path" \
 probe_case "a let binding shadows the probe" 'let cx' \
     'let SystemProbe = harness_policy::locality::NoProbe; let cx' 'let SystemProbe'
 
+# INV-23: nothing chosen at run time reaches an argv (purity.sh §2f).
+argv_case() {
+    fresh
+    plant crates/harness-sandbox/src/zz_spawn.rs "$2"
+    expect_refusal "$1" "INV-23: a spawned program or its arguments are not fixed literals"
+}
+argv_case "a program from a variable" \
+    'pub fn zz(p: &str) { let _ = std::process::Command::new(p); }\n'
+argv_case "a relative program literal (PATH lookup)" \
+    'pub fn zz() { let _ = std::process::Command::new("sh"); }\n'
+argv_case "a program literal extended at run time" \
+    'pub fn zz(t: &str) { let _ = std::process::Command::new("/bin/".to_owned() + t); }\n'
+argv_case "a comment cannot stand in for the code" \
+    '// Command::new("/bin/true")\npub fn zz() { let _ = std::process::Command::new("sh"); }\n'
+argv_case "an argument from a variable" \
+    'pub fn zz(t: &str) { let _ = std::process::Command::new("/bin/echo").arg(t); }\n'
+argv_case "an argument built with format!" \
+    'pub fn zz(t: &str) { let _ = std::process::Command::new("/bin/echo").arg(format!("{t}")); }\n'
+argv_case "arg0 from a variable" \
+    'pub fn zz(t: &str) { let _ = std::process::Command::new("/bin/echo").arg0(t); }\n'
+argv_case "an args array with a variable" \
+    'pub fn zz(t: &str) { let _ = std::process::Command::new("/bin/echo").args(["-n", t]); }\n'
+argv_case "args from a vector" \
+    'pub fn zz(v: Vec<String>) { let _ = std::process::Command::new("/bin/echo").args(v); }\n'
+argv_case "Command renamed on import" \
+    'use std::process::Command as Spawn;\npub fn zz() { let _ = Spawn::new("/bin/true"); }\n'
+# Control: fixed literals, across lines and with a trailing comma, pass.
+fresh
+plant crates/harness-sandbox/src/zz_spawn.rs \
+    'pub fn zz() {\n    let _ = std::process::Command::new(\n        "/usr/bin/true",\n    )\n    .args([\n        "-n",\n        "x",\n    ])\n    .arg("y");\n}\n'
+run_purity
+[ "$rc" -eq 0 ] || fail "fixed literal spawns were refused (rc=$rc):
+$(cat "$tmpdir/out")"
+printf 'ok accepted: fixed literal spawns\n'
+
 # H1a review N-3: the remaining name-scan gaps.
 n3_case() {
     fresh

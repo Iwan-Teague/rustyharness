@@ -456,6 +456,47 @@ if [ -n "$cli_bad" ]; then
     fail "the rustyharness binary must use exactly the production probe, harness_sandbox::locality::SystemProbe (crates/harness-cli/src/main.rs)$cli_bad"
 fi
 
+# --- 2f. INV-23: nothing chosen at run time reaches an argv ------------------
+# Prompts, task text and approval payloads never appear on any argv (design
+# §10 INV-23, R3 H-08: payloads travel through files, pipes or stdin). The
+# harness's own spawns are few and fixed, so the rule is structural: in every
+# non-test source under crates/*/src, each `Command::new(` names an absolute
+# path as a string literal, and each `.arg(`, `.arg0(` and `.args([...])`
+# takes string literals only; `Command` is never imported under another
+# name. Checked on the raw text (the program literal starts with "/") and on
+# the comment-stripped code, where literal contents are emptied (so a
+# comment cannot stand in for code, and `"/x".to_owned() + t` is not a
+# literal). Test files (tests.rs, testing.rs, tests/) may spawn freely.
+find crates -path '*/src/*' -type f -name '*.rs' ! -name tests.rs ! -name testing.rs \
+    >"$tmpdir/argv-found" || fail "find failed (INV-23)"
+sort "$tmpdir/argv-found" >"$tmpdir/argv-files" || fail "sort failed (INV-23)"
+grep -qxF crates/harness-sandbox/src/locality.rs "$tmpdir/argv-files" ||
+    fail "INV-23 scan would miss crates/harness-sandbox/src/locality.rs"
+# occ PATTERN FILE: how many times the ERE matches.
+occ() { grep -oE -- "$1" "$2" | wc -l | tr -d ' '; }
+: >"$tmpdir/hits"
+while IFS= read -r f; do
+  normalise "$f" "$tmpdir/argv-raw"
+  strip_comments "$f" "$tmpdir/argv-stripped"
+  normalise "$tmpdir/argv-stripped" "$tmpdir/argv-code"
+  spawns=$(occ 'Command::new ?\(' "$tmpdir/argv-raw")
+  [ "$spawns" = "$(occ 'Command::new ?\( ?"/' "$tmpdir/argv-raw")" ] ||
+      printf '%s: a program that is not an absolute path literal\n' "$f" >>"$tmpdir/hits"
+  [ "$(occ 'Command::new ?\(' "$tmpdir/argv-code")" = "$(occ 'Command::new ?\( ?"" ?,? ?\)' "$tmpdir/argv-code")" ] ||
+      printf '%s: a program that is not a single string literal\n' "$f" >>"$tmpdir/hits"
+  [ "$(occ '\.arg0? ?\(' "$tmpdir/argv-code")" = "$(occ '\.arg0? ?\( ?"" ?,? ?\)' "$tmpdir/argv-code")" ] ||
+      printf '%s: .arg( or .arg0( with something other than a string literal\n' "$f" >>"$tmpdir/hits"
+  [ "$(occ '\.args ?\(' "$tmpdir/argv-code")" = "$(occ '\.args ?\( ?&? ?\[ ?"" ?( ?, ?"" ?)* ?,? ?\] ?\)' "$tmpdir/argv-code")" ] ||
+      printf '%s: .args( with something other than an array of string literals\n' "$f" >>"$tmpdir/hits"
+  if grep -qE "(^|$nb)Command as($nb|\$)" "$tmpdir/argv-code"; then
+      printf '%s: Command imported under another name\n' "$f" >>"$tmpdir/hits"
+  fi
+done <"$tmpdir/argv-files"
+if [ -s "$tmpdir/hits" ]; then
+    fail "INV-23: a spawned program or its arguments are not fixed literals (no payload may reach an argv):
+$(cat "$tmpdir/hits")"
+fi
+
 # --- 2d. compile-fail doctests pin their reason (H1a review N-6) -------------
 # Every compile_fail doctest names its expected error code; gates.sh runs the
 # doctests with RUSTC_BOOTSTRAP=1 so rustdoc enforces the codes.
@@ -516,4 +557,4 @@ $(cat "$tmpdir/fi-off")"
         fail "the $crate/$feature compile_error! also fires with debug assertions on (tests would break)"
 done
 
-printf 'purity gate OK: dependency shape, pure-content, INV-28 all clean.\n'
+printf 'purity gate OK: dependency shape, pure-content, INV-23 argv, INV-28 all clean.\n'

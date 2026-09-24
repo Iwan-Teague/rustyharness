@@ -78,6 +78,12 @@ fn respond(s: &mut TcpStream, body: &str) {
 /// Serves `GET /v1/models` (model `m`) and answers each chat completion
 /// with the next scripted content.
 fn mock(replies: Vec<String>) -> Mock {
+    mock_with(replies, |_| {})
+}
+
+/// [`mock`], calling `on_chat` with each chat request (head and body)
+/// before answering it, while the harness waits for the reply.
+fn mock_with(replies: Vec<String>, on_chat: impl Fn(&str) + Send + 'static) -> Mock {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     let queue = Arc::new(Mutex::new(VecDeque::from(replies)));
@@ -91,6 +97,7 @@ fn mock(replies: Vec<String>) -> Mock {
             if req.starts_with("GET /v1/models ") {
                 respond(&mut s, r#"{"data":[{"id":"m"}]}"#);
             } else {
+                on_chat(&req);
                 let content = queue.lock().unwrap().pop_front().unwrap_or_default();
                 let body = serde_json::json!({
                     "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
@@ -738,4 +745,123 @@ fn inv_1_manifest_check_is_the_v1_admission_parser() {
     );
     let o = check(&fx.base.join("absent.json"));
     assert_eq!(o.code(), Some(4));
+}
+
+/// Every running process's argv, one string per process: `/proc/*/cmdline`
+/// on Linux, `ps` on macOS. A process that exits mid-scan is skipped.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn every_argv() -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .bytes()
+                    .all(|b| b.is_ascii_digit())
+            })
+            .filter_map(|e| std::fs::read(e.path().join("cmdline")).ok())
+            .map(|b| String::from_utf8_lossy(&b).replace('\0', " "))
+            .collect()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let o = Command::new("/bin/ps")
+            .args(["-axww", "-o", "args="])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+/// What the INV-23 scan saw while the harness waited for a reply.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct Scan {
+    /// The canary was in the chat request (so the task was in flight).
+    in_request: bool,
+    /// Every argv that carried the canary.
+    carrying: Vec<String>,
+    /// An argv naming the harness binary and the task FILE was seen.
+    harness_seen: bool,
+}
+
+/// INV-23: the task text never reaches an argv. The real binary runs a task
+/// whose text carries a canary; while the model server holds the first chat
+/// request (the harness is mid-run, waiting for the reply), every process's
+/// argv is read. The canary is in the request (so it was in flight) and in
+/// no argv, and the scan saw the harness itself (its argv names the task
+/// FILE). The static half is purity.sh §2f: every spawn in the harness is a
+/// fixed literal.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn inv_23_the_task_text_reaches_no_argv() {
+    let fx = fixture("inv23");
+    let canary = format!("TASK-CANARY-{:x}", std::process::id() ^ 0x5eed_1e55);
+    // Witness first (R3 H-04): the scan does find a canary on an argv.
+    // `; :` keeps the shell (and its argv) alive instead of exec'ing sleep,
+    // and the scan retries until the child has exec'd (a just-forked child
+    // still shows its parent's argv).
+    let witness = format!("{canary}-WITNESS");
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "sleep 30; :", &witness])
+        .spawn()
+        .unwrap();
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    let found = loop {
+        if every_argv().iter().any(|a| a.contains(&witness)) {
+            break true;
+        }
+        if std::time::Instant::now() > until {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(found, "the argv scan cannot see a planted canary");
+    std::fs::write(
+        &fx.task,
+        format!(r#"{{"task":"Find {canary} in a.txt","grants":["harness.fs.read"]}}"#),
+    )
+    .unwrap();
+    let task_path = fx.task.to_str().unwrap().to_owned();
+    let seen: Arc<Mutex<Option<Scan>>> = Arc::new(Mutex::new(None));
+    let (s, c, t) = (seen.clone(), canary.clone(), task_path.clone());
+    let m = mock_with(
+        vec![act("harness.task.submit", r#"{"note":"done"}"#)],
+        move |req| {
+            let argvs = every_argv();
+            let carrying: Vec<String> = argvs.iter().filter(|a| a.contains(&c)).cloned().collect();
+            let harness_seen = argvs
+                .iter()
+                .any(|a| a.contains("rustyharness") && a.contains(&t));
+            let mut g = s.lock().unwrap();
+            if g.is_none() {
+                *g = Some(Scan {
+                    in_request: req.contains(&c),
+                    carrying,
+                    harness_seen,
+                });
+            }
+        },
+    );
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let o = cli(&run_args(&fx, &ep), false, &fx.marker);
+    assert_eq!(o.code(), Some(5), "{}", String::from_utf8_lossy(&o.stderr));
+    let scan = seen.lock().unwrap().take().expect("no chat request");
+    assert!(scan.in_request, "the canary did not reach the model server");
+    assert!(
+        scan.harness_seen,
+        "the scan did not see the running harness"
+    );
+    assert!(
+        scan.carrying.is_empty(),
+        "argv carries the task text: {:?}",
+        scan.carrying
+    );
 }
