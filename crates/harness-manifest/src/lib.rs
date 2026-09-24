@@ -154,6 +154,77 @@ pub enum Confirmation {
     ProtectedAction,
 }
 
+// The wire names of the dimensions (the manifest's own spelling), for
+// messages and reports. A test round-trips each through the parser, so a
+// name here cannot drift from what a manifest must say.
+
+impl Effect {
+    /// The manifest wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Effect::Read => "read",
+            Effect::Write => "write",
+            Effect::Execute => "execute",
+            Effect::Irreversible => "irreversible",
+        }
+    }
+}
+
+impl Sensitivity {
+    /// The manifest wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Sensitivity::Public => "public",
+            Sensitivity::Operational => "operational",
+            Sensitivity::Personal => "personal",
+            Sensitivity::Restricted => "restricted",
+        }
+    }
+}
+
+impl BlastRadius {
+    /// The manifest wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BlastRadius::Own => "own",
+            BlastRadius::Host => "host",
+            BlastRadius::Shared => "shared",
+        }
+    }
+}
+
+impl Egress {
+    /// The manifest wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Egress::None => "none",
+            Egress::Lan => "lan",
+            Egress::Internet => "internet",
+        }
+    }
+}
+
+impl Content {
+    /// The manifest wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Content::Own => "own",
+            Content::ThirdParty => "third_party",
+        }
+    }
+}
+
+impl Confirmation {
+    /// The manifest wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Confirmation::None => "none",
+            Confirmation::UserConfirm => "user_confirm",
+            Confirmation::ProtectedAction => "protected_action",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Validated names.
 // ---------------------------------------------------------------------------

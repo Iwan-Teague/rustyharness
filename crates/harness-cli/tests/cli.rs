@@ -617,3 +617,77 @@ fn replay_of_a_forged_wall_stop_is_unreadable_evidence_with_a_named_finding() {
     );
     assert!(!String::from_utf8_lossy(&r.stderr).contains("every record recomputed and matched"));
 }
+
+/// INV-1 / INV-22 through the CLI: `manifest check` is the v1 admission
+/// parser, not the scaffold's v0 one it used to be. The example validates,
+/// with each capability's effective class and what this build's admission
+/// does with it; v0, a reserved namespace, a duplicate key and an oversized
+/// file are refused; an unreadable file is exit 4.
+#[test]
+fn inv_1_manifest_check_is_the_v1_admission_parser() {
+    let fx = fixture("manifest-check");
+    let check = |path: &Path| {
+        cli(
+            &["manifest", "check", path.to_str().unwrap()],
+            false,
+            &fx.marker,
+        )
+    };
+    let example =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../adapters/example/manifest.json");
+    let o = check(&example);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(o.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        out.contains("provider example 0.0.1 (schema v1, transport mcp-stdio), 2 capabilities"),
+        "{out}"
+    );
+    assert!(out.contains("example.config.set: effect write, sensitivity operational, blast own, egress none, content own; confirmation user_confirm"), "{out}");
+    // Valid is not admitted: external providers are H4 (§4.4).
+    assert!(
+        out.contains("admission as a pinned provider in this build: refused"),
+        "{out}"
+    );
+    assert!(out.contains("arrives in H4"), "{out}");
+
+    let text = std::fs::read_to_string(&example).unwrap();
+    let refused = |name: &str, body: &str, why: &str| {
+        let p = fx.base.join(name);
+        std::fs::write(&p, body).unwrap();
+        let o = check(&p);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.code(), Some(1), "{name}: {err}");
+        assert!(
+            err.contains("REFUSED") && err.contains(why),
+            "{name}: {err}"
+        );
+    };
+    refused(
+        "v0.json",
+        r#"{"schema_version":0,"app":"example","app_version":"0.0.1","capabilities":[{"id":"example.status.read","summary":"x","effect":"read"}]}"#,
+        "migrate",
+    );
+    refused(
+        "reserved.json",
+        &text
+            .replace("\"provider\": \"example\"", "\"provider\": \"rustyvault\"")
+            .replace("\"example.", "\"rustyvault."),
+        "reserved",
+    );
+    refused(
+        "duplicate.json",
+        &text.replacen(
+            "\"schema_version\": 1,",
+            "\"schema_version\": 1, \"schema_version\": 1,",
+            1,
+        ),
+        "repeats a JSON key",
+    );
+    refused(
+        "huge.json",
+        &" ".repeat(harness_manifest::MANIFEST_MAX_BYTES + 1),
+        "larger than the manifest cap",
+    );
+    let o = check(&fx.base.join("absent.json"));
+    assert_eq!(o.code(), Some(4));
+}

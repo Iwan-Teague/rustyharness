@@ -61,6 +61,49 @@ fn cap0(val: &mut Value) -> &mut Value {
 }
 
 #[test]
+fn dimension_names_are_the_wire_names() {
+    fn wire<T: serde::de::DeserializeOwned + PartialEq + std::fmt::Debug>(t: T, name: &str) {
+        assert_eq!(
+            serde_json::from_value::<T>(json!(name)).unwrap(),
+            t,
+            "{name}"
+        );
+    }
+    for e in [
+        Effect::Read,
+        Effect::Write,
+        Effect::Execute,
+        Effect::Irreversible,
+    ] {
+        wire(e, e.as_str());
+    }
+    for s in [
+        Sensitivity::Public,
+        Sensitivity::Operational,
+        Sensitivity::Personal,
+        Sensitivity::Restricted,
+    ] {
+        wire(s, s.as_str());
+    }
+    for b in [BlastRadius::Own, BlastRadius::Host, BlastRadius::Shared] {
+        wire(b, b.as_str());
+    }
+    for g in [Egress::None, Egress::Lan, Egress::Internet] {
+        wire(g, g.as_str());
+    }
+    for c in [Content::Own, Content::ThirdParty] {
+        wire(c, c.as_str());
+    }
+    for c in [
+        Confirmation::None,
+        Confirmation::UserConfirm,
+        Confirmation::ProtectedAction,
+    ] {
+        wire(c, c.as_str());
+    }
+}
+
+#[test]
 fn fixture_manifest_validates() {
     let m = parse_v(&fixture()).unwrap();
     assert_eq!(m.provider().as_str(), "fixture");

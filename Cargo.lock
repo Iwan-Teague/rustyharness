@@ -167,7 +167,6 @@ dependencies = [
  "harness-journal",
  "harness-manifest",
  "harness-policy",
- "serde",
  "serde_json",
  "thiserror",
 ]
