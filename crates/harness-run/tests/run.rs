@@ -13,6 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use gate_outcome::{GateOutcome, IndeterminateKind};
+use harness_core::environment::{EnvSample, Unmeasured};
 use harness_core::StopCause;
 use harness_journal::{EventKind, JournalReader, Record};
 use harness_manifest::admission::{Registry, Tier};
@@ -23,6 +24,10 @@ use harness_model::{Completion, ModelError, TaskText};
 use harness_policy::locality::{FsQuery, LocalityProbe, NoProbe};
 use harness_policy::UserPolicy;
 use harness_run::{run, Run, RunConfig, RunRefused, RunReport, TaskSpec};
+
+/// A fixed environment sample (the real probe is harness-sandbox's; these
+/// tests only need the header and records to carry one).
+const FIXED_ENV: EnvSample = EnvSample::unmeasured(Unmeasured::NoSafeApi);
 
 /// A probe that reports a local APFS volume (the decision is pure, so this
 /// is admitted on any host).
@@ -93,6 +98,7 @@ fn go(
         profile: &profile,
         backend: &backend,
         probe,
+        env: &FIXED_ENV,
         config: &RunConfig::defaults(1_000_000),
     })
 }
@@ -288,6 +294,7 @@ fn an_unknown_grant_refuses_the_session() {
         profile: &profile,
         backend: &backend,
         probe: &Local,
+        env: &FIXED_ENV,
         config: &RunConfig::defaults(1_000),
     })
     .unwrap_err();
@@ -333,6 +340,7 @@ fn a_spec_that_grants_submit_lists_it_once_in_the_header() {
         profile: &profile,
         backend: &backend,
         probe: &Local,
+        env: &FIXED_ENV,
         config: &RunConfig::defaults(1_000_000),
     })
     .unwrap();
@@ -340,4 +348,30 @@ fn a_spec_that_grants_submit_lists_it_once_in_the_header() {
         records(&r)[0].body.get("grants").unwrap(),
         &serde_json::json!(["harness.fs.read", "harness.task.submit"])
     );
+}
+
+/// §7.1 header completeness (H1f-3): the OS and architecture, the built-in
+/// manifest's digest, `shell_enabled`, the sandbox backend (none in H1) and
+/// the environment sample the caller's probe gave, in its journal form.
+#[test]
+fn the_header_records_the_host_the_manifest_and_the_environment() {
+    let (state, ws) = scratch("header");
+    fs::write(ws.join("a.txt"), "hello\n").unwrap();
+    let r = go(&state, &ws, vec![submit()], &Local).unwrap();
+    let recs = records(&r);
+    let h = &recs[0].body;
+    assert_eq!(h["os"], std::env::consts::OS);
+    assert_eq!(h["arch"], std::env::consts::ARCH);
+    assert_eq!(
+        h["builtin_manifest"],
+        harness_core::sha256(builtin::BUILTIN_MANIFEST_JSON.as_bytes()).to_string()
+    );
+    assert_eq!(h["shell_enabled"], false);
+    assert_eq!(h["sandbox"]["backend"], "none");
+    let env = h["environment"].as_object().unwrap();
+    assert_eq!(env.len(), 5);
+    for (key, v) in env {
+        assert_eq!(v["unmeasured"], "no_safe_api", "{key}");
+    }
+    assert!(r.possibly_environmental.is_empty());
 }

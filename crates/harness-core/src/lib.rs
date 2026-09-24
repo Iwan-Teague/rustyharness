@@ -22,6 +22,7 @@
     allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
 )]
 
+pub mod environment;
 pub mod strict_json;
 
 use std::collections::{HashMap, HashSet, VecDeque};

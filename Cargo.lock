@@ -153,6 +153,7 @@ dependencies = [
 name = "harness-sandbox"
 version = "0.0.1"
 dependencies = [
+ "harness-core",
  "harness-policy",
  "thiserror",
 ]

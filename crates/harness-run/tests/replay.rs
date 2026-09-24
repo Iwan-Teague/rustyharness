@@ -11,6 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use gate_outcome::{GateOutcome, IndeterminateKind};
+use harness_core::environment::{EnvSample, Unmeasured};
 use harness_core::{RunId, StopCause};
 use harness_journal::canon::{RecordFields, GENESIS};
 use harness_journal::{layout, EventKind, JournalReader};
@@ -25,6 +26,10 @@ use harness_run::{
     audit, resume, run, Audit, Resume, Run, RunConfig, RunRefused, RunReport, TaskSpec,
 };
 use serde_json::Value;
+
+/// A fixed environment sample (the real probe is harness-sandbox's; these
+/// tests only need the header and records to carry one).
+const FIXED_ENV: EnvSample = EnvSample::unmeasured(Unmeasured::NoSafeApi);
 
 struct Local;
 impl LocalityProbe for Local {
@@ -92,6 +97,7 @@ fn go(state: &Path, ws: &Path, replies: Vec<Result<Completion, ModelError>>) -> 
         profile: &profile,
         backend: &backend,
         probe: &Local,
+        env: &FIXED_ENV,
         config: &RunConfig::defaults(1_000_000),
     })
     .unwrap()
@@ -422,6 +428,7 @@ fn f_1_a_genuine_wall_stop_passes_only_with_its_anchor() {
         profile: &profile,
         backend: &backend,
         probe: &Local,
+        env: &FIXED_ENV,
         config: &config,
     })
     .unwrap();
@@ -493,6 +500,7 @@ fn resume_with(
         profile: &profile,
         backend: &backend,
         probe: &Local,
+        env: &FIXED_ENV,
         config: &RunConfig::defaults(1_000_000),
     })
 }
@@ -676,4 +684,89 @@ fn nf_1_chained_resumes_are_charged_every_earlier_attempts_wall_time() {
         third.cause,
         StopCause::Budget(harness_core::BudgetDim::Wall)
     );
+}
+
+// ---- the environment sample (§7.1, H1f-3) -------------------------------------------
+
+/// Turn the first read's `ToolFinished` into a `timeout` result carrying
+/// `environment`, re-chained. (A live timeout needs a walk the clock
+/// interrupts, which a test cannot time reliably; the loop's own sampling
+/// is tested in the crate's unit tests.)
+fn as_timeout(r: &RunReport, environment: Option<Value>) {
+    rechain(
+        &journal_path(r, 1),
+        |v| v["kind"] == "ToolFinished" && v["body"].get("output").is_some(),
+        move |b| {
+            b["status"] = Value::from("timeout");
+            if let Some(e) = &environment {
+                b["environment"] = e.clone();
+            }
+        },
+    );
+}
+
+fn pressed_sample() -> Value {
+    serde_json::json!({
+        "cpus": {"method": "available_parallelism", "value": 4},
+        "load_1m_milli": {"method": "/proc/loadavg", "value": 9000},
+        "mem_total_bytes": {"method": "/proc/meminfo MemTotal", "value": 1000},
+        "mem_available_bytes": {"method": "/proc/meminfo MemAvailable", "value": 10},
+        "state_root_free_bytes": {"unmeasured": "no_safe_api"},
+    })
+}
+
+#[test]
+fn inv_20_a_recorded_sample_is_re_fed_exactly() {
+    // A past host cannot be re-measured: the replay re-feeds the sample
+    // recorded with a timed-out result, and re-encodes it byte for byte.
+    // (Like a tool result, a sample is an input to the replay: a
+    // self-consistent edit to one is caught only by an anchor, §7.1.)
+    let (state, ws) = scratch("env-refed");
+    let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+    as_timeout(&r, Some(pressed_sample()));
+    let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+    assert_eq!(a.divergence, None);
+    let replayed = fs::read_to_string(a.replay_dir.unwrap().join(layout::JOURNAL_FILE)).unwrap();
+    let rec: Value = replayed
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .find(|v| v["kind"] == "ToolFinished" && v["body"].get("environment").is_some())
+        .unwrap();
+    assert_eq!(rec["body"]["environment"], pressed_sample());
+}
+
+#[test]
+fn inv_20_a_missing_or_misshapen_sample_is_unreadable() {
+    let mut unknown_method = pressed_sample();
+    unknown_method["mem_total_bytes"]["method"] = Value::from("free -b");
+    let mut extra_key = pressed_sample();
+    extra_key["swap_bytes"] = serde_json::json!({"unmeasured": "no_safe_api"});
+    for (name, env) in [
+        ("missing", None),
+        ("unknown-method", Some(unknown_method)),
+        ("extra-key", Some(extra_key)),
+    ] {
+        let (state, ws) = scratch(&format!("env-{name}"));
+        let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+        as_timeout(&r, env);
+        let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+        assert_eq!(a.outcome, UNREADABLE, "{name}");
+        assert!(
+            a.divergence
+                .unwrap()
+                .why
+                .contains("not the shape the loop writes"),
+            "{name}"
+        );
+    }
+    // And an `ok` result must not carry one.
+    let (state, ws) = scratch("env-on-ok");
+    let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+    rechain(
+        &journal_path(&r, 1),
+        |v| v["kind"] == "ToolFinished" && v["body"].get("output").is_some(),
+        |b| b["environment"] = pressed_sample(),
+    );
+    let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+    assert_eq!(a.outcome, UNREADABLE);
 }

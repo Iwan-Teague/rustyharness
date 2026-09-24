@@ -1,0 +1,128 @@
+//! The environment sample's journal form (design §7.1, R3 H-17).
+//!
+//! A sample is written into the header and into every `ToolFinished` whose
+//! status is `timeout` or `crashed`. Audit replay and resume cannot
+//! re-measure a past host, so they read recorded samples back and re-feed
+//! them, like recorded model replies: [`from_value`] accepts exactly the
+//! shape [`to_trusted`] writes (the five keys, each either
+//! `{"method", "value"}` or `{"unmeasured"}`, with names from the closed
+//! sets in `harness_core::environment`), so a re-fed sample re-encodes to
+//! the same bytes, and anything else is a record the loop did not write.
+
+use harness_core::environment::{EnvSample, Method, Reading, Unmeasured};
+use harness_journal::Trusted;
+use serde_json::Value;
+
+/// The journal form of a sample.
+pub(crate) fn to_trusted(s: &EnvSample) -> Trusted {
+    Trusted::Obj(
+        s.fields()
+            .into_iter()
+            .map(|(key, r)| (key, reading(r)))
+            .collect(),
+    )
+}
+
+fn reading(r: Reading) -> Trusted {
+    match r {
+        Reading::Measured { value, method } => Trusted::Obj(vec![
+            ("method", Trusted::Text(method.as_str())),
+            ("value", Trusted::U64(value)),
+        ]),
+        Reading::Unmeasured(why) => Trusted::Obj(vec![("unmeasured", Trusted::Text(why.as_str()))]),
+    }
+}
+
+/// A recorded sample, or `None` if the value is not exactly what
+/// [`to_trusted`] writes.
+pub(crate) fn from_value(v: &Value) -> Option<EnvSample> {
+    let o = v.as_object()?;
+    let keys = EnvSample::unmeasured(Unmeasured::ReadFailed)
+        .fields()
+        .map(|(k, _)| k);
+    if o.len() != keys.len() || keys.iter().any(|k| !o.contains_key(*k)) {
+        return None;
+    }
+    let field = |key: &str| -> Option<Reading> {
+        let f = o.get(key)?.as_object()?;
+        match f.len() {
+            1 => Some(Reading::Unmeasured(Unmeasured::parse(
+                f.get("unmeasured")?.as_str()?,
+            )?)),
+            2 => Some(Reading::Measured {
+                value: f.get("value")?.as_u64()?,
+                method: Method::parse(f.get("method")?.as_str()?)?,
+            }),
+            _ => None,
+        }
+    };
+    Some(EnvSample {
+        cpus: field("cpus")?,
+        load_1m_milli: field("load_1m_milli")?,
+        mem_total_bytes: field("mem_total_bytes")?,
+        mem_available_bytes: field("mem_available_bytes")?,
+        state_root_free_bytes: field("state_root_free_bytes")?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn good() -> Value {
+        json!({
+            "cpus": {"method": "available_parallelism", "value": 8},
+            "load_1m_milli": {"method": "/proc/loadavg", "value": 520},
+            "mem_total_bytes": {"method": "/proc/meminfo MemTotal", "value": 1024},
+            "mem_available_bytes": {"unmeasured": "read_failed"},
+            "state_root_free_bytes": {"unmeasured": "no_safe_api"},
+        })
+    }
+
+    #[test]
+    fn a_recorded_sample_reads_back_exactly() {
+        let s = from_value(&good()).unwrap();
+        assert_eq!(
+            s.cpus,
+            Reading::Measured {
+                value: 8,
+                method: Method::AvailableParallelism
+            }
+        );
+        assert_eq!(
+            s.mem_available_bytes,
+            Reading::Unmeasured(Unmeasured::ReadFailed)
+        );
+    }
+
+    #[test]
+    fn anything_the_loop_does_not_write_is_refused() {
+        let mut cases = Vec::new();
+        let mut v = good();
+        v["extra"] = json!({"unmeasured": "read_failed"});
+        cases.push(v);
+        let mut v = good();
+        v.as_object_mut().unwrap().remove("cpus");
+        cases.push(v);
+        let mut v = good();
+        v["cpus"]["method"] = json!("nproc");
+        cases.push(v);
+        let mut v = good();
+        v["cpus"]["value"] = json!(-1);
+        cases.push(v);
+        let mut v = good();
+        v["cpus"]["unmeasured"] = json!("read_failed");
+        cases.push(v);
+        let mut v = good();
+        v["mem_available_bytes"] = json!({"unmeasured": "unknown"});
+        cases.push(v);
+        let mut v = good();
+        v["mem_available_bytes"] = json!({"value": 1, "unmeasured": "read_failed"});
+        cases.push(v);
+        cases.push(json!(null));
+        for c in cases {
+            assert!(from_value(&c).is_none(), "{c}");
+        }
+    }
+}

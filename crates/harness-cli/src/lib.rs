@@ -63,6 +63,7 @@ use harness_model::TaskText;
 use harness_policy::locality::LocalityProbe;
 use harness_policy::UserPolicy;
 use harness_run::{Audit, Resume, Run, RunConfig, RunRefused, TaskSpec};
+use harness_sandbox::environment::SystemEnv;
 use serde::Deserialize;
 
 const USAGE: &str = "usage:
@@ -506,6 +507,7 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
             profile: &inp.profile,
             backend: &client,
             probe,
+            env: &SystemEnv,
             config: &config,
         }),
         Some(id) => harness_run::resume(Resume {
@@ -518,6 +520,7 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
             profile: &inp.profile,
             backend: &client,
             probe,
+            env: &SystemEnv,
             config: &config,
         }),
     }
@@ -536,7 +539,7 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
     // Design §9 H1: the outcome is shown to the user, in words, not only
     // in the report line and the exit code.
     note!(cx, "outcome: {}", outcome_in_words(&report.outcome));
-    let findings = info(
+    let mut findings: Vec<Finding> = info(
         "harness.run",
         &format!("run {} attempt {}", report.run, report.attempt),
         "a verification plan (H1 tasks have none)",
@@ -547,6 +550,27 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
     )
     .into_iter()
     .collect();
+    // §7.1: a timeout or crash that coincided with host pressure is marked,
+    // so a human can tell a pressed host from a broken tool. It never
+    // changes the outcome.
+    if !report.possibly_environmental.is_empty() {
+        let steps: Vec<String> = report
+            .possibly_environmental
+            .iter()
+            .map(u64::to_string)
+            .collect();
+        let observed = format!(
+            "a tool call timed out or crashed at step(s) {} while memory available was under 5% or the load above twice the CPUs",
+            steps.join(", ")
+        );
+        note!(cx, "possibly environmental: {observed}");
+        findings.extend(info(
+            "harness.possibly-environmental",
+            &format!("run {} attempt {}", report.run, report.attempt),
+            "tool calls on an unpressed host",
+            observed,
+        ));
+    }
     Ok(Outcome {
         outcome: report.outcome,
         findings,

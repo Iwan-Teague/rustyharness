@@ -53,6 +53,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gate_outcome::{Digest, GateOutcome, IndeterminateKind};
+use harness_core::environment::EnvProbe;
 use harness_core::{LoopDetector, MeterLimits, Nonce, RunId};
 use harness_journal::reader::DirBlobSource;
 use harness_journal::writer::SystemClock;
@@ -71,9 +72,11 @@ use harness_tools::{RefusalKind, ToolStatus};
 use serde_json::{Map, Value};
 
 use crate::driver::{
-    attempt_check, commit, facts_block, header, new_meter, new_meter_resumed, plan, prepare,
-    HeaderInputs, Loop, NonceSource, ReadLog, RecordedResult, HEADER_INPUT_KEYS,
+    attempt_check, builtin_manifest_sha256, commit, facts_block, header, new_meter,
+    new_meter_resumed, plan, prepare, HeaderInputs, Loop, NonceSource, ReadLog, RecordedResult,
+    HEADER_INPUT_KEYS,
 };
+use crate::sample;
 use crate::{RunConfig, RunRefused, RunReport, TaskSpec};
 
 // ---------------------------------------------------------------------------
@@ -178,6 +181,17 @@ fn recorded(
                 } else {
                     (Vec::new(), false, harness_core::sha256(b""))
                 };
+                // §7.1: exactly the timeout and crashed results carry a
+                // sample, in exactly the shape the loop writes.
+                let sampled = matches!(
+                    status,
+                    Some(ToolStatus::Timeout | ToolStatus::Crashed { .. })
+                );
+                let environment = match (sampled, r.body.get("environment")) {
+                    (true, Some(v)) => Some(sample::from_value(v).ok_or_else(bad)?),
+                    (false, None) => None,
+                    _ => return Err(bad()),
+                };
                 feed.push_back(RecordedResult {
                     capability: cap,
                     status,
@@ -185,6 +199,7 @@ fn recorded(
                     truncated,
                     digest,
                     read_sha256: digest_at(&r.body, "read_sha256"),
+                    environment,
                 });
             }
             _ => {}
@@ -239,6 +254,11 @@ fn expected_inputs(
     );
     m.insert("policy".into(), Value::from(policy.digest().to_string()));
     m.insert("checks".into(), Value::from(0u64));
+    m.insert(
+        "builtin_manifest".into(),
+        Value::from(builtin_manifest_sha256().to_string()),
+    );
+    m.insert("shell_enabled".into(), Value::Bool(false));
     m
 }
 
@@ -524,9 +544,17 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
     ) {
         return Ok(failed(d, None));
     }
-    let (Some(facts), Some(limits)) = (recorded_facts(head), recorded_limits(head)) else {
+    let (Some(facts), Some(limits), Some(environment)) = (
+        recorded_facts(head),
+        recorded_limits(head),
+        head.body.get("environment").and_then(sample::from_value),
+    ) else {
         return Ok(failed(
-            diverge(0, 0, "the header lacks the workspace facts or the limits"),
+            diverge(
+                0,
+                0,
+                "the header lacks the workspace facts, the limits or the environment sample",
+            ),
             None,
         ));
     };
@@ -546,6 +574,9 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
         facts,
         limits: &limits,
         resumed_from: None,
+        // The replay journal repeats the recorded sample: a past host
+        // cannot be re-measured, and the header is not compared.
+        environment,
     })
     .map_err(AuditRefused::Plan)?;
     let (mut w, replay_dir) = JournalWriter::create_replay(&run_dir, a.run.clone(), attempt, hdr)
@@ -579,6 +610,10 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
         },
         feed: rec.feed,
         reads: ReadLog::default(),
+        // No provider runs in an audit (every result is re-fed with its
+        // recorded sample), so this probe is never asked.
+        env: &environment,
+        pressure: Vec::new(),
     };
     let end = lp.drive(&mut w);
     let released = commit(w, &end, None);
@@ -680,6 +715,8 @@ pub struct Resume<'a> {
     pub backend: &'a dyn ModelBackend,
     /// The locality probe.
     pub probe: &'a dyn LocalityProbe,
+    /// The environment probe (§7.1).
+    pub env: &'a dyn EnvProbe,
     /// Budgets and timeouts (the recorded limits apply; timeouts from here).
     pub config: &'a RunConfig,
 }
@@ -763,6 +800,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         facts: pre.facts,
         limits: &limits,
         resumed_from: Some((n, v.head, carried_ms)),
+        environment: r.env.sample(),
     })?;
     let (mut w, attempt) = JournalWriter::create_next_attempt_checked(
         &run_dir,
@@ -802,6 +840,8 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         },
         feed: rec.feed,
         reads: ReadLog::default(),
+        env: r.env,
+        pressure: Vec::new(),
     };
     let end = lp.drive(&mut w);
     let outcome = chain.diverged.get().then_some(UNREADABLE);
@@ -815,5 +855,6 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         chain_head: released.chain_head,
         steps: end.step,
         journal_error: released.error,
+        possibly_environmental: lp.pressure,
     })
 }
