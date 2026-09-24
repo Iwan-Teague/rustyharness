@@ -455,17 +455,27 @@ fn a_closed_port_is_a_connect_error() {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap().port()
     };
+    // Windows does not refuse a loopback connect at once: it retransmits the
+    // SYN after each RST and reports the refusal only after about 2 s. The
+    // connect timeout here outlasts that, so every OS reaches the refusal
+    // itself rather than the timeout (both are `Unavailable`; this test pins
+    // the refused path).
+    let mut cfg = config();
+    cfg.limits.connect_timeout = Duration::from_secs(10);
     let c = OpenAiCompatible::new(
         &format!("http://127.0.0.1:{port}/v1"),
         Profile::conservative_default("m"),
         None,
-        config(),
+        cfg,
     )
     .unwrap();
-    assert!(matches!(
-        c.complete(&req(), soon()).unwrap_err(),
-        ModelError::Unavailable(Unavailable::Connect(_))
-    ));
+    let e = c
+        .complete(&req(), Instant::now() + Duration::from_secs(20))
+        .unwrap_err();
+    assert!(
+        matches!(e, ModelError::Unavailable(Unavailable::Connect(_))),
+        "{e:?}"
+    );
 }
 
 // ---- INV-29 through the wire ----------------------------------------------------------

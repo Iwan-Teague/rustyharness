@@ -1,7 +1,8 @@
 //! `rustyharness`: the command line (design §7.7, §2.9, §2.10, §3.4), as a
-//! library the binary (`src/main.rs`) calls with the refusing default
-//! locality probe. Tests call [`main_with`] in process with their own probe;
-//! no build of the binary can switch its probe (H1e-2b review F-2).
+//! library the binary (`src/main.rs`) calls with the real per-OS locality
+//! probe (`harness_sandbox::locality::SystemProbe`). Tests call
+//! [`main_with`] in process with their own probe; no build of the binary
+//! can switch its probe (H1e-2b review F-2).
 //!
 //! `run`, `resume` and `replay` are **gate children** (§7.7): whatever
 //! happens after the arguments are read, the LAST stdout line is the
@@ -14,7 +15,7 @@
 //! | 1 | `Failed` |
 //! | 2 | usage error |
 //! | 3 | confinement refused (never in H1: no session may hold an execute grant) |
-//! | 4 | unreadable input (task spec, policy, profile) |
+//! | 4 | unreadable input (task spec, policy, profile; a manifest for `manifest check`) |
 //! | 5 | `Indeterminate` (the kind is in the JSON): every H1 run, a refused run (e.g. the locality check), a journal failure, a replay divergence |
 //!
 //! Every H1 run is `Indeterminate { NothingChecked }` and exits 5 with no
@@ -29,6 +30,12 @@
 //!
 //! `profile check` runs the smoke eval against a live server and prints the
 //! stamp to add to the profile (it is not a gate child).
+//!
+//! `manifest check` validates a provider manifest with the admission parser
+//! (not a gate child either): exit 0 valid, 1 refused on content, 4 not
+//! readable as a JSON document at all (missing, too large, not well-formed
+//! JSON), 5 if the harness cannot check (its own version is not SemVer). A
+//! valid manifest is not an admitted one.
 
 #![forbid(unsafe_code)]
 // The panic-set lints ratchet production code; unit tests may assert loosely.
@@ -49,19 +56,20 @@ use gate_outcome::{
 };
 use harness_core::RunId;
 use harness_manifest::admission::{Registry, Tier};
-use harness_manifest::{builtin, SemVer, ValidationContext};
+use harness_manifest::{builtin, ManifestError, SemVer, ValidationContext};
 use harness_model::client::{ClientConfig, OpenAiCompatible};
 use harness_model::profile::{CheckResult, Profile};
 use harness_model::TaskText;
 use harness_policy::locality::LocalityProbe;
 use harness_policy::UserPolicy;
 use harness_run::{Audit, Resume, Run, RunConfig, RunRefused, TaskSpec};
+use harness_sandbox::environment::SystemEnv;
 use serde::Deserialize;
 
 const USAGE: &str = "usage:
   rustyharness version
   rustyharness sandbox             report confinement (refuses to run anything without it)
-  rustyharness manifest check <file.json>
+  rustyharness manifest check <file.json>   exit 0 valid (valid is not admitted), 1 refused, 4 unreadable
   rustyharness run    --task <task.json> --workspace <dir> --state-root <dir>
                       --profile <profile.json> --endpoint <http://127.0.0.1:PORT/v1>
                       [--policy <policy.json>] [--gate <gate-id>]
@@ -84,10 +92,11 @@ mod exit {
 
 /// Where the CLI writes, and what it is given from outside: the locality
 /// probe and the `GATE_OK_FILE` marker path. The shipped binary
-/// (`src/main.rs`) always passes `NoProbe` (every `state_root` refused
-/// until spike S-F1) and the marker path from the environment; only this
-/// crate's tests pass another probe, in process. No build of the binary
-/// carries a way to switch the probe (H1e-2b review F-2).
+/// (`src/main.rs`) always passes the real per-OS probe
+/// (`harness_sandbox::locality::SystemProbe`, spike S-F1; on Windows it
+/// refuses every `state_root` until spike S-W1) and the marker path from the
+/// environment; only this crate's tests pass another probe, in process. No
+/// build of the binary carries a way to switch the probe (H1e-2b review F-2).
 pub struct Cx<'a> {
     /// The filesystem-locality probe.
     pub probe: &'a dyn LocalityProbe,
@@ -498,6 +507,7 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
             profile: &inp.profile,
             backend: &client,
             probe,
+            env: &SystemEnv,
             config: &config,
         }),
         Some(id) => harness_run::resume(Resume {
@@ -510,6 +520,7 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
             profile: &inp.profile,
             backend: &client,
             probe,
+            env: &SystemEnv,
             config: &config,
         }),
     }
@@ -528,7 +539,7 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
     // Design §9 H1: the outcome is shown to the user, in words, not only
     // in the report line and the exit code.
     note!(cx, "outcome: {}", outcome_in_words(&report.outcome));
-    let findings = info(
+    let mut findings: Vec<Finding> = info(
         "harness.run",
         &format!("run {} attempt {}", report.run, report.attempt),
         "a verification plan (H1 tasks have none)",
@@ -539,12 +550,38 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
     )
     .into_iter()
     .collect();
+    if let Some(f) = possibly_environmental(
+        &format!("run {} attempt {}", report.run, report.attempt),
+        &report.possibly_environmental,
+    ) {
+        note!(cx, "possibly environmental: {}", f.observed);
+        findings.push(f);
+    }
     Ok(Outcome {
         outcome: report.outcome,
         findings,
         chain_head: report.chain_head.map(|d| d.to_string()),
         exit_override: None,
     })
+}
+
+/// §7.1: a tool call that timed out, crashed or could not run while the
+/// host was under pressure is marked, so a human can tell a pressed host
+/// from a broken tool. An Info finding: it never changes the outcome.
+fn possibly_environmental(location: &str, steps: &[u64]) -> Option<Finding> {
+    if steps.is_empty() {
+        return None;
+    }
+    let steps: Vec<String> = steps.iter().map(u64::to_string).collect();
+    info(
+        "harness.possibly-environmental",
+        location,
+        "tool calls on an unpressed host",
+        format!(
+            "a tool call timed out, crashed or could not run at step(s) {} while memory available was under 5% or the load above twice the CPUs",
+            steps.join(", ")
+        ),
+    )
 }
 
 /// The run's outcome, said plainly for the person at the terminal.
@@ -771,35 +808,147 @@ fn profile_check(cx: &Cx<'_>, rest: &[&str]) -> u8 {
     }
 }
 
+/// `manifest check`: validate a provider's manifest with the parser
+/// admission uses (`harness_manifest::Manifest::parse`: schema v1, strict
+/// JSON, reserved namespaces, §4.3 content rules), show each capability's
+/// §4.2 class and the floors its transport and the pinned tier add, and say
+/// what this build's admission would do if the user pinned these exact
+/// bytes. Exit codes: see the crate docs.
+///
+/// Named residuals (H1f-2 review F-7): the reserved set is the core
+/// constant only (H1 has no harness config, so no `extra_reserved`); only
+/// the pinned tier is tried (a manifest refused as pinned may be admissible
+/// as signed, from H4); user policy can raise a class further at run time.
 fn manifest_check(cx: &Cx<'_>, path: &str) -> u8 {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(path).and_then(|f| {
+        // One byte past the cap is enough to know it is too large.
+        f.take(harness_manifest::MANIFEST_MAX_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+    });
+    if let Err(e) = read {
+        note!(cx, "cannot read {path}: {e}");
+        return exit::UNREADABLE_INPUT;
+    }
+    if bytes.len() > harness_manifest::MANIFEST_MAX_BYTES {
+        note!(
+            cx,
+            "cannot read {path}: larger than the manifest cap of {} bytes",
+            harness_manifest::MANIFEST_MAX_BYTES
+        );
+        return exit::UNREADABLE_INPUT;
+    }
+    let ctx = match SemVer::parse(env!("CARGO_PKG_VERSION"))
+        .ok_or_else(|| "the harness version is not SemVer".to_owned())
+        .and_then(|v| ValidationContext::new(v, &[]).map_err(|e| e.to_string()))
+    {
+        Ok(c) => c,
         Err(e) => {
-            note!(cx, "cannot read {path}: {e}");
-            return 2;
+            note!(cx, "cannot check manifests: {e}");
+            return exit::INDETERMINATE;
         }
     };
-    let manifest: harness_tools::Manifest = match serde_json::from_str(&text) {
+    let m = match harness_manifest::Manifest::parse(&bytes, &ctx) {
         Ok(m) => m,
-        Err(e) => {
-            note!(cx, "REFUSED {path}: does not parse as a manifest: {e}");
-            return 1;
+        // Not a JSON document at all: unreadable input (§7.7).
+        Err(e @ (ManifestError::Json(_) | ManifestError::TooLarge { .. })) => {
+            note!(cx, "cannot read {path}: {e}");
+            return exit::UNREADABLE_INPUT;
         }
-    };
-    match manifest.validate() {
-        Ok(()) => {
-            say!(
-                cx,
-                "OK {path}: {} {} — {} capabilit(y/ies)",
-                manifest.app,
-                manifest.app_version,
-                manifest.capabilities.len()
-            );
-            0
-        }
+        // A JSON document that is not a valid manifest. Every message here
+        // shows manifest-chosen text escaped or Debug-quoted (§7.1).
         Err(e) => {
             note!(cx, "REFUSED {path}: {e}");
-            1
+            return exit::FAILED;
         }
+    };
+    let digest = harness_core::sha256(&bytes);
+    say!(
+        cx,
+        "OK {path}: provider {} {} (schema v{}, transport {}), {} capabilit{}",
+        m.provider(),
+        m.provider_version(),
+        m.schema_version(),
+        m.transport().kind(),
+        m.capabilities().len(),
+        if m.capabilities().len() == 1 {
+            "y"
+        } else {
+            "ies"
+        }
+    );
+    say!(cx, "  manifest sha256 {digest}");
+    say!(
+        cx,
+        "  capability classes (§4.2: declared confirmation raised by the derived floors, before user policy and tier floors):"
+    );
+    for c in m.capabilities() {
+        let e = harness_policy::effective_class(c, harness_manifest::Confirmation::None);
+        say!(
+            cx,
+            "  {}: effect {}, sensitivity {}, blast {}, egress {}, content {}; confirmation {} (declared {}){}",
+            c.id(),
+            e.effect.as_str(),
+            e.sensitivity.as_str(),
+            e.blast_radius.as_str(),
+            e.egress.as_str(),
+            e.content.as_str(),
+            e.confirmation.as_str(),
+            c.confirmation().as_str(),
+            if e.requires_conformed {
+                "; needs a conformed sandbox"
+            } else {
+                ""
+            }
+        );
+    }
+    if let harness_manifest::Transport::McpStdio { .. } = m.transport() {
+        say!(
+            cx,
+            "  transport mcp-stdio: the server is started only inside a conformed sandbox, never unconfined (§4.5)"
+        );
+    }
+    // What admission would say if the user pinned exactly these bytes: the
+    // same code a run uses. In H1 it always refuses (pinning is H4).
+    let admission = harness_manifest::Sha256Pin::parse_hex(&digest.to_string())
+        .ok_or_else(|| "the manifest digest is not a pin".to_owned())
+        .and_then(|pin| {
+            Registry::admit(vec![(
+                m,
+                Tier::Pinned {
+                    manifest_sha256: pin,
+                },
+            )])
+            .map_err(|e| e.to_string())
+        });
+    match admission {
+        Ok(_) => say!(
+            cx,
+            "  if pinned as sha256 {digest}, this build would admit it"
+        ),
+        Err(e) => say!(
+            cx,
+            "  if pinned as sha256 {digest}, this build would refuse it: {e}"
+        ),
+    }
+    say!(
+        cx,
+        "  a pinned provider is always sandboxed, confirms at least user_confirm and never shares a session with personal or restricted capabilities (§4.4)"
+    );
+    exit::PASSED
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pressed_step_is_an_info_finding_and_no_step_is_none() {
+        assert!(possibly_environmental("run r attempt 1", &[]).is_none());
+        let f = possibly_environmental("run r attempt 1", &[3, 7]).unwrap();
+        assert_eq!(f.severity, Severity::Info);
+        assert_eq!(f.code.0, "harness.possibly-environmental");
+        assert!(f.observed.contains("step(s) 3, 7"), "{}", f.observed);
     }
 }

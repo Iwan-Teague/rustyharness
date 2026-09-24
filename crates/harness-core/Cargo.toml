@@ -1,6 +1,6 @@
 [package]
 name = "harness-core"
-description = "rustyharness core types: untrusted data, run budgets, loop detection. Pure, no I/O."
+description = "rustyharness core: untrusted data, the run meter, loop detection, SHA-256, strict JSON, the environment-sample vocabulary. Pure, no I/O."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

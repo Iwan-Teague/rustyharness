@@ -7,6 +7,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gate_outcome::{GateOutcome, IndeterminateKind};
+use harness_core::environment::{EnvSample, Method, Reading, Unmeasured};
 use harness_core::{sha256, BudgetDim, LoopKind, MonoClock, RunId, Source, StopCause, Untrusted};
 use harness_journal::testing::{FaultFile, FaultPlan, MemBlobs};
 use harness_journal::{verify, Clock, EventKind, Header, Ident, JournalWriter, Journaled};
@@ -50,6 +51,8 @@ impl MonoClock for Advancing {
 struct Spy {
     ns: ProviderName,
     invoked: Rc<Cell<u32>>,
+    /// The status every call ends with; `None`: the provider fails.
+    status: Option<ToolStatus>,
 }
 impl ToolProvider for Spy {
     fn namespace(&self) -> &ProviderName {
@@ -61,13 +64,16 @@ impl ToolProvider for Spy {
         _ctx: &InvokeCtx,
     ) -> Result<ToolResult, ToolError> {
         self.invoked.set(self.invoked.get() + 1);
+        let Some(status) = self.status else {
+            return Err(ToolError("the spy fails".into()));
+        };
         let out = format!(
             "contents #{} of {}",
             self.invoked.get(),
             call.call().call().args
         );
         Ok(ToolResult {
-            status: ToolStatus::Ok,
+            status,
             digest: sha256(out.as_bytes()),
             output: Untrusted::new(out.into_bytes(), Source::Tool("harness.fs.read".into())),
             truncated: false,
@@ -112,6 +118,8 @@ struct Outcome {
     tokens: (u64, u64),
     estimated: bool,
     blobs: MemBlobs,
+    /// Steps whose tool timed out or crashed under host pressure.
+    pressure: Vec<u64>,
 }
 
 fn drive_with(
@@ -119,6 +127,24 @@ fn drive_with(
     plan_faults: FaultPlan,
     limits: impl FnOnce(&mut RunConfig),
     clock_step: Duration,
+) -> Outcome {
+    drive_full(
+        replies,
+        plan_faults,
+        limits,
+        clock_step,
+        Some(ToolStatus::Ok),
+        &EnvSample::unmeasured(Unmeasured::NoSafeApi),
+    )
+}
+
+fn drive_full(
+    replies: Vec<Result<Completion, ModelError>>,
+    plan_faults: FaultPlan,
+    limits: impl FnOnce(&mut RunConfig),
+    clock_step: Duration,
+    status: Option<ToolStatus>,
+    env: &EnvSample,
 ) -> Outcome {
     let reg = registry();
     let profile = Profile::conservative_default("m");
@@ -156,6 +182,7 @@ fn drive_with(
         providers: vec![Box::new(Spy {
             ns: ProviderName::new("harness").unwrap(),
             invoked: invoked.clone(),
+            status,
         })],
         meter: new_meter(
             cfg.limits.clone(),
@@ -171,8 +198,11 @@ fn drive_with(
         nonces: NonceSource::default(),
         feed: std::collections::VecDeque::new(),
         reads: ReadLog::default(),
+        env,
+        pressure: Vec::new(),
     };
     let end = lp.drive(&mut w);
+    let pressure = lp.pressure.clone();
     let tokens = lp.meter.tokens_spent();
     let estimated = lp.meter.tokens_were_estimated();
     let released = commit(w, &end, None).outcome;
@@ -192,6 +222,7 @@ fn drive_with(
         tokens,
         estimated,
         blobs,
+        pressure,
     }
 }
 
@@ -682,4 +713,91 @@ fn the_read_log_refuses_an_edit_to_a_file_never_read_or_changed_since() {
     );
     log.record("a.rs", sha256(b"v2"));
     assert_eq!(log.check("a.rs", sha256(b"v2")), Ok(()));
+}
+
+// ---- the environment sample (§7.1) ----------------------------------------------
+
+/// A host under memory pressure: 1% available.
+fn pressed() -> EnvSample {
+    let mut s = EnvSample::unmeasured(Unmeasured::NoSafeApi);
+    s.mem_total_bytes = Reading::Measured {
+        value: 1000,
+        method: Method::ProcMeminfoTotal,
+    };
+    s.mem_available_bytes = Reading::Measured {
+        value: 10,
+        method: Method::ProcMeminfoAvailable,
+    };
+    s
+}
+
+#[test]
+fn a_timeout_or_crash_records_the_host_and_flags_pressure() {
+    let calm = EnvSample::unmeasured(Unmeasured::NoSafeApi);
+    for (what, status, env, sampled, flagged) in [
+        (
+            "timeout under pressure",
+            Some(ToolStatus::Timeout),
+            pressed(),
+            true,
+            true,
+        ),
+        (
+            "crash on a calm host",
+            Some(ToolStatus::Crashed { signal: Some(9) }),
+            calm,
+            true,
+            false,
+        ),
+        // A provider failure is the tool-level "could not run" (§7.1).
+        (
+            "provider failure under pressure",
+            None,
+            pressed(),
+            true,
+            true,
+        ),
+        (
+            "ok under pressure",
+            Some(ToolStatus::Ok),
+            pressed(),
+            false,
+            false,
+        ),
+    ] {
+        let o = drive_full(
+            vec![read("a.txt"), submit()],
+            FaultPlan::default(),
+            |_| {},
+            Duration::ZERO,
+            status,
+            &env,
+        );
+        assert_eq!(o.end.cause, StopCause::Submitted, "{what}");
+        let v = verify(&o.journal, &o.blobs).unwrap();
+        // The read's result (the sentinel's ToolFinished carries neither an
+        // output nor a provider_error status).
+        let done: Vec<_> = v
+            .records
+            .iter()
+            .filter(|r| {
+                r.kind == EventKind::ToolFinished
+                    && (r.body.get("output").is_some()
+                        || r.body.get("status").and_then(|s| s.as_str()) == Some("provider_error"))
+            })
+            .collect();
+        assert_eq!(done.len(), 1, "{what}");
+        let rec = done[0];
+        match rec.body.get("environment") {
+            Some(e) => {
+                assert!(sampled, "{what}: sampled an ok result");
+                assert_eq!(crate::sample::from_value(e), Some(env), "{what}");
+            }
+            None => assert!(!sampled, "{what}: no sample"),
+        }
+        let want: Vec<u64> = if flagged { vec![rec.step] } else { Vec::new() };
+        assert_eq!(o.pressure, want, "{what}");
+        // The sample never changes the outcome.
+        assert_eq!(o.released, NOTHING_CHECKED, "{what}");
+    }
 }

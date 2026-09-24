@@ -28,8 +28,8 @@
 //! pass. A journal failure at any point after the header is
 //! `Indeterminate { UnreadableEvidence }` (INV-33).
 //!
-//! What is not here yet (H1e-2b): the CLI verbs, the audit-replay driver,
-//! the end-to-end exit test, resume.
+//! Audit replay and resume are [`replay`]; the CLI verbs over both are
+//! `harness-cli`.
 
 #![forbid(unsafe_code)]
 // The panic-set lints ratchet production code; unit tests may assert loosely.
@@ -45,6 +45,7 @@
 
 pub mod driver;
 pub mod replay;
+mod sample;
 
 pub use driver::{run, ReadLog, Run, RunConfig, RunRefused, RunReport, StaleRead, TaskSpec};
 pub use replay::{audit, resume, Audit, AuditRefused, AuditReport, Divergence, Resume};

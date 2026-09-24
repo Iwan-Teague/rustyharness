@@ -61,6 +61,106 @@ fn cap0(val: &mut Value) -> &mut Value {
 }
 
 #[test]
+fn dimension_names_are_the_wire_names() {
+    fn wire<T: serde::de::DeserializeOwned + PartialEq + std::fmt::Debug>(t: T, name: &str) {
+        assert_eq!(
+            serde_json::from_value::<T>(json!(name)).unwrap(),
+            t,
+            "{name}"
+        );
+    }
+    // Each list sits behind a wildcard-free match: a new variant does not
+    // compile until it has an arm here, next to the list it must join.
+    let effects = [
+        Effect::Read,
+        Effect::Write,
+        Effect::Execute,
+        Effect::Irreversible,
+    ];
+    let _ = |e: Effect| match e {
+        Effect::Read | Effect::Write | Effect::Execute | Effect::Irreversible => (),
+    };
+    let sensitivities = [
+        Sensitivity::Public,
+        Sensitivity::Operational,
+        Sensitivity::Personal,
+        Sensitivity::Restricted,
+    ];
+    let _ = |s: Sensitivity| match s {
+        Sensitivity::Public
+        | Sensitivity::Operational
+        | Sensitivity::Personal
+        | Sensitivity::Restricted => (),
+    };
+    let blasts = [BlastRadius::Own, BlastRadius::Host, BlastRadius::Shared];
+    let _ = |b: BlastRadius| match b {
+        BlastRadius::Own | BlastRadius::Host | BlastRadius::Shared => (),
+    };
+    let egresses = [Egress::None, Egress::Lan, Egress::Internet];
+    let _ = |g: Egress| match g {
+        Egress::None | Egress::Lan | Egress::Internet => (),
+    };
+    let contents = [Content::Own, Content::ThirdParty];
+    let _ = |c: Content| match c {
+        Content::Own | Content::ThirdParty => (),
+    };
+    let confirmations = [
+        Confirmation::None,
+        Confirmation::UserConfirm,
+        Confirmation::ProtectedAction,
+    ];
+    let _ = |c: Confirmation| match c {
+        Confirmation::None | Confirmation::UserConfirm | Confirmation::ProtectedAction => (),
+    };
+    for e in effects {
+        wire(e, e.as_str());
+    }
+    for s in sensitivities {
+        wire(s, s.as_str());
+    }
+    for b in blasts {
+        wire(b, b.as_str());
+    }
+    for g in egresses {
+        wire(g, g.as_str());
+    }
+    for c in contents {
+        wire(c, c.as_str());
+    }
+    for c in confirmations {
+        wire(c, c.as_str());
+    }
+}
+
+/// H1f-2 review F-1: text from a refused manifest reaches a terminal only
+/// escaped. Unknown field names, unknown enum values and the keys on a
+/// null value's path are all chosen by the manifest's author.
+#[test]
+fn refusals_never_carry_raw_control_or_bidi_characters() {
+    let hostile = "\u{1b}[1A\u{1b}[2K\rOK forged \u{202e}\u{7}\u{2028}";
+    // serde_json writes the text escaped, so the strict reader accepts the
+    // JSON and the raw characters reach the refusal paths.
+    let mut unknown_field = fixture();
+    unknown_field[hostile] = json!(1);
+    let mut unknown_value = fixture();
+    cap0(&mut unknown_value)["effect"] = json!(hostile);
+    let mut null_key = fixture();
+    cap0(&mut null_key)["input_schema"]["properties"][hostile] = Value::Null;
+    for v in [unknown_field, unknown_value, null_key] {
+        let e = parse_v(&v).unwrap_err().to_string();
+        assert!(
+            !e.chars().any(|c| c.is_control()
+                || is_invisible_or_bidi(c)
+                || matches!(c, '\u{2028}' | '\u{2029}')),
+            "{e:?}"
+        );
+        assert!(e.contains("\\u{1B}"), "the ESC is shown escaped: {e}");
+    }
+    assert_eq!(display_safe("a\\b", 80), "a\\\\b");
+    assert_eq!(display_safe("abcdef", 3), "abc");
+}
+
+#[test]
 fn fixture_manifest_validates() {
     let m = parse_v(&fixture()).unwrap();
     assert_eq!(m.provider().as_str(), "fixture");

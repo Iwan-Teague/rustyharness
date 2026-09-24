@@ -1,8 +1,8 @@
 //! rustyharness core types. Pure: no I/O, no async, no model or tool calls.
 //!
-//! SCAFFOLD (2026-09-23). The types here encode invariants that are already
-//! settled by reviewed suite designs; everything else waits for the
-//! rustyharness design (docs/00-overview.md, research pipeline in docs/research/).
+//! The types here are the harness's pure core (design §1.2): untrusted data,
+//! run ids and nonces, the one SHA-256 function, the strict JSON reader, the
+//! run meter and loop detection, and the environment-sample vocabulary.
 //!
 //! The gate-layer outcome type lives in the sibling `gate-outcome` crate
 //! (`GateOutcome { Passed(Witness), Failed, Indeterminate { why } }`); this
@@ -22,6 +22,7 @@
     allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
 )]
 
+pub mod environment;
 pub mod strict_json;
 
 use std::collections::{HashMap, HashSet, VecDeque};

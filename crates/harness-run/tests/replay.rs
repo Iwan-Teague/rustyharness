@@ -11,6 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use gate_outcome::{GateOutcome, IndeterminateKind};
+use harness_core::environment::{EnvSample, Unmeasured};
 use harness_core::{RunId, StopCause};
 use harness_journal::canon::{RecordFields, GENESIS};
 use harness_journal::{layout, EventKind, JournalReader};
@@ -25,6 +26,10 @@ use harness_run::{
     audit, resume, run, Audit, Resume, Run, RunConfig, RunRefused, RunReport, TaskSpec,
 };
 use serde_json::Value;
+
+/// A fixed environment sample (the real probe is harness-sandbox's; these
+/// tests only need the header and records to carry one).
+const FIXED_ENV: EnvSample = EnvSample::unmeasured(Unmeasured::NoSafeApi);
 
 struct Local;
 impl LocalityProbe for Local {
@@ -92,6 +97,7 @@ fn go(state: &Path, ws: &Path, replies: Vec<Result<Completion, ModelError>>) -> 
         profile: &profile,
         backend: &backend,
         probe: &Local,
+        env: &FIXED_ENV,
         config: &RunConfig::defaults(1_000_000),
     })
     .unwrap()
@@ -422,6 +428,7 @@ fn f_1_a_genuine_wall_stop_passes_only_with_its_anchor() {
         profile: &profile,
         backend: &backend,
         probe: &Local,
+        env: &FIXED_ENV,
         config: &config,
     })
     .unwrap();
@@ -493,6 +500,7 @@ fn resume_with(
         profile: &profile,
         backend: &backend,
         probe: &Local,
+        env: &FIXED_ENV,
         config: &RunConfig::defaults(1_000_000),
     })
 }
@@ -676,4 +684,211 @@ fn nf_1_chained_resumes_are_charged_every_earlier_attempts_wall_time() {
         third.cause,
         StopCause::Budget(harness_core::BudgetDim::Wall)
     );
+}
+
+// ---- the environment sample (§7.1, H1f-3) -------------------------------------------
+
+/// Turn the first read's `ToolFinished` into a `status` result as the loop
+/// writes one (no read digest; `environment` when given), re-chained. A
+/// live timeout needs a walk the clock interrupts, which a test cannot time
+/// reliably; the loop's own sampling is tested in the crate's unit tests.
+fn as_failed(r: &RunReport, status: &'static str, environment: Option<Value>) {
+    as_failed_keeping(r, status, environment, false);
+}
+
+/// [`as_failed`]; `keep_read` leaves the read digest in place (a shape the
+/// loop never writes on a non-ok result). A `provider_error` carries no
+/// output, as the loop writes it.
+fn as_failed_keeping(
+    r: &RunReport,
+    status: &'static str,
+    environment: Option<Value>,
+    keep_read: bool,
+) {
+    rechain(
+        &journal_path(r, 1),
+        |v| v["kind"] == "ToolFinished" && v["body"].get("output").is_some(),
+        move |b| {
+            b["status"] = Value::from(status);
+            let o = b.as_object_mut().unwrap();
+            if !keep_read {
+                o.remove("read_sha256");
+            }
+            if status == "provider_error" {
+                for k in ["output", "truncated", "digest", "read_sha256"] {
+                    o.remove(k);
+                }
+            }
+            if let Some(e) = &environment {
+                b["environment"] = e.clone();
+            }
+        },
+    );
+}
+
+fn pressed_sample() -> Value {
+    serde_json::json!({
+        "cpus": {"method": "/sys/devices/system/cpu/online", "value": 4},
+        "load_1m_milli": {"method": "/proc/loadavg", "value": 9000},
+        "mem_total_bytes": {"method": "/proc/meminfo MemTotal", "value": 1000},
+        "mem_available_bytes": {"method": "/proc/meminfo MemAvailable", "value": 10},
+        "state_root_free_bytes": {"unmeasured": "no_safe_api"},
+    })
+}
+
+/// The replay journal's records (it lives in `replay-<k>/`, not an attempt).
+fn replay_records(a: &harness_run::AuditReport) -> Vec<Value> {
+    fs::read_to_string(a.replay_dir.clone().unwrap().join(layout::JOURNAL_FILE))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .collect()
+}
+
+#[test]
+fn inv_20_a_recorded_sample_is_re_fed_exactly() {
+    // A past host cannot be re-measured: the replay re-feeds the sample
+    // recorded with a timed-out or crashed result, re-encodes it byte for
+    // byte, and marks its own header's copy as recorded. (Like a tool
+    // result, a sample is an input to the replay: a self-consistent edit to
+    // one is caught only by an anchor, §7.1.)
+    for status in ["timeout", "crashed"] {
+        let (state, ws) = scratch(&format!("env-refed-{status}"));
+        let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+        as_failed(&r, status, Some(pressed_sample()));
+        let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+        assert_eq!(a.divergence, None, "{status}");
+        let recs = replay_records(&a);
+        assert_eq!(recs[0]["body"]["environment_source"], "recorded");
+        let rec = recs
+            .iter()
+            .find(|v| v["kind"] == "ToolFinished" && v["body"].get("environment").is_some())
+            .unwrap();
+        assert_eq!(rec["body"]["status"], status);
+        assert_eq!(rec["body"]["environment"], pressed_sample(), "{status}");
+    }
+}
+
+#[test]
+fn inv_20_a_recorded_provider_failure_is_re_fed_with_its_sample() {
+    // A provider failure feeds the model a harness notice, not the
+    // observation, so the recording is cut after that step (a crash): the
+    // audit re-feeds the failure and its sample exactly (confirming NF-6).
+    let (state, ws) = scratch("env-provider-error");
+    let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+    as_failed(&r, "provider_error", Some(pressed_sample()));
+    crash_after(&journal_path(&r, 1), 2);
+    let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+    assert_eq!(a.divergence, None, "{a:?}");
+    let rec = replay_records(&a)
+        .into_iter()
+        .find(|v| v["kind"] == "ToolFinished" && v["body"]["status"] == "provider_error")
+        .unwrap();
+    assert_eq!(rec["body"]["environment"], pressed_sample());
+}
+
+#[test]
+fn a_cut_intent_is_replayed_as_not_sampled() {
+    // An intent a crash cut before its result has no recorded sample; the
+    // replay's provider failure for it says so instead of borrowing the
+    // header's (confirming NF-1).
+    let (state, ws) = scratch("env-cut-intent");
+    let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+    let text = fs::read_to_string(journal_path(&r, 1)).unwrap();
+    let cut: String = text
+        .lines()
+        .take_while(|l| !l.contains("\"kind\":\"ToolFinished\""))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    fs::write(journal_path(&r, 1), cut).unwrap();
+    let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+    assert_eq!(a.divergence, None, "{a:?}");
+    let rec = replay_records(&a)
+        .into_iter()
+        .find(|v| v["kind"] == "ToolFinished")
+        .unwrap();
+    assert_eq!(rec["body"]["status"], "provider_error");
+    for (k, v) in rec["body"]["environment"].as_object().unwrap() {
+        assert_eq!(v["unmeasured"], "not_sampled", "{k}");
+    }
+}
+
+#[test]
+fn a_read_digest_on_a_failed_result_is_unreadable() {
+    let (state, ws) = scratch("env-read-on-timeout");
+    let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+    as_failed_keeping(&r, "timeout", Some(pressed_sample()), true);
+    let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+    assert_eq!(a.outcome, UNREADABLE);
+}
+
+#[test]
+fn a_resume_re_feeds_a_timed_out_catch_up_step_with_its_sample() {
+    let (state, ws) = scratch("env-resume");
+    let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
+    // Step 1 timed out on a pressed host; the run died in step 2.
+    as_failed(&r, "timeout", Some(pressed_sample()));
+    crash_after(&journal_path(&r, 1), 3);
+    let res = resume_with(&state, &ws, &r.run, TASK, vec![read("b.txt"), submit()]).unwrap();
+    assert_eq!(res.attempt, 2);
+    // The catch-up re-fed step 1 with its recorded sample, which flags it.
+    assert_eq!(res.possibly_environmental, vec![1]);
+    let new = JournalReader::open(&layout::attempt_dir(&r.run_dir, 2)).unwrap();
+    assert_eq!(new.records[0].body["environment_source"], "measured");
+    let step1 = new
+        .records
+        .iter()
+        .find(|x| x.step == 1 && x.kind == EventKind::ToolFinished)
+        .unwrap();
+    assert_eq!(
+        Value::Object(step1.body.clone())["environment"],
+        pressed_sample()
+    );
+    let a = audit_with(&state, &r.run, Some(2), TASK, &UserPolicy::default());
+    assert_eq!(a.divergence, None, "{a:?}");
+}
+
+#[test]
+fn inv_20_a_missing_misplaced_or_misshapen_sample_is_unreadable() {
+    let mut unknown_method = pressed_sample();
+    unknown_method["mem_total_bytes"]["method"] = Value::from("free -b");
+    let mut wrong_field = pressed_sample();
+    wrong_field["cpus"] = serde_json::json!({"method": "vm_stat free+inactive", "value": 4});
+    let mut extra_key = pressed_sample();
+    extra_key["swap_bytes"] = serde_json::json!({"unmeasured": "no_safe_api"});
+    for (name, status, env) in [
+        ("missing", "timeout", None),
+        ("unknown-method", "timeout", Some(unknown_method)),
+        ("method-on-another-field", "crashed", Some(wrong_field)),
+        ("extra-key", "timeout", Some(extra_key)),
+        ("on-an-ok-result", "ok", Some(pressed_sample())),
+        ("provider-error-without-one", "provider_error", None),
+    ] {
+        let (state, ws) = scratch(&format!("env-{name}"));
+        let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+        as_failed(&r, status, env);
+        let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+        assert_eq!(a.outcome, UNREADABLE, "{name}");
+        assert!(
+            a.divergence
+                .unwrap()
+                .why
+                .contains("not the shape the loop writes"),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_journal_from_another_harness_build_is_named_as_such() {
+    let (state, ws) = scratch("other-build");
+    let r = go(&state, &ws, vec![read("a.txt"), submit()]);
+    rechain(
+        &journal_path(&r, 1),
+        |v| v["kind"] == "RunStarted",
+        |b| b["builtin_manifest"] = Value::from("0".repeat(64)),
+    );
+    let a = audit_with(&state, &r.run, None, TASK, &UserPolicy::default());
+    assert_eq!(a.outcome, UNREADABLE);
+    assert!(a.divergence.unwrap().why.contains("another harness build"));
 }

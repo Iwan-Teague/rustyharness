@@ -144,8 +144,9 @@ pub trait LocalityProbe {
     fn query(&self, path: &str) -> FsQuery;
 }
 
-/// The default probe: measures nothing, so every check refuses. It is what
-/// every OS gets until S-F1 lands a real probe for it.
+/// The refusing probe: measures nothing, so every check refuses. The binary
+/// uses the real per-OS probe (`harness-sandbox`, spike S-F1); this one is
+/// for callers and tests that must never admit a `state_root`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoProbe;
 

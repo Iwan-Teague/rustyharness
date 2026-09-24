@@ -1,6 +1,6 @@
 # Research pipeline
 
-Research feeds the v0.1 design. Research specific to rustysuite's own apps is kept in the rustysuite repository, not here; this repo stays general (ADR-0002). Every input is kept here with its sources. The
+Research fed the v0.1 design (now v0.2, reviewed SOUND). Research specific to rustysuite's own apps is kept in the rustysuite repository, not here; this repo stays general (ADR-0002). Every input is kept here with its sources. The
 design is reviewed independently before it is called SOUND.
 
 | Stream | Question | Status |
@@ -12,4 +12,4 @@ design is reviewed independently before it is called SOUND.
 | R5 integration map | Per app: what an agent would do with it, effect classes, the capabilities it would declare | **done** — rustysuite-specific, so it lives in the (private) suite repo, not here |
 | R6 threat model | The harness's own threat model — standalone and in-suite deployments | **done** — kept in the suite repo for now; its generic parts move into the v0.1 design |
 
-Then: v0.1 design ([01-design-v0.1.md](../01-design-v0.1.md), 2026-09-23) → adversarial review → rework → confirming review → SOUND.
+Then: v0.1 design ([01-design-v0.1.md](../01-design-v0.1.md), 2026-09-23) → adversarial review → rework → confirming review → SOUND (v0.2). H1 is built on it.

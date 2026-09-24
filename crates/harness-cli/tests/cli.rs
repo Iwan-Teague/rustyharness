@@ -1,12 +1,15 @@
 //! The `rustyharness` CLI as a gate child (design §7.7), end to end against
 //! a mock OpenAI-compatible server on loopback.
 //!
-//! Runs that must get past the locality check call the CLI library in
-//! process with this file's permissive probe (spike S-F1 has not landed a
-//! real one). Everything that must refuse runs the real binary, which
-//! always uses `NoProbe`: no build of it can be switched to another probe,
-//! and the test below sets the old switch variable to prove it is ignored
-//! (H1e-2b review F-2).
+//! The real binary always uses the real per-OS probe
+//! (`harness_sandbox::locality::SystemProbe`, spike S-F1). It measures Linux
+//! and macOS; on Windows it refuses every `state_root` until spike S-W1
+//! ([`REAL_PROBE_MEASURES`]). Tests that need a run to start on EVERY OS
+//! call the CLI library in process with this file's permissive probe; the
+//! whole-run test uses the real binary where its probe measures and, on
+//! Windows, first proves the real binary refuses. No build of the binary
+//! can be switched to another probe, and the tests set the old switch
+//! variable to prove it is ignored (H1e-2b review F-2).
 
 #![allow(
     clippy::unwrap_used,
@@ -75,6 +78,12 @@ fn respond(s: &mut TcpStream, body: &str) {
 /// Serves `GET /v1/models` (model `m`) and answers each chat completion
 /// with the next scripted content.
 fn mock(replies: Vec<String>) -> Mock {
+    mock_with(replies, |_| {})
+}
+
+/// [`mock`], calling `on_chat` with each chat request (head and body)
+/// before answering it, while the harness waits for the reply.
+fn mock_with(replies: Vec<String>, on_chat: impl Fn(&str) + Send + 'static) -> Mock {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     let queue = Arc::new(Mutex::new(VecDeque::from(replies)));
@@ -88,6 +97,7 @@ fn mock(replies: Vec<String>) -> Mock {
             if req.starts_with("GET /v1/models ") {
                 respond(&mut s, r#"{"data":[{"id":"m"}]}"#);
             } else {
+                on_chat(&req);
                 let content = queue.lock().unwrap().pop_front().unwrap_or_default();
                 let body = serde_json::json!({
                     "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
@@ -170,9 +180,14 @@ impl LocalityProbe for Local {
     }
 }
 
+/// Whether the real binary's probe measures this OS (spike S-F1: Linux and
+/// macOS). Elsewhere, Windows included until spike S-W1, it answers
+/// `Unmeasured` and every `state_root` is refused (design §2.8).
+const REAL_PROBE_MEASURES: bool = cfg!(any(target_os = "linux", target_os = "macos"));
+
 /// `local = true`: the CLI library in process with the permissive probe.
-/// `local = false`: the real binary (always `NoProbe`), with the variable
-/// that once switched the probe set, to show it switches nothing.
+/// `local = false`: the real binary (always the real probe), with the
+/// variable that once switched the probe set, to show it switches nothing.
 fn cli(args: &[&str], local: bool, marker: &Path) -> Output {
     if local {
         let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -260,36 +275,58 @@ const NOTHING_CHECKED: GateOutcome = GateOutcome::Indeterminate {
 
 // ---- the tests ---------------------------------------------------------------------
 
-#[test]
-fn inv_35_the_binary_refuses_a_state_root_that_is_not_a_local_disk() {
-    // `/dev` is devfs (macOS) or devtmpfs (Linux): not an admitted local
-    // filesystem. The real probe must refuse it before anything is written
-    // or the model server is asked, even with the old switch variable set.
-    let fx = fixture("refused");
-    let m = mock(vec![]);
-    let ep = format!("http://127.0.0.1:{}/v1", m.port);
-    let mut args = run_args(&fx, &ep);
-    let at = args.iter().position(|a| *a == "--state-root").unwrap() + 1;
-    args[at] = "/dev";
-    let o = cli(&args, false, &fx.marker);
-    assert_eq!(o.code(), Some(5));
-    let r = report(&o);
+/// The real binary refused `state_root` as not local: before anything was
+/// written under it or the model server was asked (design §2.8, INV-35).
+fn assert_refused_as_not_local(o: &Output, m: &Mock, state_root: &Path, marker: &Path) {
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.code(), Some(5), "stderr: {err}");
+    let r = report(o);
     assert_eq!(r["outcome"]["Indeterminate"]["why"], "CouldNotRun");
     assert_eq!(r["gate"], "rustyharness.run");
-    assert!(String::from_utf8_lossy(&o.stderr).contains("not on a filesystem identified as local"));
-    assert!(!Path::new("/dev/runs").exists(), "nothing was written");
+    assert!(
+        err.contains("not on a filesystem identified as local"),
+        "stderr: {err}"
+    );
+    if !REAL_PROBE_MEASURES {
+        // Unmeasured, and the refusal says why (§2.8: the message names
+        // what was detected).
+        assert!(err.contains("spike S-W1"), "stderr: {err}");
+    }
+    assert!(!state_root.join("runs").exists(), "nothing was written");
     assert_eq!(
         *m.requests.lock().unwrap(),
         0,
         "the model server was never contacted"
     );
-    assert!(!fx.marker.exists());
+    assert!(!marker.exists());
     assert_eq!(
-        as_parent_sees(&o, "rustyharness.run", &fx.marker, true),
+        as_parent_sees(o, "rustyharness.run", marker, true),
         GateOutcome::Indeterminate {
             why: IndeterminateKind::CouldNotRun
         }
     );
+}
+
+#[test]
+fn inv_35_the_binary_refuses_a_state_root_not_identified_as_local() {
+    // Where the real probe measures, `/dev` is devfs (macOS) or devtmpfs
+    // (Linux): not an admitted local filesystem. Where it does not (Windows
+    // until spike S-W1), every state root is refused, so the fixture's own
+    // is. Either way the refusal comes before anything is written or the
+    // model server is asked, even with the old switch variable set.
+    let fx = fixture("refused");
+    let m = mock(vec![]);
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let state_root = if REAL_PROBE_MEASURES {
+        Path::new("/dev")
+    } else {
+        fx.state.as_path()
+    };
+    let mut args = run_args(&fx, &ep);
+    let at = args.iter().position(|a| *a == "--state-root").unwrap() + 1;
+    args[at] = state_root.to_str().unwrap();
+    let o = cli(&args, false, &fx.marker);
+    assert_refused_as_not_local(&o, &m, state_root, &fx.marker);
 }
 
 #[test]
@@ -303,9 +340,19 @@ fn a_whole_run_is_nothing_checked_exit_5_no_marker_and_prints_its_chain_head() {
         ),
     ]);
     let ep = format!("http://127.0.0.1:{}/v1", m.port);
-    // The real binary with the real probe (spike S-F1): the state root
-    // under the target directory is on a local disk, so the run starts.
-    let o = cli(&run_args(&fx, &ep), false, &fx.marker);
+    // Where the real probe measures (spike S-F1), the real binary runs: the
+    // state root under the target directory is on a local disk. Where it
+    // does not (Windows until spike S-W1), the real binary must refuse that
+    // same state root; the run is then driven in process with the permissive
+    // probe, so everything after the locality check is still covered on
+    // every OS. The refusal contacted no server, so the replies are unused.
+    let o = if REAL_PROBE_MEASURES {
+        cli(&run_args(&fx, &ep), false, &fx.marker)
+    } else {
+        let refused = cli(&run_args(&fx, &ep), false, &fx.marker);
+        assert_refused_as_not_local(&refused, &m, &fx.state, &fx.marker);
+        cli(&run_args(&fx, &ep), true, &fx.marker)
+    };
     let stdout = String::from_utf8(o.stdout.clone()).unwrap();
     assert_eq!(
         o.code(),
@@ -576,4 +623,249 @@ fn replay_of_a_forged_wall_stop_is_unreadable_evidence_with_a_named_finding() {
         "wall stop not recomputable; only --anchor proves no truncation"
     );
     assert!(!String::from_utf8_lossy(&r.stderr).contains("every record recomputed and matched"));
+}
+
+/// INV-1 / INV-22 through the CLI: `manifest check` is the v1 admission
+/// parser, not the scaffold's v0 one it used to be. The example validates,
+/// with each capability's class and what this build's admission would do
+/// with it; v0, a reserved namespace, duplicate keys (top level and nested)
+/// are refused (exit 1); a file that is not a JSON document at all, or is
+/// too large or missing, is unreadable (exit 4). Refusals never put a raw
+/// control or bidi character on the terminal (H1f-2 review F-1).
+#[test]
+fn inv_1_manifest_check_is_the_v1_admission_parser() {
+    let fx = fixture("manifest-check");
+    let check = |path: &Path| {
+        cli(
+            &["manifest", "check", path.to_str().unwrap()],
+            false,
+            &fx.marker,
+        )
+    };
+    let example =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../adapters/example/manifest.json");
+    let o = check(&example);
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(o.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        out.contains("provider example 0.0.1 (schema v1, transport mcp-stdio), 2 capabilities"),
+        "{out}"
+    );
+    assert!(out.contains("example.config.set: effect write, sensitivity operational, blast own, egress none, content own; confirmation user_confirm"), "{out}");
+    assert!(
+        out.contains("started only inside a conformed sandbox"),
+        "{out}"
+    );
+    // Valid is not admitted: external providers are H4 (§4.4).
+    assert!(out.contains("this build would refuse it"), "{out}");
+    assert!(out.contains("arrives in H4"), "{out}");
+
+    let text = std::fs::read_to_string(&example).unwrap();
+    let write = |name: &str, body: &str| {
+        let p = fx.base.join(name);
+        std::fs::write(&p, body).unwrap();
+        p
+    };
+    let refused = |name: &str, body: &str, want_code: i32, why: &str| {
+        let o = check(&write(name, body));
+        let err = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert_eq!(o.code(), Some(want_code), "{name}: {err}");
+        assert!(err.contains(why), "{name}: {err}");
+        // Nothing from the manifest reaches the terminal raw: one line, no
+        // other control character, no bidi or zero-width code point.
+        let body = err.strip_suffix('\n').unwrap_or(&err);
+        assert!(
+            !body.chars().any(|c| c.is_control()
+                || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{2028}' | '\u{2029}')),
+            "{name}: {err:?}"
+        );
+        err
+    };
+    refused(
+        "v0.json",
+        r#"{"schema_version":0,"app":"example","app_version":"0.0.1","capabilities":[{"id":"example.status.read","summary":"x","effect":"read"}]}"#,
+        1,
+        "migrate",
+    );
+    refused(
+        "reserved.json",
+        &text
+            .replace("\"provider\": \"example\"", "\"provider\": \"rustyvault\"")
+            .replace("\"example.", "\"rustyvault."),
+        1,
+        "reserved",
+    );
+    refused(
+        "duplicate.json",
+        &text.replacen(
+            "\"schema_version\": 1,",
+            "\"schema_version\": 1, \"schema_version\": 1,",
+            1,
+        ),
+        1,
+        "repeats a JSON key",
+    );
+    refused(
+        "nested-duplicate.json",
+        &text.replacen(
+            "\"maxLength\": 64",
+            "\"maxLength\": 64, \"maxLength\": 64",
+            1,
+        ),
+        1,
+        "repeats a JSON key",
+    );
+    // Hostile text in an unknown field's name and in the key on a null
+    // value's path: the refusal shows it escaped, so it cannot redraw the
+    // terminal (e.g. print a forged "OK" over its own refusal).
+    let esc = "\\u001b[1A\\u001b[2K\\rOK forged \\u202e\\u0007";
+    let e = refused(
+        "hostile-field.json",
+        &text.replacen("{", &format!("{{\"{esc}\": 1, "), 1),
+        1,
+        "unknown field",
+    );
+    assert!(e.contains("\\u{1B}"), "{e}");
+    refused(
+        "hostile-null.json",
+        &text.replacen(
+            "\"properties\": {}",
+            &format!("\"properties\": {{\"{esc}\": null}}"),
+            1,
+        ),
+        1,
+        "null value",
+    );
+    refused("not-json.json", "{\"schema_version\": 1,", 4, "cannot read");
+    refused(
+        "huge.json",
+        &" ".repeat(harness_manifest::MANIFEST_MAX_BYTES + 1),
+        4,
+        "larger than the manifest cap",
+    );
+    let o = check(&fx.base.join("absent.json"));
+    assert_eq!(o.code(), Some(4));
+}
+
+/// Every running process's argv, one string per process: `/proc/*/cmdline`
+/// on Linux, `ps` on macOS. A process that exits mid-scan is skipped.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn every_argv() -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .bytes()
+                    .all(|b| b.is_ascii_digit())
+            })
+            .filter_map(|e| std::fs::read(e.path().join("cmdline")).ok())
+            .map(|b| String::from_utf8_lossy(&b).replace('\0', " "))
+            .collect()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let o = Command::new("/bin/ps")
+            .args(["-axww", "-o", "args="])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+/// What one INV-23 scan saw while the harness waited for a reply.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct Scan {
+    /// The canary was in the chat request (so the task was in flight).
+    in_request: bool,
+    /// Every argv that carried the canary.
+    carrying: Vec<String>,
+    /// The running harness was seen: an argv naming the binary and the
+    /// task FILE.
+    harness_seen: bool,
+}
+
+/// INV-23: the task text never reaches an argv. The real binary runs a task
+/// whose text carries a canary, through a tool step, and at EVERY chat
+/// request (the harness is mid-run, waiting for the reply) every process's
+/// argv is read: the canary is in each request, in no argv, and the scan
+/// saw the harness itself. A witness runs first: a process whose argv[0] is
+/// a canary must be found, so the scan is shown able to see one. Named
+/// limit: each scan is a snapshot, so a child that starts and exits between
+/// two scans is covered only by the static half, purity.sh §2f (every spawn
+/// is one of capture.rs's three fixed queries).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn inv_23_the_task_text_reaches_no_argv() {
+    use std::os::unix::process::CommandExt;
+    let fx = fixture("inv23");
+    let canary = format!("TASK-CANARY-{:x}", std::process::id() ^ 0x5eed_1e55);
+    // Witness first (R3 H-04): one process, no shell and no grandchild (a
+    // killed `sh` could leave its `sleep` behind), argv[0] the canary.
+    let witness = format!("{canary}-WITNESS");
+    let mut child = Command::new("/bin/sleep")
+        .arg("30")
+        .arg0(&witness)
+        .spawn()
+        .unwrap();
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    let found = loop {
+        if every_argv().iter().any(|a| a.contains(&witness)) {
+            break true;
+        }
+        if std::time::Instant::now() > until {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(found, "the argv scan cannot see a planted canary");
+
+    std::fs::write(
+        &fx.task,
+        format!(r#"{{"task":"Find {canary} in a.txt","grants":["harness.fs.read"]}}"#),
+    )
+    .unwrap();
+    let task_path = fx.task.to_str().unwrap().to_owned();
+    let scans: Arc<Mutex<Vec<Scan>>> = Arc::new(Mutex::new(Vec::new()));
+    let (s, c, t) = (scans.clone(), canary.clone(), task_path.clone());
+    let m = mock_with(
+        vec![
+            act("harness.fs.read", r#"{"path":"a.txt"}"#),
+            act("harness.task.submit", r#"{"note":"done"}"#),
+        ],
+        move |req| {
+            let argvs = every_argv();
+            s.lock().unwrap().push(Scan {
+                in_request: req.contains(&c),
+                carrying: argvs.iter().filter(|a| a.contains(&c)).cloned().collect(),
+                harness_seen: argvs.iter().any(|a| a.contains(BIN) && a.contains(&t)),
+            });
+        },
+    );
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let o = cli(&run_args(&fx, &ep), false, &fx.marker);
+    assert_eq!(o.code(), Some(5), "{}", String::from_utf8_lossy(&o.stderr));
+    let scans = std::mem::take(&mut *scans.lock().unwrap());
+    // One scan per model call: before the read and after it.
+    assert_eq!(scans.len(), 2);
+    for (i, scan) in scans.iter().enumerate() {
+        assert!(scan.in_request, "scan {i}: the canary was not in flight");
+        assert!(
+            scan.harness_seen,
+            "scan {i}: the running harness was not seen"
+        );
+        assert!(
+            scan.carrying.is_empty(),
+            "scan {i}: argv carries the task text: {:?}",
+            scan.carrying
+        );
+    }
 }

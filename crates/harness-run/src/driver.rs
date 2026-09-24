@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gate_outcome::{Digest, GateOutcome, IndeterminateKind};
+use harness_core::environment::{EnvProbe, EnvSample};
 use harness_core::{
     sha256, BudgetDim, LoopDetector, LoopEvent, LoopKind, LoopSignal, Meter, MeterLimits,
     MonoClock, Nonce, RunId, Source, StopCause, TokenUsage, Untrusted,
@@ -40,7 +41,7 @@ use harness_journal::{
 };
 use harness_journal::{Condition, ConditionKind};
 use harness_manifest::admission::{Registry, Resolved};
-use harness_manifest::Capability;
+use harness_manifest::{builtin, Capability};
 use harness_model::context::{self, ContextError, Fact, FactValue, Feedback, Turn};
 use harness_model::profile::{Profile, Protocol};
 use harness_model::protocol::{self, parse_reply, FormatError};
@@ -57,6 +58,8 @@ use harness_policy::{
 use harness_tools::builtin::{workspace_facts, RootRefused, WorkspaceFacts};
 use harness_tools::{InvokeCtx, ReadTools, ToolProvider, ToolStatus};
 use serde_json::Value;
+
+use crate::sample;
 
 // ---------------------------------------------------------------------------
 // Inputs and outputs.
@@ -124,9 +127,13 @@ pub struct Run<'a> {
     pub profile: &'a Profile,
     /// The model backend.
     pub backend: &'a dyn ModelBackend,
-    /// The filesystem-locality probe (`NoProbe` refuses every state root
-    /// until spike S-F1 lands a real one).
+    /// The filesystem-locality probe (the binary passes
+    /// `harness_sandbox::locality::SystemProbe`; `NoProbe` refuses every
+    /// state root).
     pub probe: &'a dyn LocalityProbe,
+    /// The environment probe (§7.1; the binary passes
+    /// `harness_sandbox::environment::SystemEnv`).
+    pub env: &'a dyn EnvProbe,
     /// Budgets and timeouts.
     pub config: &'a RunConfig,
 }
@@ -201,6 +208,11 @@ pub struct RunReport {
     pub steps: u64,
     /// The journal failure, when there was one.
     pub journal_error: Option<JournalError>,
+    /// Steps whose tool timed out, crashed or could not run (a provider
+    /// failure) while the host was under pressure (§7.1: memory available
+    /// under 5% or load above twice the CPUs), for the report's
+    /// `possibly-environmental` Info finding.
+    pub possibly_environmental: Vec<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +248,8 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         facts,
         limits: &r.config.limits,
         resumed_from: None,
+        environment: r.env.sample(),
+        environment_recorded: false,
     })?;
     let (mut w, attempt) = JournalWriter::create_next_attempt_checked(
         &run_dir,
@@ -263,6 +277,8 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         nonces: NonceSource::default(),
         feed: std::collections::VecDeque::new(),
         reads: ReadLog::default(),
+        env: r.env,
+        pressure: Vec::new(),
     };
     let end = lp.drive(&mut w);
     let released = commit(w, &end, None);
@@ -275,6 +291,7 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
         chain_head: released.chain_head,
         steps: end.step,
         journal_error: released.error,
+        possibly_environmental: lp.pressure,
     })
 }
 
@@ -446,11 +463,17 @@ pub(crate) struct HeaderInputs<'a> {
     /// head, and the wall time carried into this attempt (every earlier
     /// attempt's, in milliseconds).
     pub(crate) resumed_from: Option<(u32, Digest, u64)>,
+    /// The environment sample (§7.1): measured for a live attempt, the
+    /// recorded one for an audit replay.
+    pub(crate) environment: EnvSample,
+    /// Whether `environment` was copied from a recording (an audit replay's
+    /// header) rather than measured here (H1f-3 review F-9).
+    pub(crate) environment_recorded: bool,
 }
 
 /// The header keys an audit replay or a resume recomputes from its own
 /// inputs and requires to be equal to the recorded ones.
-pub(crate) const HEADER_INPUT_KEYS: [&str; 7] = [
+pub(crate) const HEADER_INPUT_KEYS: [&str; 9] = [
     "task",
     "grants",
     "workspace_public",
@@ -458,7 +481,17 @@ pub(crate) const HEADER_INPUT_KEYS: [&str; 7] = [
     "profile",
     "policy",
     "checks",
+    "builtin_manifest",
+    "shell_enabled",
 ];
+
+/// The SHA-256 of the compiled-in manifest (§7.1 header "manifest
+/// SHA-256s": in H1 the built-in provider is the only one admission
+/// accepts). rustc reads CRLF sources as LF, so it is the same digest on
+/// every OS.
+pub(crate) fn builtin_manifest_sha256() -> Digest {
+    sha256(builtin::BUILTIN_MANIFEST_JSON.as_bytes())
+}
 
 pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, RunRefused> {
     let version = Ident::of(env!("CARGO_PKG_VERSION")).ok_or(StartError {
@@ -530,7 +563,29 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, RunRefused> {
                 ),
             ]),
         )
-        .field("checks", Trusted::U64(0));
+        .field("checks", Trusted::U64(0))
+        .field(
+            "builtin_manifest",
+            Trusted::Digest(builtin_manifest_sha256()),
+        )
+        // No execute-class capability exists in H1, so no shell can be on
+        // any exec allowlist (§4.8) and there is no sandbox backend (§6).
+        .field("shell_enabled", Trusted::Bool(false))
+        .field(
+            "sandbox",
+            Trusted::Obj(vec![("backend", Trusted::Text("none"))]),
+        )
+        .field("os", Trusted::Text(std::env::consts::OS))
+        .field("arch", Trusted::Text(std::env::consts::ARCH))
+        .field("environment", sample::to_trusted(&h.environment))
+        .field(
+            "environment_source",
+            Trusted::Text(if h.environment_recorded {
+                "recorded"
+            } else {
+                "measured"
+            }),
+        );
     if let Some((attempt, head, carried_ms)) = h.resumed_from {
         hd = hd.field(
             "resumed_from",
@@ -608,6 +663,10 @@ pub(crate) struct Loop<'a> {
     pub(crate) feed: std::collections::VecDeque<RecordedResult>,
     /// Files read this run and their digests (§2.3 "Stale reads").
     pub(crate) reads: ReadLog,
+    /// Samples the host when a live tool call times out or crashes (§7.1).
+    pub(crate) env: &'a dyn EnvProbe,
+    /// Steps whose tool timed out or crashed under host pressure.
+    pub(crate) pressure: Vec<u64>,
 }
 
 /// Where render nonces come from: recorded ones in order (so a replayed
@@ -634,6 +693,9 @@ pub(crate) struct RecordedResult {
     pub(crate) truncated: bool,
     pub(crate) digest: Digest,
     pub(crate) read_sha256: Option<Digest>,
+    /// The sample recorded with a `timeout`, `crashed` or `provider_error`
+    /// result (§7.1).
+    pub(crate) environment: Option<EnvSample>,
 }
 
 /// The files read this run, with the SHA-256 of each file's whole content
@@ -924,7 +986,9 @@ impl<'a> Loop<'a> {
             deadline: Instant::now() + self.config.tool_call_timeout.min(self.remaining_wall()),
         };
         let provider = capability.id().provider().to_owned();
+        let mut fed_environment = None;
         let result = if let Some(rec) = self.feed.pop_front() {
+            fed_environment = rec.environment;
             // Replaying (audit, or a resume catching up): the recorded
             // result of this very call stands in for running it again. The
             // intent above is journaled all the same, so the replayed
@@ -968,9 +1032,21 @@ impl<'a> Loop<'a> {
                 if let ToolStatus::Error { code } = res.status {
                     ev = ev.field("code", Trusted::U64(u64::from(code)));
                 }
-                if let Some(r) = &res.read {
+                // Only an ok result records a read (the reader refuses a read
+                // digest on anything else; confirming review NF-3).
+                if let (Some(r), ToolStatus::Ok) = (&res.read, res.status) {
                     ev = ev.field("read_sha256", Trusted::Digest(r.sha256));
                     self.reads.record(r.path.as_str(), r.sha256);
+                }
+                // §7.1: a timeout or a crash records the host's condition.
+                // A re-fed result carries the sample recorded with it (a
+                // past host cannot be re-measured).
+                if matches!(res.status, ToolStatus::Timeout | ToolStatus::Crashed { .. }) {
+                    let s = fed_environment.unwrap_or_else(|| self.env.sample());
+                    ev = ev.field("environment", sample::to_trusted(&s));
+                    if s.possibly_environmental() {
+                        self.pressure.push(step);
+                    }
                 }
                 w.append(step, ev).map_err(journal)?;
                 self.detector
@@ -989,11 +1065,18 @@ impl<'a> Loop<'a> {
                 }
             }
             Err(_) => {
+                // A provider failure is the tool-level "could not run"
+                // (§7.1 samples on CouldNotRun; H1f-3 review F-2).
+                let s = fed_environment.unwrap_or_else(|| self.env.sample());
+                if s.possibly_environmental() {
+                    self.pressure.push(step);
+                }
                 w.append(
                     step,
                     Event::new(EventKind::ToolFinished)
                         .field("intent_seq", Trusted::U64(intent_seq))
-                        .field("status", Trusted::Text("provider_error")),
+                        .field("status", Trusted::Text("provider_error"))
+                        .field("environment", sample::to_trusted(&s)),
                 )
                 .map_err(journal)?;
                 Feedback::Harness(HarnessText::from_static(

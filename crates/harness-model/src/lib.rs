@@ -23,8 +23,8 @@
 //! **Blocking, not tokio (for now).** Design §3.2 sketches the client over
 //! tokio because rmcp (H4) needs a runtime. For loopback-only H1 a blocking
 //! client over `std::net` needs no dependency at all, and the trait is
-//! synchronous like `ToolProvider` (H1c); the async decision is H1e's, with
-//! the loop.
+//! synchronous like `ToolProvider` (H1c). H1e decided: both stay synchronous
+//! for H1, and the question returns with rmcp (H4).
 
 #![forbid(unsafe_code)]
 // The panic-set lints ratchet production code; unit tests may assert loosely.

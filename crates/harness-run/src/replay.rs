@@ -53,6 +53,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gate_outcome::{Digest, GateOutcome, IndeterminateKind};
+use harness_core::environment::{EnvProbe, EnvSample, Unmeasured};
 use harness_core::{LoopDetector, MeterLimits, Nonce, RunId};
 use harness_journal::reader::DirBlobSource;
 use harness_journal::writer::SystemClock;
@@ -71,9 +72,14 @@ use harness_tools::{RefusalKind, ToolStatus};
 use serde_json::{Map, Value};
 
 use crate::driver::{
-    attempt_check, commit, facts_block, header, new_meter, new_meter_resumed, plan, prepare,
-    HeaderInputs, Loop, NonceSource, ReadLog, RecordedResult, HEADER_INPUT_KEYS,
+    attempt_check, builtin_manifest_sha256, commit, facts_block, header, new_meter,
+    new_meter_resumed, plan, prepare, HeaderInputs, Loop, NonceSource, ReadLog, RecordedResult,
+    HEADER_INPUT_KEYS,
 };
+use crate::sample;
+
+/// The audit's probe: a replay never measures a host.
+const NOT_SAMPLED: EnvSample = EnvSample::unmeasured(Unmeasured::NotSampled);
 use crate::{RunConfig, RunRefused, RunReport, TaskSpec};
 
 // ---------------------------------------------------------------------------
@@ -178,6 +184,21 @@ fn recorded(
                 } else {
                     (Vec::new(), false, harness_core::sha256(b""))
                 };
+                // §7.1: exactly the timeout, crashed and provider-failure
+                // (None) results carry a sample, in exactly the shape the
+                // loop writes; only an ok read carries a read digest.
+                let sampled = matches!(
+                    status,
+                    None | Some(ToolStatus::Timeout | ToolStatus::Crashed { .. })
+                );
+                if r.body.contains_key("read_sha256") && status != Some(ToolStatus::Ok) {
+                    return Err(bad());
+                }
+                let environment = match (sampled, r.body.get("environment")) {
+                    (true, Some(v)) => Some(sample::from_value(v).ok_or_else(bad)?),
+                    (false, None) => None,
+                    _ => return Err(bad()),
+                };
                 feed.push_back(RecordedResult {
                     capability: cap,
                     status,
@@ -185,6 +206,7 @@ fn recorded(
                     truncated,
                     digest,
                     read_sha256: digest_at(&r.body, "read_sha256"),
+                    environment,
                 });
             }
             _ => {}
@@ -239,20 +261,40 @@ fn expected_inputs(
     );
     m.insert("policy".into(), Value::from(policy.digest().to_string()));
     m.insert("checks".into(), Value::from(0u64));
+    m.insert(
+        "builtin_manifest".into(),
+        Value::from(builtin_manifest_sha256().to_string()),
+    );
+    m.insert("shell_enabled".into(), Value::Bool(false));
     m
 }
 
 fn check_header(recorded: &Record, expected: &Map<String, Value>) -> Result<(), Divergence> {
     for k in HEADER_INPUT_KEYS {
         if recorded.body.get(k) != expected.get(k) {
-            return Err(diverge(
-                0,
-                0,
-                "the task, grants, profile or policy given differ from the recorded header",
-            ));
+            return Err(diverge(0, 0, header_mismatch(k)));
         }
     }
     Ok(())
+}
+
+/// What a differing header input means (H1f-3 review F-5): most are the
+/// caller's inputs; `builtin_manifest` and `shell_enabled` belong to the
+/// harness build, so a journal written by another build (every journal
+/// from before H1f-3 included) cannot be audited or resumed by this one.
+fn header_mismatch(key: &str) -> &'static str {
+    match key {
+        "task" => "the task given differs from the recorded header",
+        "grants" => "the grants given differ from the recorded header",
+        "workspace_public" => "the workspace declaration differs from the recorded header",
+        "protocol" | "profile" => "the profile given differs from the recorded header",
+        "policy" => "the policy given differs from the recorded header",
+        "checks" => "the verification plan differs from the recorded header",
+        "builtin_manifest" | "shell_enabled" => {
+            "another harness build wrote this journal (its built-in manifest or shell setting differs)"
+        }
+        _ => "a header input differs from the recorded header",
+    }
 }
 
 fn recorded_facts(h: &Record) -> Option<WorkspaceFacts> {
@@ -524,9 +566,17 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
     ) {
         return Ok(failed(d, None));
     }
-    let (Some(facts), Some(limits)) = (recorded_facts(head), recorded_limits(head)) else {
+    let (Some(facts), Some(limits), Some(environment)) = (
+        recorded_facts(head),
+        recorded_limits(head),
+        head.body.get("environment").and_then(sample::from_value),
+    ) else {
         return Ok(failed(
-            diverge(0, 0, "the header lacks the workspace facts or the limits"),
+            diverge(
+                0,
+                0,
+                "the header lacks the workspace facts, the limits or the environment sample",
+            ),
             None,
         ));
     };
@@ -546,6 +596,10 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
         facts,
         limits: &limits,
         resumed_from: None,
+        // The replay journal repeats the recorded sample, marked as such:
+        // a past host cannot be re-measured, and the header is not compared.
+        environment,
+        environment_recorded: true,
     })
     .map_err(AuditRefused::Plan)?;
     let (mut w, replay_dir) = JournalWriter::create_replay(&run_dir, a.run.clone(), attempt, hdr)
@@ -579,6 +633,12 @@ pub fn audit(a: Audit<'_>) -> Result<AuditReport, AuditRefused> {
         },
         feed: rec.feed,
         reads: ReadLog::default(),
+        // No provider runs in an audit: a recorded result is re-fed with its
+        // recorded sample. A step with no recorded result (an intent a crash
+        // cut) ends as a provider failure, whose sample says it was not
+        // sampled rather than borrowing the header's (confirming NF-1).
+        env: &NOT_SAMPLED,
+        pressure: Vec::new(),
     };
     let end = lp.drive(&mut w);
     let released = commit(w, &end, None);
@@ -680,6 +740,8 @@ pub struct Resume<'a> {
     pub backend: &'a dyn ModelBackend,
     /// The locality probe.
     pub probe: &'a dyn LocalityProbe,
+    /// The environment probe (§7.1).
+    pub env: &'a dyn EnvProbe,
     /// Budgets and timeouts (the recorded limits apply; timeouts from here).
     pub config: &'a RunConfig,
 }
@@ -719,7 +781,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         head,
         &expected_inputs(r.spec, r.registry, r.policy, r.profile),
     )
-    .map_err(|_| nope("the task, grants, profile or policy differ from the recorded run"))?;
+    .map_err(|d| nope(d.why))?;
     if recorded_facts(head).map(|f| f.tree) != Some(pre.facts.tree) {
         return Err(nope(
             "the workspace changed since the attempt, and an H1 run keeps no snapshot to restore",
@@ -763,6 +825,8 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         facts: pre.facts,
         limits: &limits,
         resumed_from: Some((n, v.head, carried_ms)),
+        environment: r.env.sample(),
+        environment_recorded: false,
     })?;
     let (mut w, attempt) = JournalWriter::create_next_attempt_checked(
         &run_dir,
@@ -802,6 +866,8 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         },
         feed: rec.feed,
         reads: ReadLog::default(),
+        env: r.env,
+        pressure: Vec::new(),
     };
     let end = lp.drive(&mut w);
     let outcome = chain.diverged.get().then_some(UNREADABLE);
@@ -815,5 +881,6 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         chain_head: released.chain_head,
         steps: end.step,
         journal_error: released.error,
+        possibly_environmental: lp.pressure,
     })
 }

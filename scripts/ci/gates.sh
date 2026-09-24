@@ -12,7 +12,7 @@ cd "$(dirname "$0")/../.."
 printf '=== 1/5 cargo fmt --all --check ===\n'
 cargo fmt --all --check
 
-printf '=== 2/5 purity (dep shape, pure-content, INV-28) ===\n'
+printf '=== 2/5 purity (dep shape, pure-content, INV-23, INV-28) ===\n'
 sh scripts/ci/purity.sh
 printf '%s\n' '--- purity refusal witnesses (planted violations must be refused) ---'
 sh scripts/ci/purity-selftest.sh
@@ -22,13 +22,18 @@ cargo deny check advisories bans licenses sources
 
 printf '=== 4/5 cargo clippy --workspace --all-targets -- -D warnings ===\n'
 cargo clippy --locked --workspace --all-targets -- -D warnings
-printf '%s\n' '--- clippy again with gate-outcome/json (the §6 wire types must compile in CI too) ---'
-cargo clippy --locked --workspace --all-targets --features gate-outcome/json -- -D warnings
+# Every workspace build has gate-outcome/json on: harness-cli enables it and
+# features unify across --workspace (since H1e-2b), so the §6 wire types are
+# always built above. What a workspace build never sees is gate-outcome's
+# zero-dependency default (design §1.2), so it is built alone (H1f-1 review
+# F-1).
+printf '%s\n' '--- clippy on gate-outcome alone, without its json feature ---'
+cargo clippy --locked -p gate-outcome --all-targets -- -D warnings
 
 printf '=== 5/5 cargo test --workspace ===\n'
-cargo test --locked --workspace
-printf '%s\n' '--- tests again with gate-outcome/json ---'
-cargo test --locked --workspace --features gate-outcome/json
+cargo test --locked --workspace --no-fail-fast
+printf '%s\n' '--- tests on gate-outcome alone, without its json feature ---'
+cargo test --locked -p gate-outcome --no-fail-fast
 printf '%s\n' '--- compile-fail doctests with their expected error codes enforced ---'
 # Stable rustdoc accepts `compile_fail,E0451` but checks the code only when
 # it believes it is a nightly build; RUSTC_BOOTSTRAP=1 turns that check on
