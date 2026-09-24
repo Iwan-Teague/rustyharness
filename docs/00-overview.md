@@ -27,6 +27,8 @@ Name and placement: [ADR-0001](adr/0001-name-and-placement.md).
 
 **Standalone first** ([ADR-0002](adr/0002-standalone-first.md), owner-decided): anyone can use rustyharness with their own agent and model and nothing else from rustysuite. Everything rustysuite-specific in this document (§2's suite uses, suite app adapters, suitectl, gates, the mesh) is an optional add-on, off unless enabled. The security defaults in §3 apply to every user.
 
+**The goal in the wild** (owner, 2026-09-24; design OD-1): on its own, rustyharness aims to do what a general coding agent such as opencode or Cline does: read and edit code, run the toolchain, fetch crates and documentation online, open ports on the device. Every action needs the user's permission and runs inside confinement. Apps that embed it narrow it through their own configuration; the harness holds no app-specific code (design OD-2).
+
 ## 2. Where it is used in the suite (candidates — to be confirmed by research)
 
 These are the suite's uses. The first user is anyone with an agent and a model, using none of them.
@@ -35,7 +37,7 @@ These are the suite's uses. The first user is anyone with an agent and a model, 
 |---|---|---|---|
 | U1 | **Suite development** | Takes a task (an action-queue row, a review finding), works in an isolated worktree, runs the member's gates through `suitectl`, delivers a patch with evidence | `charter/design/component-d-agent-harness-DRAFT.md`, `suite-dev-engine-plan-v1.md` §6 (component D), `suite-engine-v2-rust.md` |
 | U2 | **Design and review fleet** | Authors designs and — as a *separate, independent* agent — reviews them. Replaces today's opencode + bash supervisor fleet | the fleet's own failure history (docs/research, lane ah02) |
-| U3 | **rustybenchmark Agentic board** | Enters as one pinned, versioned harness so the benchmark measures which model works best in the suite's own harness on each machine | `projects/rustybenchmark/docs/15-profiles-and-divisions.md` §3.4 |
+| U3 | **rustybenchmark Agentic board** | Enters as one pinned, versioned harness so the benchmark measures which model works best in the suite's own harness on each machine. The benchmark embeds `harness-run` with its own locked-down configuration (policy, an empty provider registry, its profile, optionally its own `ModelBackend`), and grades and measures outside the harness. No benchmark code lives in the harness (owner, 2026-09-24; design OD-2, OD-3) | `projects/rustybenchmark/docs/15-profiles-and-divisions.md` §3.4 |
 | U4 | **Operating the suite** | A local admin assistant: check a rustynet node, read a rustydns zone, verify backups — through each app's declared capabilities | owner direction (local admin-assistant model) |
 | U5 | **Assistants inside apps** | rustyfin's grounded AI assistant; the personal-data app's ask-model features — each app uses the harness instead of building its own loop | `projects/rustyfin/docs/plans/2026-03-15-ai-grounded-tools-architecture.md`, suite design notes |
 
@@ -56,6 +58,13 @@ Constraint on U5: the personal-data app currently makes ask-model un-grantable b
 10. **Secrets stay out of the model's context.** Key material reaches tools, never the prompt. Standalone, through the harness's own secret handling; with the suite add-on, through rustyvault's consumer seam (`charter/design/vault-consumer-seam-rust-v0.1.md`).
 11. **Resumable and replayable** from the journal.
 
+Added by the owner on 2026-09-24 (design OD-5; required, not yet designed):
+
+12. **Ports with permission.** An agent can run and test a server it builds: granted loopback ports, never the model server's; a port visible on the network is a separate, higher-risk grant.
+13. **Background processes.** Start, read output, stop; all killed when the run ends.
+14. **Embedder-supplied confinement inputs.** Extra read-only roots (e.g. a local crate registry, a pre-built build cache), a writable build directory outside the workspace, and environment and cargo configuration.
+15. **Cleanup that keeps the evidence.** `gc` removes a finished run's workspace, grading and scratch directories and keeps its journal and snapshots.
+
 ## 4. Modularity: how future apps slot in without a redesign
 
 The working idea (now manifest v1 in `crates/harness-manifest`; design §4):
@@ -73,6 +82,7 @@ Open: the wire protocol. Options: a suite-native protocol, MCP (Model Context Pr
 - No hosted model by default.
 - No irreversible action without a human yes.
 - Not a chat app at first; a user-facing assistant can be built on top later.
+- No grading or measuring for an embedding app: an app such as rustybenchmark does that itself (owner, 2026-09-24; design OD-3).
 
 ## 6. Open questions
 
