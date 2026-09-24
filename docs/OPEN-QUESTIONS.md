@@ -1,22 +1,77 @@
 # Open questions
 
-Owner decisions are marked **(owner)**; the rest are design questions the
-research pipeline and v0.1 design must answer.
+Owner decisions are marked **(owner)**. The design
+([01-design-v0.1.md](01-design-v0.1.md), v0.2, reviewed SOUND) answers most of the
+questions the project started with; each is kept here with where it was answered,
+so the history stays readable. What is still open is listed first.
 
-1. **Wire protocol for app capabilities:** suite-native, MCP, or native with an MCP bridge? MCP's security criticisms (tool poisoning, confused deputy) vs its ecosystem.
-2. **Tool calling with small local models:** native tool calls vs a text protocol with grammar-constrained decoding. Which is more reliable, and on which models?
-3. **Edit format** for code changes (unified diff, search/replace, whole file) — measured failure rates, and how the harness validates a patch before calling it delivered.
-4. **Reuse vs write:** existing Rust agent/MCP crates (licences, maturity, C dependencies) vs our own.
-5. **Shared crates with rustybenchmark:** the sandbox and the model client exist there. Shared crate, dependency, or copy?
-6. **Hosted models (owner):** allowed at all? Opt-in per run? Never for some apps (the personal-data app)?
-7. ~~**Membership (owner)**~~ — **decided 2026-09-23:** present-non-member dev/ops tool until the design is SOUND (ADR-0002).
-8. ~~**Licence (owner)**~~ — **decided 2026-09-23:** PolyForm Noncommercial 1.0.0, source-available (ADR-0003).
-9. **Where the admin assistant ends:** which operations are ever automatic, and which always need a human yes?
-10. **Remote model hosts over rustynet:** a GPU box on the mesh serving the model to a laptop — in scope for v1?
-11. ~~**rustyharness vs the charter's "rustyai" (owner)**~~ — **decided 2026-09-23: separate, standalone-first** (ADR-0002). Original question: the charter already names rustyai as the confined AI over personal data (the personal-data app's router, maximal-sensitivity floor). Is rustyharness the runtime rustyai is built on, or a separate dev/ops tool that never touches personal data? The answer decides which security floor applies to which parts.
-12. **Confinement mode (owner, suite OI-24):** separate OS account, VM/container, or interim only. The harness's execution design depends on it; the suite's confinement design v0.2 (reviewed SOUND) lists the properties P1-P8 any agent runtime must have.
-13. **Local-only vs cloud models:** the existing in-suite agent tooling (rustynet-mcp ai-agent, rustyfin ai-agent) is cloud-capable or cloud-first; the Component D draft says local only. The harness needs one stated egress posture.
-14. **Reuse rustyfin's assistant tool contract?** It is the most mature in-suite pattern (per-tool access mode, risk tier, confirmation policy, six-layer permission check, confirmation tokens; MIT) — but the proposed membership ADR would archive rustyfin.
-15. **How suite add-ons are packaged** without a hard suite dependency: cargo features, runtime-loaded adapters (manifest + MCP server), or both?
-16. **The shared gate-outcome type as a standalone crate:** the suite has one outcome type; rustyharness must use it without depending on the suite. Publish `gate-outcome` standalone (licence permitting, suite OI-05), or a mirrored type with a conformance test?
-17. **Carried from the scaffold review (REVIEW-rustyharness-scaffold-2026-09-23, design notes for v0.1):** F4 — `Message.content` must be `Untrusted<String>` for model and tool roles so the trust marking survives the loop boundary; F5 — `Containment::Available` must be unnameable without evidence (a token only a conformance-passing backend can mint, per UNIFIED's witness pattern); F10 — split CLI exit codes (usage vs unreadable input) and adopt the suite child-report protocol before emitting verdicts; F11 — journal: a home for untrusted payloads and a type-level append-only guarantee; F13 — refuse duplicate JSON keys in manifests (serde keeps the last).
+## Still open
+
+1. **(owner) The design's owner questions** (§11), each with the fail-closed default
+   that holds until answered:
+   1. `gate-outcome`'s licence: does ADR-0003 cover it, or is it a recorded
+      exception? *Default:* PolyForm Noncommercial.
+   2. May a hosted model ever see `personal` data? *Default:* no.
+   3. May the harness ever hold `restricted` capabilities? *Default:* refused (INV-27).
+   4. Windows in v1? *Default:* read-only unless spike S-W1 passes; today every
+      Windows `state_root` is refused until S-W1 (design row H1f-1).
+   5. Reviewer independence bar? *Default:* fresh context and distinct run always; a
+      distinct model when two or more are configured.
+   6. Concurrency per model endpoint? *Default:* 1 for loopback.
+   7. When to invest in a trifecta-breaking architecture? *Default:* never combine;
+      revisit after H4.
+   8. macOS if `sandbox-exec` disappears? *Default:* macOS execution refuses.
+2. **(owner) Should audit replay check `state_root` locality?** `rustyharness replay`
+   writes `runs/<run-id>/replay-<k>/` under `state_root` without the locality check
+   `run` applies (INV-35), so on Windows it writes where `run` refuses. Checking would
+   make replay refuse on Windows until S-W1 too (design row H1f-1).
+3. **The H1 phase-exit review** (§9): every H1 slice has been reviewed; the phase
+   itself has not.
+
+## Answered by the design
+
+1. **Wire protocol for app capabilities** — MCP on the wire (rmcp, stdio), with a
+   capability manifest v1 as the trust root; server self-description is ignored for
+   policy (D7, §4, §4.6).
+2. **Tool calling with small local models** — both native tool calls and a text
+   protocol, chosen per model profile (D6, §3.3); grammar-constrained decoding waits
+   on spike S-P1 and safety never depends on it.
+3. **Edit format** — exact search/replace (unique match) or whole-file write, applied
+   in process with a stale-read check and post-apply verification; never `git apply`
+   (D9, §4.9; H2).
+4. **Reuse vs write** — the model client is the harness's own (a small HTTP/1.1
+   client over `std::net`, no TLS in the default build; §3.2, design row H1d); MCP
+   uses rmcp (§4.5, H4).
+5. **Shared crates with rustybenchmark** — the sandbox backends and the conformance
+   corpus are proposed as the shared crates; the harness takes no dependency on the
+   benchmark (§6.3).
+6. **Hosted models** — off in the default build (feature `hosted`), opt-in per run,
+   never across privacy classes; the remaining owner question is item 1.2 above
+   (§3.2, §5.4).
+7. ~~**Membership (owner)**~~ — decided 2026-09-23: present-non-member dev/ops tool
+   until the design is SOUND (ADR-0002).
+8. ~~**Licence (owner)**~~ — decided 2026-09-23: PolyForm Noncommercial 1.0.0,
+   source-available (ADR-0003).
+9. **Where the admin assistant ends** — irreversible or shared-scope operations are
+   never automatic; the default policy table says what is (§5.2).
+10. **Remote model hosts over rustynet** — a suite add-on (a mesh model transport),
+    not core (§8).
+11. ~~**rustyharness vs the charter's "rustyai" (owner)**~~ — decided 2026-09-23:
+    separate, standalone-first (ADR-0002).
+12. **Confinement mode** — per-OS in-process backends gated by a conformance token:
+    namespaces + Landlock + seccomp on Linux, deny-default Seatbelt on macOS,
+    AppContainer + Job Object on Windows (D12, §6); a separate OS account per agent
+    is the suite's host-level control (§8).
+13. **Local-only vs cloud models** — local first: loopback by default, hosted only by
+    feature and per-run opt-in (§3.2, §5.4).
+14. **Reuse rustyfin's assistant tool contract** — its confirmation-token pattern is
+    lifted clean-room, with no code dependency (§5.3).
+15. **How suite add-ons are packaged** — runtime-loaded providers (manifest + MCP
+    server), plus a few `addon-*` cargo features for what must be in process (§8).
+16. **The shared gate-outcome type** — one standalone crate both consume, moving to
+    its own repository before H3 exits (§1.4); its licence is item 1.1 above.
+17. **Scaffold review design notes** — F4 (`Message` trust marking, done in H1d),
+    F5 (`Containment::Available` needs a `Conformed` token, H2, §6.1), F10 (split CLI
+    exit codes and the child-report protocol, done in H1e-2b, §7.7), F11 (journal
+    untrusted payloads and type-level append-only, done in H1c), F13 (duplicate JSON
+    keys refused, done in H1b).

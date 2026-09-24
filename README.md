@@ -13,45 +13,95 @@ The model is a swappable part. The harness is what makes an agent reliable.
 
 ## Status
 
-**Scaffold — design phase (2026-09-23).** Nothing executes yet. The crates encode
-only the rules already settled by reviewed suite designs:
+**H1, the read-only agent, is built; its phase-exit review is next** (design
+[§9](docs/01-design-v0.1.md)). What works today:
 
-- **No sandbox, no execution.** `rustyharness sandbox` refuses on every platform until a backend passes conformance.
-- **Tool output is data.** Everything from outside the trust boundary is `Untrusted`, with no `Deref` and no content in `Debug`.
-- **Apps plug in through versioned capability manifests.** Unknown fields, schema versions and namespaces are refused.
-- **No private outcome type.** Run results will use the suite's single gate-outcome type.
+- **A read-only agent loop** against a model served on loopback
+  (`http://127.0.0.1`, `[::1]` or `localhost`; OpenAI-compatible, e.g. llama.cpp),
+  with native tool calls or a text action protocol, hard budgets, loop detection,
+  and three read tools confined to a workspace (`harness.fs.read`, `.search`,
+  `.list`).
+- **Evidence, not claims.** Every run writes a hash-chained, write-ahead journal;
+  `replay` recomputes every record of a run or names the first divergence;
+  `resume` continues an interrupted run in a new attempt.
+- **No run can pass yet.** Checks arrive in H3, so every run ends
+  `Indeterminate { NothingChecked }` (exit 5), whatever the agent says.
+- **No sandbox, no execution.** No backend has passed conformance, so no execute
+  capability can be granted and `rustyharness sandbox` refuses (H2).
+- **Local disks only.** A `state_root` must be on a filesystem positively
+  identified as local; on Windows every one is refused until spike S-W1, so runs
+  work on Linux and macOS.
+
+Invariants that hold throughout: tool and model output is `Untrusted` data;
+capability manifests are versioned, strictly parsed and refused when unknown;
+there is exactly one outcome type (`gate-outcome`).
 
 ## Layout
 
 ```
 crates/
-  harness-core      Untrusted<T>, budgets                        (pure, no I/O)
-  harness-model     ModelBackend trait — the model is swappable
-  harness-manifest  capability manifest v1: schema, validation, admission (pure)
-  harness-tools     the ToolProvider seam and the built-in read tools
-  harness-sandbox   fail-closed confinement (no backend yet → refuses)
-  harness-journal   append-only run evidence
-  harness-cli       the `rustyharness` binary
-adapters/           fixtures only: an example v1 manifest (providers ship their own)
-docs/               overview, ADRs, open questions, research pipeline
-scripts/ci/gates.sh the member gate entrypoint (fmt, deny, clippy, test)
+  gate-outcome        the one outcome type: GateOutcome, reports, verdict()  (pure, std-only)
+  harness-core        Untrusted<T>, the meter, loop detection, SHA-256, strict JSON (pure)
+  harness-manifest    capability manifest v1: schema, validation, admission  (pure)
+  harness-policy      effective classes, decisions, the trifecta, locality   (pure)
+  harness-model-core  messages, action protocols, profiles, context builder  (pure)
+  harness-model       the loopback HTTP client, replay and scripted backends
+  harness-tools       the ToolProvider seam and the built-in read tools
+  harness-journal     the append-only, hash-chained run journal
+  harness-sandbox     fail-closed confinement; locality and environment probes
+  harness-run         the run driver: loop, audit replay, resume
+  harness-cli         the `rustyharness` binary
+adapters/             fixtures only: an example v1 manifest (providers ship their own)
+docs/                 overview, design, ADRs, open questions, research
+scripts/ci/gates.sh   the member gate entrypoint (fmt, purity, deny, clippy, test)
 ```
+
+## Try it
 
 ```bash
 cargo test --workspace
 cargo run -p harness-cli -- manifest check adapters/example/manifest.json
-cargo run -p harness-cli -- sandbox
+cargo run -p harness-cli -- sandbox            # refuses: no confinement yet
 ```
+
+A run needs a task, a model profile (`model` is the id the server lists) and a model
+server on loopback:
+
+```json
+{"task": "What is the codename in notes.txt?", "grants": ["harness.fs.read", "harness.fs.list"]}
+```
+
+```json
+{"profile_version": 1, "id": "my-model", "model": "my-model",
+ "context_window": 32768, "fill_ratio": 0.6, "protocol": "text",
+ "tool_choice_required_ok": false, "grammar": "none", "max_active_tools": 6,
+ "edit_format": "replace", "recent_turns": 5,
+ "sampling": {"temperature": 0.2, "top_p": 0.95, "seed": 7, "max_tokens": 2048}}
+```
+
+```bash
+rustyharness run --task task.json --profile profile.json \
+  --workspace <dir> --state-root <dir outside the workspace> \
+  --endpoint http://127.0.0.1:8080/v1
+rustyharness replay --run <run id> --task task.json --profile profile.json \
+  --state-root <same dir> --anchor <the chain_head line run printed>
+```
+
+`rustyharness` with no arguments prints every verb. The last stdout line of
+`run`, `resume` and `replay` is a JSON `GateReport` and the exit code agrees with
+it (design §7.7). `rustyharness profile check` scores a model on a smoke eval and
+prints a stamp for its profile.
 
 ## Read order
 
 1. [docs/00-overview.md](docs/00-overview.md) — what it is, where it is used, what it must do, how apps slot in
-2. [docs/01-design-v0.1.md](docs/01-design-v0.1.md) — the v0.1 design (draft, under review)
+2. [docs/01-design-v0.1.md](docs/01-design-v0.1.md) — the design (v0.2, reviewed SOUND); "Changes since v0.2" records every H1 slice
 3. [ADR-0001 name and placement](docs/adr/0001-name-and-placement.md), [ADR-0002 standalone first](docs/adr/0002-standalone-first.md), [ADR-0003 licence](docs/adr/0003-licence.md)
 4. [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md)
-5. [docs/research/README.md](docs/research/README.md) — the research pipeline feeding the v0.1 design
+5. [docs/research/README.md](docs/research/README.md) — the research pipeline that fed the design
 
-Portable by design: CI runs every gate on macOS, Linux and Windows.
+Portable by design: CI runs `scripts/ci/gates.sh` on Linux and macOS and every
+cargo step of it on Windows.
 
 ## Licence
 
@@ -61,4 +111,3 @@ any noncommercial purpose — personal, hobby, research, education, charities, p
 bodies. **Commercial use requires a separate licence from the author**; ask through
 the GitHub profile that owns this repository. See
 [ADR-0003](docs/adr/0003-licence.md) for why this is not an OSI open-source licence.
-
