@@ -27,7 +27,6 @@ harness-manifest = { path = "../harness-manifest" }
 harness-model = { path = "../harness-model" }
 harness-policy = { path = "../harness-policy" }
 harness-run = { path = "../harness-run" }
-harness-tools = { path = "../harness-tools" }
 harness-sandbox = { path = "../harness-sandbox" }
 serde.workspace = true
 serde_json.workspace = true

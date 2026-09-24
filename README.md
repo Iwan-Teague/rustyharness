@@ -27,11 +27,12 @@ only the rules already settled by reviewed suite designs:
 crates/
   harness-core      Untrusted<T>, budgets                        (pure, no I/O)
   harness-model     ModelBackend trait — the model is swappable
-  harness-tools     capability manifest schema + content validation
+  harness-manifest  capability manifest v1: schema, validation, admission (pure)
+  harness-tools     the ToolProvider seam and the built-in read tools
   harness-sandbox   fail-closed confinement (no backend yet → refuses)
   harness-journal   append-only run evidence
   harness-cli       the `rustyharness` binary
-adapters/           one directory per suite app: its capability manifest
+adapters/           fixtures only: an example v1 manifest (providers ship their own)
 docs/               overview, ADRs, open questions, research pipeline
 scripts/ci/gates.sh the member gate entrypoint (fmt, deny, clippy, test)
 ```

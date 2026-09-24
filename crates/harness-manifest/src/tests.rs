@@ -69,38 +69,95 @@ fn dimension_names_are_the_wire_names() {
             "{name}"
         );
     }
-    for e in [
+    // Each list sits behind a wildcard-free match: a new variant does not
+    // compile until it has an arm here, next to the list it must join.
+    let effects = [
         Effect::Read,
         Effect::Write,
         Effect::Execute,
         Effect::Irreversible,
-    ] {
-        wire(e, e.as_str());
-    }
-    for s in [
+    ];
+    let _ = |e: Effect| match e {
+        Effect::Read | Effect::Write | Effect::Execute | Effect::Irreversible => (),
+    };
+    let sensitivities = [
         Sensitivity::Public,
         Sensitivity::Operational,
         Sensitivity::Personal,
         Sensitivity::Restricted,
-    ] {
-        wire(s, s.as_str());
-    }
-    for b in [BlastRadius::Own, BlastRadius::Host, BlastRadius::Shared] {
-        wire(b, b.as_str());
-    }
-    for g in [Egress::None, Egress::Lan, Egress::Internet] {
-        wire(g, g.as_str());
-    }
-    for c in [Content::Own, Content::ThirdParty] {
-        wire(c, c.as_str());
-    }
-    for c in [
+    ];
+    let _ = |s: Sensitivity| match s {
+        Sensitivity::Public
+        | Sensitivity::Operational
+        | Sensitivity::Personal
+        | Sensitivity::Restricted => (),
+    };
+    let blasts = [BlastRadius::Own, BlastRadius::Host, BlastRadius::Shared];
+    let _ = |b: BlastRadius| match b {
+        BlastRadius::Own | BlastRadius::Host | BlastRadius::Shared => (),
+    };
+    let egresses = [Egress::None, Egress::Lan, Egress::Internet];
+    let _ = |g: Egress| match g {
+        Egress::None | Egress::Lan | Egress::Internet => (),
+    };
+    let contents = [Content::Own, Content::ThirdParty];
+    let _ = |c: Content| match c {
+        Content::Own | Content::ThirdParty => (),
+    };
+    let confirmations = [
         Confirmation::None,
         Confirmation::UserConfirm,
         Confirmation::ProtectedAction,
-    ] {
+    ];
+    let _ = |c: Confirmation| match c {
+        Confirmation::None | Confirmation::UserConfirm | Confirmation::ProtectedAction => (),
+    };
+    for e in effects {
+        wire(e, e.as_str());
+    }
+    for s in sensitivities {
+        wire(s, s.as_str());
+    }
+    for b in blasts {
+        wire(b, b.as_str());
+    }
+    for g in egresses {
+        wire(g, g.as_str());
+    }
+    for c in contents {
         wire(c, c.as_str());
     }
+    for c in confirmations {
+        wire(c, c.as_str());
+    }
+}
+
+/// H1f-2 review F-1: text from a refused manifest reaches a terminal only
+/// escaped. Unknown field names, unknown enum values and the keys on a
+/// null value's path are all chosen by the manifest's author.
+#[test]
+fn refusals_never_carry_raw_control_or_bidi_characters() {
+    let hostile = "\u{1b}[1A\u{1b}[2K\rOK forged \u{202e}\u{7}\u{2028}";
+    // serde_json writes the text escaped, so the strict reader accepts the
+    // JSON and the raw characters reach the refusal paths.
+    let mut unknown_field = fixture();
+    unknown_field[hostile] = json!(1);
+    let mut unknown_value = fixture();
+    cap0(&mut unknown_value)["effect"] = json!(hostile);
+    let mut null_key = fixture();
+    cap0(&mut null_key)["input_schema"]["properties"][hostile] = Value::Null;
+    for v in [unknown_field, unknown_value, null_key] {
+        let e = parse_v(&v).unwrap_err().to_string();
+        assert!(
+            !e.chars().any(|c| c.is_control()
+                || is_invisible_or_bidi(c)
+                || matches!(c, '\u{2028}' | '\u{2029}')),
+            "{e:?}"
+        );
+        assert!(e.contains("\\u{1B}"), "the ESC is shown escaped: {e}");
+    }
+    assert_eq!(display_safe("a\\b", 80), "a\\\\b");
+    assert_eq!(display_safe("abcdef", 3), "abc");
 }
 
 #[test]

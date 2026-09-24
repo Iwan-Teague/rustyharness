@@ -54,7 +54,7 @@ Constraint on U5: the personal-data app currently makes ask-model un-grantable b
 
 ## 4. Modularity: how future apps slot in without a redesign
 
-The working idea (implemented only as a schema in `crates/harness-tools`):
+The working idea (now manifest v1 in `crates/harness-manifest`; design §4):
 
 - **Each tool provider ships a versioned capability manifest** — rustysuite apps are the first providers, not the only ones (`adapters/<app>/manifest.json`): capability ids namespaced under the app (`rustydns.zone.read`), a human summary, and an **effect class** (`read`, `write`, `execute`, `irreversible`).
 - **The core knows effect classes, never apps.** Policy, approval and confinement are written against effect classes, so adding an app adds a manifest and an adapter — no core change.

@@ -620,9 +620,11 @@ fn replay_of_a_forged_wall_stop_is_unreadable_evidence_with_a_named_finding() {
 
 /// INV-1 / INV-22 through the CLI: `manifest check` is the v1 admission
 /// parser, not the scaffold's v0 one it used to be. The example validates,
-/// with each capability's effective class and what this build's admission
-/// does with it; v0, a reserved namespace, a duplicate key and an oversized
-/// file are refused; an unreadable file is exit 4.
+/// with each capability's class and what this build's admission would do
+/// with it; v0, a reserved namespace, duplicate keys (top level and nested)
+/// are refused (exit 1); a file that is not a JSON document at all, or is
+/// too large or missing, is unreadable (exit 4). Refusals never put a raw
+/// control or bidi character on the terminal (H1f-2 review F-1).
 #[test]
 fn inv_1_manifest_check_is_the_v1_admission_parser() {
     let fx = fixture("manifest-check");
@@ -643,28 +645,39 @@ fn inv_1_manifest_check_is_the_v1_admission_parser() {
         "{out}"
     );
     assert!(out.contains("example.config.set: effect write, sensitivity operational, blast own, egress none, content own; confirmation user_confirm"), "{out}");
-    // Valid is not admitted: external providers are H4 (§4.4).
     assert!(
-        out.contains("admission as a pinned provider in this build: refused"),
+        out.contains("started only inside a conformed sandbox"),
         "{out}"
     );
+    // Valid is not admitted: external providers are H4 (§4.4).
+    assert!(out.contains("this build would refuse it"), "{out}");
     assert!(out.contains("arrives in H4"), "{out}");
 
     let text = std::fs::read_to_string(&example).unwrap();
-    let refused = |name: &str, body: &str, why: &str| {
+    let write = |name: &str, body: &str| {
         let p = fx.base.join(name);
         std::fs::write(&p, body).unwrap();
-        let o = check(&p);
-        let err = String::from_utf8_lossy(&o.stderr);
-        assert_eq!(o.code(), Some(1), "{name}: {err}");
+        p
+    };
+    let refused = |name: &str, body: &str, want_code: i32, why: &str| {
+        let o = check(&write(name, body));
+        let err = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert_eq!(o.code(), Some(want_code), "{name}: {err}");
+        assert!(err.contains(why), "{name}: {err}");
+        // Nothing from the manifest reaches the terminal raw: one line, no
+        // other control character, no bidi or zero-width code point.
+        let body = err.strip_suffix('\n').unwrap_or(&err);
         assert!(
-            err.contains("REFUSED") && err.contains(why),
-            "{name}: {err}"
+            !body.chars().any(|c| c.is_control()
+                || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{2028}' | '\u{2029}')),
+            "{name}: {err:?}"
         );
+        err
     };
     refused(
         "v0.json",
         r#"{"schema_version":0,"app":"example","app_version":"0.0.1","capabilities":[{"id":"example.status.read","summary":"x","effect":"read"}]}"#,
+        1,
         "migrate",
     );
     refused(
@@ -672,6 +685,7 @@ fn inv_1_manifest_check_is_the_v1_admission_parser() {
         &text
             .replace("\"provider\": \"example\"", "\"provider\": \"rustyvault\"")
             .replace("\"example.", "\"rustyvault."),
+        1,
         "reserved",
     );
     refused(
@@ -681,11 +695,45 @@ fn inv_1_manifest_check_is_the_v1_admission_parser() {
             "\"schema_version\": 1, \"schema_version\": 1,",
             1,
         ),
+        1,
         "repeats a JSON key",
     );
     refused(
+        "nested-duplicate.json",
+        &text.replacen(
+            "\"maxLength\": 64",
+            "\"maxLength\": 64, \"maxLength\": 64",
+            1,
+        ),
+        1,
+        "repeats a JSON key",
+    );
+    // Hostile text in an unknown field's name and in the key on a null
+    // value's path: the refusal shows it escaped, so it cannot redraw the
+    // terminal (e.g. print a forged "OK" over its own refusal).
+    let esc = "\\u001b[1A\\u001b[2K\\rOK forged \\u202e\\u0007";
+    let e = refused(
+        "hostile-field.json",
+        &text.replacen("{", &format!("{{\"{esc}\": 1, "), 1),
+        1,
+        "unknown field",
+    );
+    assert!(e.contains("\\u{1B}"), "{e}");
+    refused(
+        "hostile-null.json",
+        &text.replacen(
+            "\"properties\": {}",
+            &format!("\"properties\": {{\"{esc}\": null}}"),
+            1,
+        ),
+        1,
+        "null value",
+    );
+    refused("not-json.json", "{\"schema_version\": 1,", 4, "cannot read");
+    refused(
         "huge.json",
         &" ".repeat(harness_manifest::MANIFEST_MAX_BYTES + 1),
+        4,
         "larger than the manifest cap",
     );
     let o = check(&fx.base.join("absent.json"));

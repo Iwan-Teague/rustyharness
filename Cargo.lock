@@ -65,7 +65,6 @@ dependencies = [
  "harness-policy",
  "harness-run",
  "harness-sandbox",
- "harness-tools",
  "serde",
  "serde_json",
 ]

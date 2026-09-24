@@ -15,7 +15,7 @@
 //! | 1 | `Failed` |
 //! | 2 | usage error |
 //! | 3 | confinement refused (never in H1: no session may hold an execute grant) |
-//! | 4 | unreadable input (task spec, policy, profile) |
+//! | 4 | unreadable input (task spec, policy, profile; a manifest for `manifest check`) |
 //! | 5 | `Indeterminate` (the kind is in the JSON): every H1 run, a refused run (e.g. the locality check), a journal failure, a replay divergence |
 //!
 //! Every H1 run is `Indeterminate { NothingChecked }` and exits 5 with no
@@ -30,6 +30,12 @@
 //!
 //! `profile check` runs the smoke eval against a live server and prints the
 //! stamp to add to the profile (it is not a gate child).
+//!
+//! `manifest check` validates a provider manifest with the admission parser
+//! (not a gate child either): exit 0 valid, 1 refused on content, 4 not
+//! readable as a JSON document at all (missing, too large, not well-formed
+//! JSON), 5 if the harness cannot check (its own version is not SemVer). A
+//! valid manifest is not an admitted one.
 
 #![forbid(unsafe_code)]
 // The panic-set lints ratchet production code; unit tests may assert loosely.
@@ -50,7 +56,7 @@ use gate_outcome::{
 };
 use harness_core::RunId;
 use harness_manifest::admission::{Registry, Tier};
-use harness_manifest::{builtin, SemVer, ValidationContext};
+use harness_manifest::{builtin, ManifestError, SemVer, ValidationContext};
 use harness_model::client::{ClientConfig, OpenAiCompatible};
 use harness_model::profile::{CheckResult, Profile};
 use harness_model::TaskText;
@@ -62,7 +68,7 @@ use serde::Deserialize;
 const USAGE: &str = "usage:
   rustyharness version
   rustyharness sandbox             report confinement (refuses to run anything without it)
-  rustyharness manifest check <file.json>
+  rustyharness manifest check <file.json>   exit 0 valid (valid is not admitted), 1 refused, 4 unreadable
   rustyharness run    --task <task.json> --workspace <dir> --state-root <dir>
                       --profile <profile.json> --endpoint <http://127.0.0.1:PORT/v1>
                       [--policy <policy.json>] [--gate <gate-id>]
@@ -773,12 +779,17 @@ fn profile_check(cx: &Cx<'_>, rest: &[&str]) -> u8 {
     }
 }
 
-/// `manifest check`: validate a provider's manifest exactly as admission
-/// would (`harness_manifest::Manifest::parse`: schema v1, strict JSON,
-/// reserved namespaces, §4.3 content rules), show each capability's
-/// effective class (§4.2) and say what this build's admission does with it.
-/// Exit 0 valid, 1 refused, 4 unreadable. A valid manifest is not an
-/// admitted one: admitting external providers is H4 (§4.4).
+/// `manifest check`: validate a provider's manifest with the parser
+/// admission uses (`harness_manifest::Manifest::parse`: schema v1, strict
+/// JSON, reserved namespaces, §4.3 content rules), show each capability's
+/// §4.2 class and the floors its transport and the pinned tier add, and say
+/// what this build's admission would do if the user pinned these exact
+/// bytes. Exit codes: see the crate docs.
+///
+/// Named residuals (H1f-2 review F-7): the reserved set is the core
+/// constant only (H1 has no harness config, so no `extra_reserved`); only
+/// the pinned tier is tried (a manifest refused as pinned may be admissible
+/// as signed, from H4); user policy can raise a class further at run time.
 fn manifest_check(cx: &Cx<'_>, path: &str) -> u8 {
     use std::io::Read;
     let mut bytes = Vec::new();
@@ -794,10 +805,10 @@ fn manifest_check(cx: &Cx<'_>, path: &str) -> u8 {
     if bytes.len() > harness_manifest::MANIFEST_MAX_BYTES {
         note!(
             cx,
-            "REFUSED {path}: larger than the manifest cap of {} bytes",
+            "cannot read {path}: larger than the manifest cap of {} bytes",
             harness_manifest::MANIFEST_MAX_BYTES
         );
-        return exit::FAILED;
+        return exit::UNREADABLE_INPUT;
     }
     let ctx = match SemVer::parse(env!("CARGO_PKG_VERSION"))
         .ok_or_else(|| "the harness version is not SemVer".to_owned())
@@ -806,11 +817,18 @@ fn manifest_check(cx: &Cx<'_>, path: &str) -> u8 {
         Ok(c) => c,
         Err(e) => {
             note!(cx, "cannot check manifests: {e}");
-            return exit::FAILED;
+            return exit::INDETERMINATE;
         }
     };
     let m = match harness_manifest::Manifest::parse(&bytes, &ctx) {
         Ok(m) => m,
+        // Not a JSON document at all: unreadable input (§7.7).
+        Err(e @ (ManifestError::Json(_) | ManifestError::TooLarge { .. })) => {
+            note!(cx, "cannot read {path}: {e}");
+            return exit::UNREADABLE_INPUT;
+        }
+        // A JSON document that is not a valid manifest. Every message here
+        // shows manifest-chosen text escaped or Debug-quoted (§7.1).
         Err(e) => {
             note!(cx, "REFUSED {path}: {e}");
             return exit::FAILED;
@@ -832,6 +850,10 @@ fn manifest_check(cx: &Cx<'_>, path: &str) -> u8 {
         }
     );
     say!(cx, "  manifest sha256 {digest}");
+    say!(
+        cx,
+        "  capability classes (§4.2: declared confirmation raised by the derived floors, before user policy and tier floors):"
+    );
     for c in m.capabilities() {
         let e = harness_policy::effective_class(c, harness_manifest::Confirmation::None);
         say!(
@@ -852,8 +874,14 @@ fn manifest_check(cx: &Cx<'_>, path: &str) -> u8 {
             }
         );
     }
+    if let harness_manifest::Transport::McpStdio { .. } = m.transport() {
+        say!(
+            cx,
+            "  transport mcp-stdio: the server is started only inside a conformed sandbox, never unconfined (§4.5)"
+        );
+    }
     // What admission would say if the user pinned exactly these bytes: the
-    // same code a run uses, so this line cannot disagree with it.
+    // same code a run uses. In H1 it always refuses (pinning is H4).
     let admission = harness_manifest::Sha256Pin::parse_hex(&digest.to_string())
         .ok_or_else(|| "the manifest digest is not a pin".to_owned())
         .and_then(|pin| {
@@ -866,11 +894,18 @@ fn manifest_check(cx: &Cx<'_>, path: &str) -> u8 {
             .map_err(|e| e.to_string())
         });
     match admission {
-        Ok(_) => say!(cx, "  admission as a pinned provider: admitted"),
+        Ok(_) => say!(
+            cx,
+            "  if pinned as sha256 {digest}, this build would admit it"
+        ),
         Err(e) => say!(
             cx,
-            "  admission as a pinned provider in this build: refused: {e}"
+            "  if pinned as sha256 {digest}, this build would refuse it: {e}"
         ),
     }
+    say!(
+        cx,
+        "  a pinned provider is always sandboxed, confirms at least user_confirm and never shares a session with personal or restricted capabilities (§4.4)"
+    );
     exit::PASSED
 }

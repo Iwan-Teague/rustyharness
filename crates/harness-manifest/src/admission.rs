@@ -71,7 +71,8 @@ pub enum AdmissionError {
     },
     /// A `pinned` manifest declares more than its tier may.
     #[error(
-        "provider {provider}: a pinned manifest may not declare {what} (capability {capability})"
+        "provider {provider}: a pinned manifest may not declare {what}{}",
+        capability_clause(.capability)
     )]
     TierExceeded {
         /// Provider.
@@ -93,6 +94,16 @@ pub enum AdmissionError {
         /// The design phase that adds it.
         phase: &'static str,
     },
+}
+
+/// ` (capability <id>)`, or nothing when the refusal is about the whole
+/// manifest (its transport).
+fn capability_clause(capability: &str) -> String {
+    if capability.is_empty() {
+        String::new()
+    } else {
+        format!(" (capability {capability})")
+    }
 }
 
 /// Resolution of a capability id against a registry.

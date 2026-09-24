@@ -155,8 +155,9 @@ pub enum Confirmation {
 }
 
 // The wire names of the dimensions (the manifest's own spelling), for
-// messages and reports. A test round-trips each through the parser, so a
-// name here cannot drift from what a manifest must say.
+// messages and reports. A test round-trips every variant through serde, and
+// its variant lists sit behind wildcard-free matches, so a new variant does
+// not compile until it is listed there too.
 
 impl Effect {
     /// The manifest wire name.
@@ -324,9 +325,33 @@ fn check_name(
     Ok(())
 }
 
-/// Bound untrusted text before it goes into an error message.
+/// Bound untrusted text before it goes into an error message. Every
+/// caller formats the result with `{:?}`, which escapes control and bidi
+/// characters; text shown with `{}` goes through [`display_safe`].
 fn shown(s: &str) -> String {
     s.chars().take(80).collect()
+}
+
+/// Untrusted text made safe to show with `{}` (design §7.1: display paths
+/// escape control, bidi and ANSI sequences), with the journal's reversible
+/// escape: `\` becomes `\\`, and every control character (ESC included,
+/// so an ANSI sequence is inert), line or paragraph separator, zero-width or
+/// bidi code point becomes `\u{HEX}`. At most `max` characters of `s` are
+/// kept (H1f-2 review F-1: a refused manifest could otherwise redraw the
+/// terminal, e.g. print a forged "OK" over its own refusal).
+fn display_safe(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    for c in s.chars().take(max) {
+        if c == '\\' {
+            out.push_str("\\\\");
+        } else if c.is_control() || is_invisible_or_bidi(c) || matches!(c, '\u{2028}' | '\u{2029}')
+        {
+            out.push_str(&format!("\\u{{{:X}}}", u32::from(c)));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// A strict `MAJOR.MINOR.PATCH` (no pre-release or build suffix, no leading
@@ -914,17 +939,21 @@ pub enum ManifestError {
 }
 
 fn shape(e: &serde_json::Error) -> ManifestError {
-    let detail = e.to_string();
-    let kind = if detail.starts_with("unknown field") {
+    let raw = e.to_string();
+    let kind = if raw.starts_with("unknown field") {
         ShapeKind::UnknownField
-    } else if detail.starts_with("unknown variant") {
+    } else if raw.starts_with("unknown variant") {
         ShapeKind::UnknownValue
-    } else if detail.starts_with("missing field") {
+    } else if raw.starts_with("missing field") {
         ShapeKind::MissingField
     } else {
         ShapeKind::Other
     };
-    ManifestError::Shape { kind, detail }
+    // serde quotes the offending key or value verbatim.
+    ManifestError::Shape {
+        kind,
+        detail: display_safe(&raw, 512),
+    }
 }
 
 /// Zero-width and bidi-control code points (design §2.3, §4.3).
@@ -1345,7 +1374,7 @@ fn find_null(v: &Value, at: String) -> Option<String> {
             .find_map(|(i, e)| find_null(e, format!("{at}/{i}"))),
         Value::Object(o) => o
             .iter()
-            .find_map(|(k, e)| find_null(e, format!("{at}/{}", shown(k)))),
+            .find_map(|(k, e)| find_null(e, format!("{at}/{}", display_safe(k, 80)))),
         _ => None,
     }
 }
