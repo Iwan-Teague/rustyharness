@@ -506,3 +506,70 @@ fn startup_check_needs_the_model_listed() {
     let raw = String::from_utf8(m.requests.lock().unwrap()[0].clone()).unwrap();
     assert!(raw.starts_with("GET /v1/models HTTP/1.1\r\n"));
 }
+
+// ---- H1e-2b: Retry-After and server-claimed identity ------------------------------
+
+fn with_retry_after(status: &str, secs: &str) -> Vec<u8> {
+    format!("HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nRetry-After: {secs}\r\nContent-Length: 0\r\n\r\n")
+        .into_bytes()
+}
+
+#[test]
+fn retry_after_is_honoured_as_a_floor_on_the_backoff() {
+    // The configured backoff is 5-20 ms; the server asks for 1 s.
+    let ok = chunked(
+        "text/event-stream",
+        &sse(&[&text_event("fine"), STOP, "[DONE]"]),
+    );
+    let m = mock(vec![
+        Behave::Respond(with_retry_after("429 Too Many Requests", "1")),
+        Behave::Respond(ok),
+    ]);
+    let t = Instant::now();
+    let c = client(&m, None).complete(&req(), soon()).unwrap();
+    assert_eq!(c.retried, vec![429]);
+    assert!(
+        t.elapsed() >= Duration::from_secs(1),
+        "waited only {:?}",
+        t.elapsed()
+    );
+}
+
+#[test]
+fn a_retry_after_past_the_deadline_ends_the_call_without_waiting() {
+    let m = mock(vec![Behave::Respond(with_retry_after(
+        "503 Service Unavailable",
+        "3600",
+    ))]);
+    let t = Instant::now();
+    let e = client(&m, None)
+        .complete(&req(), Instant::now() + Duration::from_secs(2))
+        .unwrap_err();
+    assert_eq!(
+        e,
+        ModelError::Unavailable(Unavailable::Status {
+            code: 503,
+            statuses: vec![503]
+        })
+    );
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    assert_eq!(m.requests.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn the_startup_check_records_what_the_server_claims() {
+    let listed = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nServer: llama.cpp b9999\r\nContent-Length: {}\r\n\r\n{}",
+        r#"{"data":[{"id":"local-model"}]}"#.len(),
+        r#"{"data":[{"id":"local-model"}]}"#
+    )
+    .into_bytes();
+    let m = mock(vec![Behave::Respond(listed)]);
+    let c = client(&m, None);
+    assert_eq!(c.identity().claimed, harness_model::ServerClaims::default());
+    c.startup_check(soon()).unwrap();
+    let claimed = c.identity().claimed;
+    assert_eq!(claimed.model_id.as_deref(), Some("local-model"));
+    assert_eq!(claimed.server.as_deref(), Some("llama.cpp b9999"));
+    assert_eq!(claimed.template_sha256, None);
+}

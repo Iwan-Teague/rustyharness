@@ -840,9 +840,14 @@ fn new_run_and_attempt_entries_are_fsynced_before_the_header() {
     let run_dir = t.0.join("run-0003");
     std::fs::create_dir_all(&run_dir).unwrap();
     let ds = spy(None);
-    let (w, n) =
-        JournalWriter::create_next_attempt_with(&run_dir, rid(3), Header::new(id("0.0.1")), &ds)
-            .unwrap();
+    let (w, n) = JournalWriter::create_next_attempt_with(
+        &run_dir,
+        rid(3),
+        Header::new(id("0.0.1")),
+        &ds,
+        &|_| Ok(()),
+    )
+    .unwrap();
     drop(w);
     let attempt = layout::attempt_dir(&run_dir, n);
     assert_eq!(
@@ -862,6 +867,7 @@ fn attempt_dir_fsync_failure_refuses_to_start() {
         rid(4),
         Header::new(id("0.0.1")),
         &spy(Some("attempt-1")),
+        &|_| Ok(()),
     )
     .unwrap_err();
     assert_eq!(err.op, "fsync attempt dir");
@@ -886,6 +892,7 @@ fn run_dir_fsync_failure_refuses_to_start() {
         rid(5),
         Header::new(id("0.0.1")),
         &spy(Some("run-0005")),
+        &|_| Ok(()),
     )
     .unwrap_err();
     assert_eq!(err.op, "fsync run dir");
@@ -1081,4 +1088,83 @@ fn create_run_dir_syncs_state_root_even_when_runs_already_exists() {
     let synced = ok.synced.borrow().clone();
     assert_eq!(synced, vec![t.0.clone(), t.0.join("runs")]);
     assert!(dir.is_dir());
+}
+
+// ---- H1e-2b: attempt-directory check, replay directories, header claims ----
+
+#[test]
+fn a_failed_attempt_dir_check_refuses_before_the_header() {
+    let t = TempDir::new("attempt-check");
+    let run_dir = t.0.join("run-0006");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let seen = std::cell::RefCell::new(None);
+    let err = JournalWriter::create_next_attempt_checked(
+        &run_dir,
+        rid(6),
+        Header::new(id("0.0.1")),
+        &|p| {
+            *seen.borrow_mut() = Some(p.to_path_buf());
+            Err("not local".into())
+        },
+    )
+    .unwrap_err();
+    assert_eq!(err.op, "attempt dir check");
+    assert_eq!(
+        seen.borrow().as_deref(),
+        Some(layout::attempt_dir(&run_dir, 1).as_path()),
+        "the check sees the new attempt directory itself"
+    );
+    assert!(!layout::attempt_dir(&run_dir, 1)
+        .join(layout::JOURNAL_FILE)
+        .exists());
+}
+
+#[test]
+fn replay_journals_live_beside_the_attempts_and_carry_the_attempt_number() {
+    let t = TempDir::new("replay-dir");
+    let run_dir = t.0.join("run-0007");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let (w, dir) =
+        JournalWriter::create_replay(&run_dir, rid(7), 2, Header::new(id("0.0.1"))).unwrap();
+    drop(w);
+    assert_eq!(dir, layout::replay_dir(&run_dir, 1));
+    let bytes = std::fs::read(dir.join(layout::JOURNAL_FILE)).unwrap();
+    let v = verify(
+        &bytes,
+        &reader::DirBlobSource::new(dir.join(layout::BLOBS_DIR)),
+    )
+    .unwrap();
+    assert_eq!(v.attempt, 2);
+    let (_, second) =
+        JournalWriter::create_replay(&run_dir, rid(7), 2, Header::new(id("0.0.1"))).unwrap();
+    assert_eq!(second, layout::replay_dir(&run_dir, 2));
+    assert_eq!(layout::latest_attempt(&run_dir).unwrap(), None);
+}
+
+#[test]
+fn header_claims_are_untrusted_payloads_never_trusted_text() {
+    let file = FaultFile::new(FaultPlan::default());
+    let buf = file.buf.clone();
+    let w = JournalWriter::start(
+        file,
+        MemBlobs::default(),
+        TestClock(Cell::new(0)),
+        rid(8),
+        1,
+        Header::new(id("0.0.1")).claimed(
+            "claimed_model",
+            Untrusted::new("evil\u{202e}model".into(), Source::Model),
+        ),
+    )
+    .unwrap();
+    drop(w);
+    let v = verify(&buf.borrow(), &MemBlobs::default()).unwrap();
+    let c = v.records[0].body.get("claimed_model").unwrap();
+    assert_eq!(c.get("untrusted"), Some(&serde_json::Value::Bool(true)));
+    assert!(!c
+        .get("inline")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .contains('\u{202e}'));
 }

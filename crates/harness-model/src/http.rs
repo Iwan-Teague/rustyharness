@@ -56,9 +56,30 @@ pub struct HttpResponse {
     pub status: u16,
     /// `Content-Type`, lowercased, without parameters.
     pub content_type: Option<String>,
+    /// `Retry-After` in delta-seconds form (digits only, at most one day).
+    /// The HTTP-date form is ignored (treated as absent): honouring it
+    /// would need the wall clock, and the backoff applies instead.
+    pub retry_after_secs: Option<u64>,
+    /// The `Server` header, at most 256 bytes: a CLAIM (§3.5).
+    pub server: Option<String>,
     /// The (de-chunked) body.
     pub body: Vec<u8>,
 }
+
+/// A parsed response head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Head {
+    status: u16,
+    framing: Framing,
+    content_type: Option<String>,
+    retry_after_secs: Option<u64>,
+    server: Option<String>,
+}
+
+/// Longest `Server` claim kept.
+const SERVER_CLAIM_MAX: usize = 256;
+/// Largest `Retry-After` honoured, in seconds.
+const RETRY_AFTER_MAX_SECS: u64 = 86_400;
 
 /// Why an exchange failed. Messages are harness-authored; no request or
 /// response bytes, and never a header value, are included.
@@ -184,7 +205,7 @@ impl Conn {
 }
 
 /// Parse a response head (without the final blank line). Pure.
-fn parse_head(lines: &[Vec<u8>]) -> Result<(u16, Framing, Option<String>), HttpError> {
+fn parse_head(lines: &[Vec<u8>]) -> Result<Head, HttpError> {
     let m = HttpError::Malformed;
     let (status_line, headers) = lines.split_first().ok_or(m("empty head"))?;
     let sl = std::str::from_utf8(status_line).map_err(|_| m("status line"))?;
@@ -204,6 +225,8 @@ fn parse_head(lines: &[Vec<u8>]) -> Result<(u16, Framing, Option<String>), HttpE
     let mut length: Option<usize> = None;
     let mut chunked = false;
     let mut content_type = None;
+    let mut retry_after_secs = None;
+    let mut server = None;
     for h in headers {
         let text = std::str::from_utf8(h).map_err(|_| m("header is not UTF-8"))?;
         if text.chars().any(|c| c.is_control() && c != '\t') {
@@ -242,6 +265,17 @@ fn parse_head(lines: &[Vec<u8>]) -> Result<(u16, Framing, Option<String>), HttpE
                     .to_ascii_lowercase();
                 content_type = Some(base);
             }
+            "retry-after" => {
+                retry_after_secs = (!value.is_empty()
+                    && value.len() <= 6
+                    && value.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| value.parse::<u64>().ok())
+                .flatten()
+                .filter(|s| *s <= RETRY_AFTER_MAX_SECS);
+            }
+            "server" if value.len() <= SERVER_CLAIM_MAX && !value.is_empty() => {
+                server = Some(value.to_owned());
+            }
             _ => {}
         }
     }
@@ -251,7 +285,13 @@ fn parse_head(lines: &[Vec<u8>]) -> Result<(u16, Framing, Option<String>), HttpE
         (false, Some(n)) => Framing::Length(n),
         (false, None) => Framing::Close,
     };
-    Ok((status, framing, content_type))
+    Ok(Head {
+        status,
+        framing,
+        content_type,
+        retry_after_secs,
+        server,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,7 +384,13 @@ pub fn exchange(
         }
         lines.push(l);
     }
-    let (status, framing, content_type) = parse_head(&lines)?;
+    let Head {
+        status,
+        framing,
+        content_type,
+        retry_after_secs,
+        server,
+    } = parse_head(&lines)?;
     c.compact();
     let body = match framing {
         Framing::Length(n) => {
@@ -407,6 +453,8 @@ pub fn exchange(
     Ok(HttpResponse {
         status,
         content_type,
+        retry_after_secs,
+        server,
         body,
     })
 }
@@ -420,12 +468,40 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_is_delta_seconds_only_and_bounded() {
+        let ra = |v: &str| {
+            parse_head(&lines(&format!(
+                "HTTP/1.1 429 Too Many\r\nContent-Length: 0\r\nRetry-After: {v}"
+            )))
+            .unwrap()
+            .retry_after_secs
+        };
+        assert_eq!(ra("3"), Some(3));
+        assert_eq!(ra("86400"), Some(86_400));
+        for ignored in [
+            "86401",
+            "-1",
+            "+3",
+            "3.5",
+            "Wed, 21 Oct 2015 07:28:00 GMT",
+            "9999999",
+        ] {
+            assert_eq!(ra(ignored), None, "{ignored}");
+        }
+        let h = parse_head(&lines(
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nServer: llama.cpp b1234",
+        ))
+        .unwrap();
+        assert_eq!(h.server.as_deref(), Some("llama.cpp b1234"));
+    }
+
+    #[test]
     fn heads_are_parsed_strictly() {
-        let (st, f, ct) =
+        let h =
             parse_head(&lines("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nTransfer-Encoding: chunked"))
                 .unwrap();
         assert_eq!(
-            (st, f, ct.as_deref()),
+            (h.status, h.framing, h.content_type.as_deref()),
             (200, Framing::Chunked, Some("text/event-stream"))
         );
         for bad in [

@@ -738,3 +738,18 @@ fn a_write_capability_that_merely_looks_like_submit_stays_out_of_scope() {
         "{err:?}"
     );
 }
+
+#[test]
+fn the_policy_digest_distinguishes_lists_and_order() {
+    let a = UserPolicy::new(&["fixture.a"], &[], &[]).unwrap();
+    let b = UserPolicy::new(&[], &[], &["fixture.a"]).unwrap();
+    let c = UserPolicy::new(&["fixture.a", "fixture.*"], &[], &[]).unwrap();
+    let d = UserPolicy::new(&["fixture.*", "fixture.a"], &[], &[]).unwrap();
+    assert_eq!(
+        a.digest(),
+        UserPolicy::new(&["fixture.a"], &[], &[]).unwrap().digest()
+    );
+    assert_ne!(a.digest(), b.digest());
+    assert_ne!(c.digest(), d.digest(), "order matters: first match wins");
+    assert_ne!(UserPolicy::default().digest(), a.digest());
+}

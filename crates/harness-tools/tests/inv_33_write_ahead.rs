@@ -60,6 +60,7 @@ impl ToolProvider for Spy {
             ),
             truncated: false,
             digest: sha256(b"file text"),
+            read: None,
         })
     }
 }

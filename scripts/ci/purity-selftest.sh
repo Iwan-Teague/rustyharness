@@ -148,12 +148,12 @@ expect_refusal "harness-policy depends on harness-sandbox" "harness-policy pulle
 # The test-only journal seam must not be enabled by a normal dependency.
 fresh
 awk '{ print } /^\[dependencies\]/ { print "harness-journal = { path = \"../harness-journal\", features = [\"fault-injection\"] }" }' \
-    "$copy/crates/harness-cli/Cargo.toml" >"$tmpdir/Cargo.toml.planted" ||
+    "$copy/crates/harness-sandbox/Cargo.toml" >"$tmpdir/Cargo.toml.planted" ||
     fail "awk failed planting a dependency"
-mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-cli/Cargo.toml" || fail "mv failed"
-grep -qF 'features = ["fault-injection"]' "$copy/crates/harness-cli/Cargo.toml" ||
+mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-sandbox/Cargo.toml" || fail "mv failed"
+grep -qF 'features = ["fault-injection"]' "$copy/crates/harness-sandbox/Cargo.toml" ||
     fail "fault-injection plant did not land"
-expect_refusal "harness-cli enables the journal's fault-injection seam" \
+expect_refusal "harness-sandbox enables the journal's fault-injection seam" \
     "a normal dependency edge enables harness-journal/fault-injection"
 
 # INV-24: a TLS crate in the default build is refused (planted as a local
@@ -215,9 +215,7 @@ expect_refusal "harness-model depends on a crate outside its allowlist" "harness
 
 # H1c confirming review NF-1: a workspace feature that forwards to fault-injection.
 fresh
-awk '{ print } /^\[dependencies\]/ { print "harness-journal = { path = \"../harness-journal\" }" }' \
-    "$copy/crates/harness-cli/Cargo.toml" >"$tmpdir/Cargo.toml.planted" || fail "awk failed"
-mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-cli/Cargo.toml" || fail "mv failed"
+# (harness-cli already depends on harness-journal since H1e-2b.)
 printf '\n[features]\nchaos = ["harness-journal/fault-injection"]\n' >>"$copy/crates/harness-cli/Cargo.toml" ||
     fail "could not plant the chaos feature"
 expect_refusal "a chaos feature forwards to fault-injection" "a workspace feature forwards to harness-journal/fault-injection"
@@ -229,6 +227,20 @@ mv "$tmpdir/lib.rs.planted" "$copy/crates/harness-journal/src/lib.rs" || fail "m
 grep -q 'compile_error' "$copy/crates/harness-journal/src/lib.rs" &&
     fail "compile_error! plant did not land"
 expect_refusal "the fault-injection compile_error! removed" "an optimised build with harness-journal/fault-injection compiles"
+
+# H1e-2b review F-2: the shipped binary's probe is NoProbe, with no switch.
+fresh
+sed 's/probe: &NoProbe,/probe: \&harness_policy::locality::NoProbe, probe: \&Other,/' \
+    "$copy/crates/harness-cli/src/main.rs" >"$tmpdir/main.rs.planted" || fail "sed failed"
+mv "$tmpdir/main.rs.planted" "$copy/crates/harness-cli/src/main.rs" || fail "mv failed"
+grep -q 'probe: &Other' "$copy/crates/harness-cli/src/main.rs" || fail "probe plant did not land"
+expect_refusal "the binary gains a second probe" "the rustyharness binary must use exactly one probe"
+fresh
+sed 's/probe: &NoProbe,/probe: \&PermissiveProbe,/' \
+    "$copy/crates/harness-cli/src/main.rs" >"$tmpdir/main.rs.planted" || fail "sed failed"
+mv "$tmpdir/main.rs.planted" "$copy/crates/harness-cli/src/main.rs" || fail "mv failed"
+grep -q 'probe: &PermissiveProbe' "$copy/crates/harness-cli/src/main.rs" || fail "probe plant did not land"
+expect_refusal "the binary uses a permissive probe" "the rustyharness binary must use exactly one probe"
 
 # H1a review N-3: the remaining name-scan gaps.
 n3_case() {
@@ -270,6 +282,10 @@ expect_refusal "a second Meter construction site" "Meter construction"
 fresh
 plant crates/harness-run/tests/zz_plant.rs 'pub fn zz(l: harness_core::MeterLimits, c: Box<dyn harness_core::MonoClock>) -> harness_core::Meter { harness_core::Meter::new(l, None, c) }\n'
 expect_refusal "a Meter built in the run crate outside driver.rs" "Meter construction"
+# ...including the resumed-attempt constructor (H1e-2b).
+fresh
+plant crates/harness-tools/src/zz_plant.rs 'pub fn zz(l: harness_core::MeterLimits, c: Box<dyn harness_core::MonoClock>) -> harness_core::Meter { harness_core::Meter::new_resumed(l, None, c, std::time::Duration::ZERO) }\n'
+expect_refusal "a resumed Meter built outside the driver" "Meter construction"
 
 # H1e-1 review NF-B: literals must not hide code from the code-only scans.
 n3b_case() {

@@ -211,9 +211,10 @@ impl Clock for SystemClock {
 /// digests, `ModelIdentity`, sandbox, OS, `shell_enabled`, protected-path
 /// digests, plan digest, environment sample) are added by the run driver
 /// with [`Header::field`].
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Header {
     fields: Vec<(&'static str, Trusted)>,
+    claims: Vec<(&'static str, Untrusted<String>)>,
 }
 
 impl Header {
@@ -221,7 +222,18 @@ impl Header {
     pub fn new(harness_version: Ident) -> Self {
         Self {
             fields: vec![("harness_version", Trusted::Id(harness_version))],
+            claims: Vec::new(),
         }
+    }
+
+    /// Add a field that is a CLAIM from outside the harness (design §3.5:
+    /// what a model server says it serves). It is written as an untrusted
+    /// payload (escaped inline, or a blob stored before the header), never
+    /// as trusted text.
+    #[must_use]
+    pub fn claimed(mut self, key: &'static str, value: Untrusted<String>) -> Self {
+        self.claims.push((key, value));
+        self
     }
 
     /// Add a header field.
@@ -449,7 +461,48 @@ impl JournalWriter<FsFile, DirBlobs, SystemClock> {
         run: RunId,
         header: Header,
     ) -> Result<(Self, u32), StartError> {
-        Self::create_next_attempt_with(run_dir, run, header, &RealDirSync)
+        Self::create_next_attempt_with(run_dir, run, header, &RealDirSync, &|_| Ok(()))
+    }
+
+    /// [`JournalWriter::create_next_attempt`], running `check` on the new
+    /// attempt directory after it exists and before anything is written in
+    /// it (design §2.8: the filesystem-locality check runs "again on each
+    /// new attempt-<n> directory", so a mount placed under the run is
+    /// caught). A failed check is a [`StartError`]: no header, no writer.
+    pub fn create_next_attempt_checked(
+        run_dir: &Path,
+        run: RunId,
+        header: Header,
+        check: &dyn Fn(&Path) -> Result<(), String>,
+    ) -> Result<(Self, u32), StartError> {
+        Self::create_next_attempt_with(run_dir, run, header, &RealDirSync, check)
+    }
+
+    /// Open the next `replay-<k>` directory under `run_dir` for an audit
+    /// replay (§2.9) and start its journal, whose records carry `attempt`
+    /// (the attempt being replayed) so they compare field for field with
+    /// the recorded ones. A real, durable journal like any attempt's: the
+    /// replay is evidence too.
+    pub fn create_replay(
+        run_dir: &Path,
+        run: RunId,
+        attempt: u32,
+        header: Header,
+    ) -> Result<(Self, PathBuf), StartError> {
+        let io_err = |op, e: io::Error| StartError {
+            op,
+            error: e.to_string(),
+        };
+        real_dir(run_dir).map_err(|e| io_err("run dir", e))?;
+        let (_, dir) =
+            layout::create_next_replay(run_dir).map_err(|e| io_err("create replay dir", e))?;
+        RealDirSync
+            .sync(run_dir)
+            .map_err(|e| io_err("fsync run dir", e))?;
+        Ok((
+            Self::create_with(&dir, run, attempt, header, &RealDirSync)?,
+            dir,
+        ))
     }
 
     pub(crate) fn create_next_attempt_with(
@@ -457,6 +510,7 @@ impl JournalWriter<FsFile, DirBlobs, SystemClock> {
         run: RunId,
         header: Header,
         ds: &dyn DirSync,
+        check: &dyn Fn(&Path) -> Result<(), String>,
     ) -> Result<(Self, u32), StartError> {
         let io_err = |op, e: io::Error| StartError {
             op,
@@ -466,6 +520,10 @@ impl JournalWriter<FsFile, DirBlobs, SystemClock> {
         let (n, dir) =
             layout::create_next_attempt(run_dir).map_err(|e| io_err("create attempt dir", e))?;
         ds.sync(run_dir).map_err(|e| io_err("fsync run dir", e))?;
+        check(&dir).map_err(|error| StartError {
+            op: "attempt dir check",
+            error,
+        })?;
         Ok((Self::create_with(&dir, run, n, header, ds)?, n))
     }
 }
@@ -497,6 +555,13 @@ impl<F: JournalFile, B: BlobSink, K: Clock> JournalWriter<F, B, K> {
         let mut ev = Event::new(EventKind::RunStarted);
         for (k, v) in header.fields {
             ev = ev.field(k, v);
+        }
+        for (k, v) in &header.claims {
+            let blob = w.untrusted(v).map_err(|e| StartError {
+                op: "header claim",
+                error: e.to_string(),
+            })?;
+            ev = ev.field(k, Trusted::Untrusted(blob));
         }
         let body = ev.body().map_err(|e| StartError {
             op: "header",

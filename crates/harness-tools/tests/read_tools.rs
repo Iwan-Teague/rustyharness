@@ -288,11 +288,12 @@ fn workspace_facts_change_with_content_and_count_files() {
     fs::create_dir(ws.join("d")).unwrap();
     fs::write(ws.join("d/a"), "1").unwrap();
     fs::write(ws.join("b"), "2").unwrap();
-    let (d1, n) = workspace_facts(&ws).unwrap();
-    assert_eq!(n, 2);
-    assert_eq!(workspace_facts(&ws).unwrap().0, d1);
+    let far = Instant::now() + Duration::from_secs(60);
+    let f1 = workspace_facts(&ws, far).unwrap();
+    assert_eq!((f1.files, f1.oversize), (2, 0));
+    assert_eq!(workspace_facts(&ws, far).unwrap().tree, f1.tree);
     fs::write(ws.join("d/a"), "3").unwrap();
-    assert_ne!(workspace_facts(&ws).unwrap().0, d1);
+    assert_ne!(workspace_facts(&ws, far).unwrap().tree, f1.tree);
 }
 
 #[cfg(unix)]

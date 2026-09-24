@@ -180,6 +180,13 @@ enum RecordedReply {
 /// `sha256` and `len` (H1d review F-6): whatever blob source the caller
 /// passes, a payload that is not the recorded one is refused.
 fn payload(v: &Value, blobs: &dyn BlobSource, seq: u64) -> Result<String, ReplayError> {
+    String::from_utf8(payload_bytes(v, blobs, seq)?).map_err(|_| ReplayError::Malformed(seq))
+}
+
+/// Read one untrusted payload of record `seq` back as bytes (inline text or
+/// its blob), re-hashed against its recorded `sha256` and `len`. The audit
+/// driver uses it to re-feed recorded tool output.
+pub fn payload_bytes(v: &Value, blobs: &dyn BlobSource, seq: u64) -> Result<Vec<u8>, ReplayError> {
     let m = ReplayError::Malformed(seq);
     let o = v.as_object().ok_or(m.clone())?;
     if o.get("untrusted") != Some(&Value::Bool(true)) {
@@ -200,7 +207,7 @@ fn payload(v: &Value, blobs: &dyn BlobSource, seq: u64) -> Result<String, Replay
     if harness_core::sha256(&bytes) != want || u64::try_from(bytes.len()).ok() != Some(len) {
         return Err(ReplayError::PayloadMismatch(seq));
     }
-    String::from_utf8(bytes).map_err(|_| m)
+    Ok(bytes)
 }
 
 fn statuses_of(b: &Map<String, Value>) -> Option<Vec<u16>> {
@@ -391,6 +398,7 @@ impl ModelBackend for ReplayBackend {
             profile_validated: self.profile.validated(),
             profile_stamp_sha256: self.profile.stamp_sha256().map(str::to_owned),
             api_key_handle: None,
+            claimed: crate::ServerClaims::default(),
         }
     }
 

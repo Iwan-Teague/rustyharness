@@ -30,14 +30,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gate_outcome::{Digest, GateOutcome, IndeterminateKind};
 use harness_core::{
-    sha256, LoopDetector, LoopEvent, LoopKind, LoopSignal, Meter, MeterLimits, MonoClock, Nonce,
-    RunId, Source, StopCause, TokenUsage, Untrusted,
+    sha256, BudgetDim, LoopDetector, LoopEvent, LoopKind, LoopSignal, Meter, MeterLimits,
+    MonoClock, Nonce, RunId, Source, StopCause, TokenUsage, Untrusted,
 };
 use harness_journal::writer::SystemClock;
 use harness_journal::{
     layout, BlobSink, Clock, Event, EventKind, Header, Ident, JournalError, JournalFile,
     JournalWriter, StartError, Trusted,
 };
+use harness_journal::{Condition, ConditionKind};
 use harness_manifest::admission::{Registry, Resolved};
 use harness_manifest::Capability;
 use harness_model::context::{self, ContextError, Fact, FactValue, Feedback, Turn};
@@ -53,7 +54,7 @@ use harness_policy::{
     Call, DenyReason, PolicyDecision, RuleId, RuleList, Session, SessionRefused, SessionSpec,
     UserPolicy, WorkspaceDecl, SUBMIT_ID,
 };
-use harness_tools::builtin::{workspace_facts, RootRefused};
+use harness_tools::builtin::{workspace_facts, RootRefused, WorkspaceFacts};
 use harness_tools::{InvokeCtx, ReadTools, ToolProvider, ToolStatus};
 use serde_json::Value;
 
@@ -84,6 +85,8 @@ pub struct RunConfig {
     /// Longest a single tool call may take (§2.4: 30 s for non-exec tools;
     /// also capped by the remaining wall budget).
     pub tool_call_timeout: Duration,
+    /// Longest the pre-start workspace-facts walk may take.
+    pub facts_timeout: Duration,
 }
 
 impl RunConfig {
@@ -100,6 +103,7 @@ impl RunConfig {
             },
             model_call_timeout: Duration::from_secs(300),
             tool_call_timeout: Duration::from_secs(30),
+            facts_timeout: Duration::from_secs(120),
         }
     }
 }
@@ -164,6 +168,9 @@ pub enum RunRefused {
     /// The journal header is not durable (§2.5).
     #[error("{0}")]
     Start(#[from] StartError),
+    /// A resume that cannot continue this run (§2.10).
+    #[error("cannot resume: {0}")]
+    NotResumable(&'static str),
 }
 
 impl RunRefused {
@@ -203,62 +210,62 @@ pub struct RunReport {
 /// Run a task (see the crate docs). `Err` means the run did not start.
 pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
     // ---- Before anything is written. ----
-    let (session, tools) = plan(r.spec, r.registry, r.policy, r.profile)?;
-    let read_tools = ReadTools::new(r.workspace)?;
-    let ws = read_tools.root().to_path_buf();
-    let state_root = std::fs::canonicalize(r.state_root).map_err(RunRefused::StateRoot)?;
-    if state_root.starts_with(&ws) || ws.starts_with(&state_root) {
-        return Err(RunRefused::Overlap);
-    }
-    let state_str = state_root.to_str().ok_or_else(|| {
-        RunRefused::StateRoot(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "state_root is not valid UTF-8",
-        ))
-    })?;
-    locality::check(r.probe, state_str)?;
-    let (tree, files) = workspace_facts(&ws).map_err(RunRefused::Facts)?;
-    let facts = vec![
-        Fact {
-            name: "workspace tree digest",
-            value: FactValue::Digest(tree),
-            method:
-                "walk of the workspace in name order, symlinks not followed, sha256 of each file",
-        },
-        Fact {
-            name: "workspace file count",
-            value: FactValue::Count(files),
-            method: "the same walk",
-        },
-    ];
+    let pre = prepare(
+        r.spec,
+        r.registry,
+        r.policy,
+        r.profile,
+        r.workspace,
+        r.state_root,
+        r.probe,
+        r.config,
+    )?;
+    let facts = pre.facts;
 
     // ---- runs/<run-id>, the first attempt, the durable header. ----
-    let (run_id, run_dir) = create_run(&state_root)?;
+    let (run_id, run_dir) = create_run(&pre.state_root)?;
     if let Some(s) = run_dir.to_str() {
         locality::check(r.probe, s)?;
     }
-    let header = header(r.spec, r.registry, r.profile, r.backend, tree, files)?;
-    let (mut w, attempt) = JournalWriter::create_next_attempt(&run_dir, run_id.clone(), header)?;
+    let header = header(&HeaderInputs {
+        spec: r.spec,
+        registry: r.registry,
+        policy: r.policy,
+        profile: r.profile,
+        identity: &r.backend.identity(),
+        facts,
+        limits: &r.config.limits,
+        resumed_from: None,
+    })?;
+    let (mut w, attempt) = JournalWriter::create_next_attempt_checked(
+        &run_dir,
+        run_id.clone(),
+        header,
+        &attempt_check(r.probe),
+    )?;
 
     // ---- The loop. ----
     let meter = new_meter(r.config.limits.clone(), Box::new(SystemClock::default()));
     let mut lp = Loop {
-        session,
+        session: pre.session,
         registry: r.registry,
-        tools,
+        tools: pre.tools,
         task: &r.spec.task,
-        facts,
+        facts: facts_block(&facts),
         profile: r.profile,
         backend: r.backend,
-        providers: vec![Box::new(read_tools)],
+        providers: vec![Box::new(pre.read_tools)],
         meter,
         detector: LoopDetector::new(),
         turns: Vec::new(),
         config: r.config,
         step: 0,
+        nonces: NonceSource::default(),
+        feed: std::collections::VecDeque::new(),
+        reads: ReadLog::default(),
     };
     let end = lp.drive(&mut w);
-    let released = commit(w, &end);
+    let released = commit(w, &end, None);
     Ok(RunReport {
         run: run_id,
         attempt,
@@ -271,12 +278,106 @@ pub fn run(r: Run<'_>) -> Result<RunReport, RunRefused> {
     })
 }
 
+/// What `prepare` established before anything was written.
+pub(crate) struct Prepared {
+    pub(crate) session: Session,
+    pub(crate) tools: Vec<ToolSpec>,
+    pub(crate) read_tools: ReadTools,
+    pub(crate) state_root: PathBuf,
+    pub(crate) facts: WorkspaceFacts,
+}
+
+/// The pre-start checks shared by `run` and `resume` (§2.1): plan the
+/// session, open the workspace, canonicalise `state_root`, refuse an
+/// overlap, check locality, measure the workspace facts.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare(
+    spec: &TaskSpec,
+    registry: &Registry,
+    policy: &UserPolicy,
+    profile: &Profile,
+    workspace: &Path,
+    state_root: &Path,
+    probe: &dyn LocalityProbe,
+    config: &RunConfig,
+) -> Result<Prepared, RunRefused> {
+    let (session, tools) = plan(spec, registry, policy, profile)?;
+    let read_tools = ReadTools::new(workspace)?;
+    let ws = read_tools.root().to_path_buf();
+    let state_root = std::fs::canonicalize(state_root).map_err(RunRefused::StateRoot)?;
+    if state_root.starts_with(&ws) || ws.starts_with(&state_root) {
+        return Err(RunRefused::Overlap);
+    }
+    let state_str = state_root.to_str().ok_or_else(|| {
+        RunRefused::StateRoot(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "state_root is not valid UTF-8",
+        ))
+    })?;
+    locality::check(probe, state_str)?;
+    let facts =
+        workspace_facts(&ws, Instant::now() + config.facts_timeout).map_err(RunRefused::Facts)?;
+    Ok(Prepared {
+        session,
+        tools,
+        read_tools,
+        state_root,
+        facts,
+    })
+}
+
+/// The locality check run on each new attempt directory (§2.8).
+pub(crate) fn attempt_check(
+    probe: &dyn LocalityProbe,
+) -> impl Fn(&Path) -> Result<(), String> + '_ {
+    move |dir: &Path| {
+        let s = dir
+            .to_str()
+            .ok_or_else(|| "the attempt directory is not valid UTF-8".to_owned())?;
+        locality::check(probe, s)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Context block 4 from the measured facts.
+pub(crate) fn facts_block(f: &WorkspaceFacts) -> Vec<Fact> {
+    vec![
+        Fact {
+            name: "workspace tree digest",
+            value: FactValue::Digest(f.tree),
+            method: "walk of the workspace in name order, symlinks not followed, sha256 of each file up to 64 MiB, size only above",
+        },
+        Fact {
+            name: "workspace file count",
+            value: FactValue::Count(f.files),
+            method: "the same walk",
+        },
+        Fact {
+            name: "workspace files over 64 MiB (size only)",
+            value: FactValue::Count(f.oversize),
+            method: "the same walk",
+        },
+    ]
+}
+
 /// The meter, built here and only here in production code, always with a
 /// clock the caller does not control in [`run`] (the real one).
 pub(crate) fn new_meter(limits: MeterLimits, clock: Box<dyn MonoClock>) -> Meter {
     // No hosted endpoints in this build, so no price table (§2.4: a hosted
     // run without one refuses to start, N-7, with the `hosted` feature).
     Meter::new(limits, None, clock)
+}
+
+/// The meter of a resumed attempt: the wall time the interrupted attempt
+/// already spent (its journal's last monotonic time) is charged from the
+/// start (§2.10).
+pub(crate) fn new_meter_resumed(
+    limits: MeterLimits,
+    clock: Box<dyn MonoClock>,
+    already_elapsed: Duration,
+) -> Meter {
+    Meter::new_resumed(limits, None, clock, already_elapsed)
 }
 
 /// Plan the session and the tool definitions (§2.1 "plan session").
@@ -332,19 +433,38 @@ fn create_run(state_root: &Path) -> Result<(RunId, PathBuf), RunRefused> {
     Err(RunRefused::RunDir(last))
 }
 
-fn header(
-    spec: &TaskSpec,
-    registry: &Registry,
-    profile: &Profile,
-    backend: &dyn ModelBackend,
-    tree: Digest,
-    files: u64,
-) -> Result<Header, RunRefused> {
+/// Everything the journal header is built from.
+pub(crate) struct HeaderInputs<'a> {
+    pub(crate) spec: &'a TaskSpec,
+    pub(crate) registry: &'a Registry,
+    pub(crate) policy: &'a UserPolicy,
+    pub(crate) profile: &'a Profile,
+    pub(crate) identity: &'a harness_model::ModelIdentity,
+    pub(crate) facts: WorkspaceFacts,
+    pub(crate) limits: &'a MeterLimits,
+    /// A resumed attempt: the attempt it continues and that journal's
+    /// chain head.
+    pub(crate) resumed_from: Option<(u32, Digest)>,
+}
+
+/// The header keys an audit replay or a resume recomputes from its own
+/// inputs and requires to be equal to the recorded ones.
+pub(crate) const HEADER_INPUT_KEYS: [&str; 7] = [
+    "task",
+    "grants",
+    "workspace_public",
+    "protocol",
+    "profile",
+    "policy",
+    "checks",
+];
+
+pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, RunRefused> {
     let version = Ident::of(env!("CARGO_PKG_VERSION")).ok_or(StartError {
         op: "header",
         error: "the harness version is not an identifier".into(),
     })?;
-    let id = backend.identity();
+    let spec = h.spec;
     let grants = spec
         .grants
         .iter()
@@ -354,16 +474,17 @@ fn header(
                 .then(|| SUBMIT_ID.to_owned())
                 .as_ref(),
         )
-        .filter_map(|g| match registry.resolve(g) {
+        .filter_map(|g| match h.registry.resolve(g) {
             Resolved::One { capability, .. } => Ident::from_capability(capability),
             _ => None,
         })
         .map(Trusted::Id)
         .collect();
-    Ok(Header::new(version)
+    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    let mut hd = Header::new(version)
         .field(
             "endpoint",
-            Trusted::Text(match id.endpoint {
+            Trusted::Text(match h.identity.endpoint {
                 harness_model::EndpointClass::Loopback => "loopback",
                 harness_model::EndpointClass::Replay => "replay",
                 harness_model::EndpointClass::Scripted => "scripted",
@@ -371,17 +492,65 @@ fn header(
         )
         .field(
             "protocol",
-            Trusted::Text(match profile.protocol() {
+            Trusted::Text(match h.profile.protocol() {
                 Protocol::Text => "text",
                 Protocol::Native => "native",
             }),
         )
-        .field("profile_validated", Trusted::Bool(id.profile_validated))
+        .field(
+            "task",
+            Trusted::Digest(sha256(spec.task.as_str().as_bytes())),
+        )
+        .field("profile", Trusted::Digest(h.profile.content_sha256()))
+        .field(
+            "profile_validated",
+            Trusted::Bool(h.identity.profile_validated),
+        )
+        .field("policy", Trusted::Digest(h.policy.digest()))
         .field("grants", Trusted::List(grants))
         .field("workspace_public", Trusted::Bool(spec.workspace_public))
-        .field("workspace_tree", Trusted::Digest(tree))
-        .field("workspace_files", Trusted::U64(files))
-        .field("checks", Trusted::U64(0)))
+        .field("workspace_tree", Trusted::Digest(h.facts.tree))
+        .field("workspace_files", Trusted::U64(h.facts.files))
+        .field("workspace_oversize", Trusted::U64(h.facts.oversize))
+        .field(
+            "limits",
+            Trusted::Obj(vec![
+                ("steps", Trusted::U64(u64::from(h.limits.steps))),
+                ("tokens", Trusted::U64(h.limits.tokens)),
+                ("wall_ms", Trusted::U64(ms(h.limits.wall))),
+                ("cost_micros", Trusted::U64(h.limits.cost_micros)),
+                (
+                    "format_errors",
+                    Trusted::U64(u64::from(h.limits.format_errors)),
+                ),
+                (
+                    "repair_rounds",
+                    Trusted::U64(u64::from(h.limits.repair_rounds)),
+                ),
+            ]),
+        )
+        .field("checks", Trusted::U64(0));
+    if let Some((attempt, head)) = h.resumed_from {
+        hd = hd.field(
+            "resumed_from",
+            Trusted::Obj(vec![
+                ("attempt", Trusted::U64(u64::from(attempt))),
+                ("chain_head", Trusted::Digest(head)),
+            ]),
+        );
+    }
+    // §3.5: what the server claims, as untrusted payloads, labelled.
+    let c = &h.identity.claimed;
+    for (key, v) in [
+        ("claimed_model_id", &c.model_id),
+        ("claimed_server", &c.server),
+        ("claimed_template_sha256", &c.template_sha256),
+    ] {
+        if let Some(v) = v {
+            hd = hd.claimed(key, Untrusted::new(v.clone(), Source::Model));
+        }
+    }
+    Ok(hd)
 }
 
 /// How the loop ended.
@@ -397,15 +566,16 @@ pub(crate) struct End {
 pub(crate) fn commit<F: JournalFile, B: BlobSink, K: Clock>(
     w: JournalWriter<F, B, K>,
     end: &End,
+    outcome: Option<GateOutcome>,
 ) -> harness_journal::Released {
-    let outcome = match end.cause {
+    let outcome = outcome.unwrap_or(match end.cause {
         StopCause::JournalUnavailable { .. } => GateOutcome::Indeterminate {
             why: IndeterminateKind::UnreadableEvidence,
         },
         _ => GateOutcome::Indeterminate {
             why: IndeterminateKind::NothingChecked,
         },
-    };
+    });
     w.commit(end.step, &end.cause, outcome, end.deliverable)
 }
 
@@ -427,6 +597,82 @@ pub(crate) struct Loop<'a> {
     pub(crate) turns: Vec<Turn>,
     pub(crate) config: &'a RunConfig,
     pub(crate) step: u64,
+    /// Where render nonces come from (recorded ones first when replaying).
+    pub(crate) nonces: NonceSource,
+    /// Recorded tool results that stand in for calls (audit replay and a
+    /// resume's catch-up); when empty, the providers run.
+    pub(crate) feed: std::collections::VecDeque<RecordedResult>,
+    /// Files read this run and their digests (§2.3 "Stale reads").
+    pub(crate) reads: ReadLog,
+}
+
+/// Where render nonces come from: recorded ones in order (so a replayed
+/// request renders byte for byte), then fresh random ones.
+#[derive(Debug, Default)]
+pub(crate) struct NonceSource {
+    pub(crate) recorded: std::collections::VecDeque<Nonce>,
+}
+
+impl NonceSource {
+    fn next(&mut self) -> Option<Nonce> {
+        self.recorded.pop_front().or_else(new_nonce)
+    }
+}
+
+/// A recorded `ToolFinished`, re-fed in place of the call it records.
+#[derive(Debug, Clone)]
+pub(crate) struct RecordedResult {
+    /// The capability the recorded intent named.
+    pub(crate) capability: String,
+    /// `None` for a recorded provider failure.
+    pub(crate) status: Option<ToolStatus>,
+    pub(crate) output: Vec<u8>,
+    pub(crate) truncated: bool,
+    pub(crate) digest: Digest,
+    pub(crate) read_sha256: Option<Digest>,
+}
+
+/// The files read this run, with the SHA-256 of each file's whole content
+/// at its latest read (design §2.3 "Stale reads"). H1 has no edit tools,
+/// so nothing consumes it yet; H2's edits call [`ReadLog::check`], which
+/// refuses an edit to a file that changed since it was read, or was never
+/// read.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReadLog {
+    files: std::collections::BTreeMap<String, Digest>,
+}
+
+/// Why an edit anchored on an earlier read is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum StaleRead {
+    /// The file was never read in this run.
+    #[error("file not read in this run; read it first")]
+    NeverRead,
+    /// The file changed since it was last read.
+    #[error("file changed since read; re-read first")]
+    Changed,
+}
+
+impl ReadLog {
+    /// Record a read.
+    pub fn record(&mut self, path: &str, sha256: Digest) {
+        self.files.insert(path.to_owned(), sha256);
+    }
+
+    /// The digest recorded for `path`, if any.
+    pub fn get(&self, path: &str) -> Option<Digest> {
+        self.files.get(path).copied()
+    }
+
+    /// Whether an edit may rely on the last read of `path`, given the
+    /// file's current digest.
+    pub fn check(&self, path: &str, current: Digest) -> Result<(), StaleRead> {
+        match self.files.get(path) {
+            None => Err(StaleRead::NeverRead),
+            Some(d) if *d == current => Ok(()),
+            Some(_) => Err(StaleRead::Changed),
+        }
+    }
 }
 
 /// One step's result.
@@ -487,6 +733,7 @@ impl<'a> Loop<'a> {
         // 1. Charge the meter.
         self.meter.tick_wall()?;
         self.meter.charge_step()?;
+        self.observe_budgets(w, step)?;
 
         // 2. Build the context (§2.3).
         let built = match context::build(
@@ -535,6 +782,7 @@ impl<'a> Loop<'a> {
             completion.request_bytes.max(request_bytes),
             completion.reply_bytes,
         )?;
+        self.observe_budgets(w, step)?;
 
         // 4. Parse exactly one action.
         let parsed = parse_reply(&completion, self.profile.protocol(), &self.tools);
@@ -672,15 +920,31 @@ impl<'a> Loop<'a> {
             deadline: Instant::now() + self.config.tool_call_timeout.min(self.remaining_wall()),
         };
         let provider = capability.id().provider().to_owned();
-        let result = match self
-            .providers
-            .iter_mut()
-            .find(|p| p.namespace().as_str() == provider)
-        {
-            Some(p) => p.invoke(journaled, &ctx),
-            None => {
-                drop(journaled);
-                Err(harness_tools::ToolError("no provider serves it".into()))
+        let result = if let Some(rec) = self.feed.pop_front() {
+            // Replaying (audit, or a resume catching up): the recorded
+            // result of this very call stands in for running it again. The
+            // intent above is journaled all the same, so the replayed
+            // journal has the recorded shape.
+            let path = journaled
+                .call()
+                .call()
+                .args
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            drop(journaled);
+            rec.into_result(&tool, path.as_deref())
+        } else {
+            match self
+                .providers
+                .iter_mut()
+                .find(|p| p.namespace().as_str() == provider)
+            {
+                Some(p) => p.invoke(journaled, &ctx),
+                None => {
+                    drop(journaled);
+                    Err(harness_tools::ToolError("no provider serves it".into()))
+                }
             }
         };
         // No budget check between the call and its result record (H1e-2a
@@ -699,6 +963,10 @@ impl<'a> Loop<'a> {
                     .field("output", Trusted::Untrusted(out));
                 if let ToolStatus::Error { code } = res.status {
                     ev = ev.field("code", Trusted::U64(u64::from(code)));
+                }
+                if let Some(r) = &res.read {
+                    ev = ev.field("read_sha256", Trusted::Digest(r.sha256));
+                    self.reads.record(r.path.as_str(), r.sha256);
                 }
                 w.append(step, ev).map_err(journal)?;
                 self.detector
@@ -739,6 +1007,7 @@ impl<'a> Loop<'a> {
         // 10. Stop checks: the meter (budgets, the tool's wall time
         // included) and the journal (in drive).
         self.meter.tick_wall()?;
+        self.observe_budgets(w, step)?;
         Ok(Flow::Continue)
     }
 
@@ -746,11 +1015,11 @@ impl<'a> Loop<'a> {
     /// the nonce is refused by the renderer; a new nonce is tried (three
     /// times) before the run stops.
     fn request(
-        &self,
+        &mut self,
         mut messages: Vec<harness_model::Message>,
     ) -> Result<(ModelRequest, Value), StopCause> {
         for _ in 0..3 {
-            let nonce = new_nonce().ok_or(StopCause::PolicyAbort)?;
+            let nonce = self.nonces.next().ok_or(StopCause::PolicyAbort)?;
             let req = ModelRequest {
                 messages,
                 tools: self.tools.clone(),
@@ -798,6 +1067,27 @@ impl<'a> Loop<'a> {
             notice: None,
         });
         Ok(Flow::Continue)
+    }
+
+    /// The 80% standing condition per budget dimension (§2.6), journaled
+    /// only when it begins or ends (`BudgetCharged`, key = dimension).
+    fn observe_budgets<F: JournalFile, B: BlobSink, K: Clock>(
+        &mut self,
+        w: &mut JournalWriter<F, B, K>,
+        step: u64,
+    ) -> Result<(), StopCause> {
+        for dim in BUDGET_DIMS {
+            let Some(key) = Ident::of(budget_key(dim)) else {
+                continue;
+            };
+            let c = Condition {
+                kind: ConditionKind::BudgetAbove80,
+                key,
+            };
+            w.observe_condition(step, &c, self.meter.above_80(dim))
+                .map_err(journal)?;
+        }
+        Ok(())
     }
 
     /// A step with no action still counts toward no-progress (§2.6).
@@ -876,6 +1166,60 @@ fn decided(d: &PolicyDecision) -> Event {
         ev = ev.field("reason", Trusted::Text(deny_name(reason)));
     }
     ev
+}
+
+/// The dimensions whose 80% crossing is journaled (§2.6). Repair rounds
+/// are a verification budget (not spent in H1).
+const BUDGET_DIMS: [BudgetDim; 5] = [
+    BudgetDim::Steps,
+    BudgetDim::Tokens,
+    BudgetDim::Wall,
+    BudgetDim::Cost,
+    BudgetDim::FormatErrors,
+];
+
+pub(crate) fn budget_key(d: BudgetDim) -> &'static str {
+    match d {
+        BudgetDim::Steps => "steps",
+        BudgetDim::Tokens => "tokens",
+        BudgetDim::Wall => "wall",
+        BudgetDim::Cost => "cost",
+        BudgetDim::FormatErrors => "format_errors",
+        BudgetDim::RepairRounds => "repair_rounds",
+    }
+}
+
+impl RecordedResult {
+    /// The recorded result as a tool result for this call. A recorded
+    /// result for another capability is a provider failure here, so the
+    /// replayed journal differs from the recorded one at this step.
+    fn into_result(
+        self,
+        tool: &str,
+        path: Option<&str>,
+    ) -> Result<harness_tools::ToolResult, harness_tools::ToolError> {
+        let unfit =
+            || harness_tools::ToolError("the recorded result does not fit this call".into());
+        if self.capability != tool {
+            return Err(unfit());
+        }
+        let status = self.status.ok_or_else(unfit)?;
+        let read = match (self.read_sha256, path) {
+            (Some(sha256), Some(p)) => Some(harness_tools::ReadRecord {
+                path: harness_policy::workspace_path(p).map_err(|_| unfit())?,
+                sha256,
+            }),
+            (None, _) => None,
+            (Some(_), None) => return Err(unfit()),
+        };
+        Ok(harness_tools::ToolResult {
+            status,
+            output: Untrusted::new(self.output, Source::Tool(self.capability)),
+            truncated: self.truncated,
+            digest: self.digest,
+            read,
+        })
+    }
 }
 
 fn deny_name(r: &DenyReason) -> &'static str {

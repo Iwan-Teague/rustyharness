@@ -167,6 +167,15 @@ fn a_whole_run_reads_submits_and_is_nothing_checked() {
         capabilities(&recs, EventKind::ToolStarted, "capability"),
         ["harness.fs.read", "harness.task.submit"]
     );
+    // The read record (§2.3 "Stale reads"): the file's whole-content digest.
+    let read = recs
+        .iter()
+        .find(|r| r.kind == EventKind::ToolFinished && r.body.contains_key("read_sha256"))
+        .unwrap();
+    assert_eq!(
+        read.body["read_sha256"],
+        serde_json::json!(harness_core::sha256(b"hello from the workspace\n").to_string())
+    );
     // The file's text reached the journal only as an untrusted payload.
     let j = String::from_utf8(all_bytes(&state)).unwrap();
     assert!(j.contains("hello from the workspace"));

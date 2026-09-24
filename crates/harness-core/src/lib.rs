@@ -49,6 +49,39 @@ pub fn sha256_parts(parts: &[&[u8]]) -> Digest {
     Digest::from_bytes(out)
 }
 
+/// Incremental SHA-256 over bytes fed in pieces (H1e-2a confirming review
+/// NF-1: a large file is hashed chunk by chunk, never read whole). The same
+/// digest as [`sha256`] over the concatenation. Pure: the caller does the
+/// reading.
+#[derive(Clone, Default)]
+pub struct Sha256Stream(sha2::Sha256);
+
+impl fmt::Debug for Sha256Stream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Sha256Stream")
+    }
+}
+
+impl Sha256Stream {
+    /// A fresh hash.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed more bytes.
+    pub fn update(&mut self, bytes: &[u8]) {
+        use sha2::Digest as _;
+        self.0.update(bytes);
+    }
+
+    /// The digest of everything fed.
+    pub fn finish(self) -> Digest {
+        use sha2::Digest as _;
+        let out: [u8; 32] = self.0.finalize().into();
+        Digest::from_bytes(out)
+    }
+}
+
 /// A run identity (design §2.8): 128 bits, time-ordered then random,
 /// written as exactly 32 lowercase hex characters. Its own strict type
 /// (H1c confirming review NF-3): a run id becomes a directory name under
@@ -473,6 +506,23 @@ impl Meter {
         }
     }
 
+    /// A meter for a RESUMED attempt (design §2.10): as [`Meter::new`], but
+    /// the wall time the interrupted attempt already spent (the last
+    /// recorded monotonic time of its journal) counts from the start, so
+    /// killing and resuming a run does not buy fresh wall budget. The only
+    /// constructor that takes a duration from outside the meter's clock;
+    /// the purity gate confines it to the run driver like `Meter::new`.
+    pub fn new_resumed(
+        limits: MeterLimits,
+        pricing: Option<Pricing>,
+        clock: Box<dyn MonoClock>,
+        already_elapsed: Duration,
+    ) -> Self {
+        let mut m = Self::new(limits, pricing, clock);
+        m.elapsed = already_elapsed;
+        m
+    }
+
     fn latched(&self) -> Option<StopCause> {
         self.exhaustion.as_ref().map(stop_cause)
     }
@@ -683,6 +733,37 @@ impl Meter {
     /// The typed stop cause for a latched exhaustion (INV-14), if any.
     pub fn stop_cause(&self) -> Option<StopCause> {
         self.latched()
+    }
+
+    /// `(spent, limit)` for a dimension, as measured here (wall time in
+    /// milliseconds). Feeds the 80% standing condition (§2.6).
+    pub fn usage(&self, dim: BudgetDim) -> (u64, u64) {
+        let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+        match dim {
+            BudgetDim::Steps => (u64::from(self.spent_steps), u64::from(self.limits.steps)),
+            BudgetDim::Tokens => (
+                self.tokens_input.saturating_add(self.tokens_output),
+                self.limits.tokens,
+            ),
+            BudgetDim::Wall => (ms(self.elapsed), ms(self.limits.wall)),
+            BudgetDim::Cost => (self.cost_micros, self.limits.cost_micros),
+            BudgetDim::FormatErrors => (
+                u64::from(self.consecutive_format_errors),
+                u64::from(self.limits.format_errors),
+            ),
+            BudgetDim::RepairRounds => (
+                u64::from(self.repair_rounds_used),
+                u64::from(self.limits.repair_rounds),
+            ),
+        }
+    }
+
+    /// Whether a dimension has crossed 80% of its limit (§2.6 standing
+    /// condition). A zero limit (e.g. the cost of a local model) never
+    /// counts as crossed: it is not a budget in use.
+    pub fn above_80(&self, dim: BudgetDim) -> bool {
+        let (spent, limit) = self.usage(dim);
+        limit > 0 && u128::from(spent) * 5 >= u128::from(limit) * 4
     }
 }
 
@@ -1027,6 +1108,85 @@ mod tests {
 
     // H1e-1 review: the pause is a guard, so a wait always ends and the wall
     // budget is never switched off for the rest of the run.
+    #[test]
+    fn the_80_percent_condition_is_measured_per_dimension() {
+        let mut m = Meter::new(
+            MeterLimits {
+                steps: 10,
+                tokens: 100,
+                wall: Duration::from_secs(60),
+                cost_micros: 0,
+                format_errors: 3,
+                repair_rounds: 1,
+            },
+            None,
+            Box::new(ManualClock::default()),
+        );
+        for _ in 0..7 {
+            m.charge_step().unwrap();
+        }
+        assert!(!m.above_80(BudgetDim::Steps));
+        m.charge_step().unwrap();
+        assert!(m.above_80(BudgetDim::Steps), "8 of 10");
+        assert!(!m.above_80(BudgetDim::Cost), "a zero limit is not in use");
+        m.record_tokens(
+            Some(TokenUsage {
+                input: 70,
+                output: 9,
+            }),
+            0,
+            0,
+        )
+        .unwrap();
+        assert!(!m.above_80(BudgetDim::Tokens));
+        m.record_tokens(
+            Some(TokenUsage {
+                input: 1,
+                output: 0,
+            }),
+            0,
+            0,
+        )
+        .unwrap();
+        assert!(m.above_80(BudgetDim::Tokens));
+        assert_eq!(m.usage(BudgetDim::Tokens), (80, 100));
+    }
+
+    #[test]
+    fn a_resumed_meter_starts_with_the_time_already_spent() {
+        let limits = MeterLimits {
+            steps: 10,
+            tokens: 100,
+            wall: Duration::from_secs(60),
+            cost_micros: 0,
+            format_errors: 3,
+            repair_rounds: 1,
+        };
+        let mut m = Meter::new_resumed(
+            limits.clone(),
+            None,
+            Box::new(ManualClock::default()),
+            Duration::from_secs(50),
+        );
+        assert!(m.tick_wall().is_ok());
+        assert_eq!(m.elapsed(), Duration::from_secs(50));
+        let mut m = Meter::new_resumed(
+            limits,
+            None,
+            Box::new(ManualClock::default()),
+            Duration::from_secs(61),
+        );
+        assert_eq!(m.tick_wall(), Err(StopCause::Budget(BudgetDim::Wall)));
+    }
+
+    #[test]
+    fn sha256_stream_equals_the_one_shot_digest() {
+        let mut h = Sha256Stream::new();
+        h.update(b"hello ");
+        h.update(b"world");
+        assert_eq!(h.finish(), sha256(b"hello world"));
+    }
+
     #[test]
     fn a_dropped_pause_guard_resumes_the_wall_clock() {
         let clock = ManualClock::default();

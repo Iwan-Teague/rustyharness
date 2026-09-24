@@ -97,6 +97,19 @@ pub struct ToolResult {
     pub truncated: bool,
     /// SHA-256 of the full output (computed by the harness, §1.4).
     pub digest: Digest,
+    /// For a successful `fs.read`: which file, and the SHA-256 of its whole
+    /// content when read (§2.3 "Stale reads"; the run keeps these so an
+    /// edit (H2) can refuse a file that changed since it was read).
+    pub read: Option<ReadRecord>,
+}
+
+/// A file read and its content digest (§2.3 "Stale reads").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadRecord {
+    /// The workspace path (lexically checked).
+    pub path: harness_policy::WorkspacePath,
+    /// SHA-256 of the whole file at read time.
+    pub sha256: Digest,
 }
 
 /// A provider-level failure (the provider could not even report a status).

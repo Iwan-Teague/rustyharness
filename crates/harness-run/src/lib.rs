@@ -44,8 +44,10 @@
 )]
 
 pub mod driver;
+pub mod replay;
 
-pub use driver::{run, Run, RunConfig, RunRefused, RunReport, TaskSpec};
+pub use driver::{run, ReadLog, Run, RunConfig, RunRefused, RunReport, StaleRead, TaskSpec};
+pub use replay::{audit, resume, Audit, AuditRefused, AuditReport, Divergence, Resume};
 
 #[cfg(test)]
 mod tests;

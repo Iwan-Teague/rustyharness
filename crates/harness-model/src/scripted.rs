@@ -79,6 +79,7 @@ impl ModelBackend for ScriptedBackend {
             profile_validated: self.profile.validated(),
             profile_stamp_sha256: self.profile.stamp_sha256().map(str::to_owned),
             api_key_handle: None,
+            claimed: crate::ServerClaims::default(),
         }
     }
 

@@ -270,6 +270,22 @@ pub struct ModelIdentity {
     pub profile_stamp_sha256: Option<String>,
     /// The API key's handle name, never its value (§5.5).
     pub api_key_handle: Option<String>,
+    /// What the server SAYS it is (§3.5). Claims, not facts: the run
+    /// driver records them only as untrusted payloads labelled "claimed".
+    pub claimed: ServerClaims,
+}
+
+/// Server-claimed identity (§3.5): a server can lie about what it serves,
+/// so these are recorded as claims beside what the harness controls.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServerClaims {
+    /// The model id the server listed for the profile's model.
+    pub model_id: Option<String>,
+    /// The server's `Server` header (software and version).
+    pub server: Option<String>,
+    /// The chat-template hash. Not collected in this build: it needs the
+    /// llama.cpp `/props` check of spike S-P1.
+    pub template_sha256: Option<String>,
 }
 
 impl fmt::Display for EndpointClass {

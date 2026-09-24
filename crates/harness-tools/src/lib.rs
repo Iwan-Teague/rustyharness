@@ -23,7 +23,9 @@ use serde::Deserialize;
 pub mod builtin;
 pub mod provider;
 pub use builtin::ReadTools;
-pub use provider::{InvokeCtx, RefusalKind, ToolError, ToolProvider, ToolResult, ToolStatus};
+pub use provider::{
+    InvokeCtx, ReadRecord, RefusalKind, ToolError, ToolProvider, ToolResult, ToolStatus,
+};
 
 /// The manifest schema version this harness understands.
 pub const SCHEMA_VERSION: u32 = 0;

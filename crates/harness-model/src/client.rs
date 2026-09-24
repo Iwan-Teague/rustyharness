@@ -150,6 +150,7 @@ pub struct OpenAiCompatible {
     profile: Profile,
     key: Option<ApiKey>,
     config: ClientConfig,
+    claims: std::cell::RefCell<crate::ServerClaims>,
 }
 
 fn map_http(e: HttpError) -> ModelError {
@@ -167,10 +168,11 @@ fn map_http(e: HttpError) -> ModelError {
     }
 }
 
-/// One attempt's result: a completion, a retryable status, or a final error.
+/// One attempt's result: a completion, a retryable status (with the
+/// server's `Retry-After`, if any), or a final error.
 enum Attempt {
     Done(Result<Completion, ModelError>),
-    Retryable(u16),
+    Retryable(u16, Option<u64>),
 }
 
 impl OpenAiCompatible {
@@ -193,6 +195,7 @@ impl OpenAiCompatible {
             profile,
             key,
             config,
+            claims: std::cell::RefCell::new(crate::ServerClaims::default()),
         })
     }
 
@@ -241,8 +244,8 @@ impl OpenAiCompatible {
                 }
                 _ => Err(ModelError::Unusable("unexpected content type".into())),
             }),
-            429 => Attempt::Retryable(429),
-            s @ 500..=599 => Attempt::Retryable(s),
+            429 => Attempt::Retryable(429, resp.retry_after_secs),
+            s @ 500..=599 => Attempt::Retryable(s, resp.retry_after_secs),
             s => Attempt::Done(Err(ModelError::Unusable(format!("HTTP status {s}")))),
         }
     }
@@ -261,11 +264,18 @@ impl OpenAiCompatible {
         }
         let v = strict_json::parse(&resp.body)
             .map_err(|_| ModelError::Unusable("GET /models: malformed JSON".into()))?;
-        let listed = v.get("data").and_then(Value::as_array).is_some_and(|d| {
+        let listed = v.get("data").and_then(Value::as_array).and_then(|d| {
             d.iter()
-                .any(|m| m.get("id").and_then(Value::as_str) == Some(self.profile.model()))
+                .filter_map(|m| m.get("id").and_then(Value::as_str))
+                .find(|id| *id == self.profile.model())
         });
-        if listed {
+        if let Some(id) = listed {
+            // §3.5: what the server claims, kept for the journal header.
+            *self.claims.borrow_mut() = crate::ServerClaims {
+                model_id: Some(id.to_owned()),
+                server: resp.server.clone(),
+                template_sha256: None,
+            };
             Ok(())
         } else {
             Err(ModelError::Unusable(
@@ -284,6 +294,7 @@ impl ModelBackend for OpenAiCompatible {
             profile_validated: self.profile.validated(),
             profile_stamp_sha256: self.profile.stamp_sha256().map(str::to_owned),
             api_key_handle: self.key.as_ref().map(|k| k.handle.clone()),
+            claimed: self.claims.borrow().clone(),
         }
     }
 
@@ -294,9 +305,9 @@ impl ModelBackend for OpenAiCompatible {
         let mut retried: Vec<u16> = Vec::new();
         let mut attempt: u32 = 0;
         loop {
-            let status = match self.attempt(&body, deadline, &retried) {
+            let (status, retry_after) = match self.attempt(&body, deadline, &retried) {
                 Attempt::Done(r) => return r,
-                Attempt::Retryable(s) => s,
+                Attempt::Retryable(s, ra) => (s, ra),
             };
             retried.push(status);
             let give_up = |s: u16, statuses: Vec<u16>| {
@@ -309,7 +320,11 @@ impl ModelBackend for OpenAiCompatible {
             if attempt >= self.config.retry.max_retries {
                 return Err(give_up(status, retried));
             }
-            let wait = Duration::from_millis(backoff_ms(&self.config.retry, attempt));
+            // Retry-After (H1e-2b) is honoured as a floor on the backoff,
+            // still bounded by the retry count above and the deadline below:
+            // a server asking for longer than the call has left ends it.
+            let wait = Duration::from_millis(backoff_ms(&self.config.retry, attempt))
+                .max(Duration::from_secs(retry_after.unwrap_or(0)));
             match deadline.checked_duration_since(Instant::now()) {
                 Some(left) if left > wait => std::thread::sleep(wait),
                 _ => return Err(give_up(status, retried)),

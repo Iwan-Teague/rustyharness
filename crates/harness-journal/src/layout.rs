@@ -92,6 +92,47 @@ pub fn create_next_attempt(run_dir: &Path) -> io::Result<(u32, PathBuf)> {
     Ok((n, dir))
 }
 
+/// `replay-<k>` under `run_dir`: where an audit replay writes the journal
+/// it recomputes (design §2.9), next to the attempts it checks, never
+/// inside one.
+pub fn replay_dir(run_dir: &Path, k: u32) -> PathBuf {
+    run_dir.join(format!("replay-{k}"))
+}
+
+/// Parse `replay-<k>` (the `attempt-<n>` grammar).
+pub fn parse_replay_name(name: &str) -> Option<u32> {
+    parse_attempt_name(&format!("attempt-{}", name.strip_prefix("replay-")?))
+}
+
+/// Create the next `replay-<k>` directory (1 if none), with `create_dir`.
+pub fn create_next_replay(run_dir: &Path) -> io::Result<(u32, PathBuf)> {
+    let mut max = 0u32;
+    for entry in fs::read_dir(run_dir)? {
+        let name = entry?.file_name();
+        if let Some(n) = name.to_str().and_then(parse_replay_name) {
+            max = max.max(n);
+        }
+    }
+    let k = max
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("replay counter exhausted"))?;
+    let dir = replay_dir(run_dir, k);
+    fs::create_dir(&dir)?;
+    Ok((k, dir))
+}
+
+/// The highest `attempt-<n>` under `run_dir`, if any.
+pub fn latest_attempt(run_dir: &Path) -> io::Result<Option<u32>> {
+    let mut max = None;
+    for entry in fs::read_dir(run_dir)? {
+        let name = entry?.file_name();
+        if let Some(n) = name.to_str().and_then(parse_attempt_name) {
+            max = Some(max.map_or(n, |m: u32| m.max(n)));
+        }
+    }
+    Ok(max)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +150,10 @@ mod tests {
             "x-1",
         ] {
             assert_eq!(parse_attempt_name(bad), None, "{bad}");
+        }
+        assert_eq!(parse_replay_name("replay-3"), Some(3));
+        for bad in ["replay-0", "replay-", "replay-x", "attempt-1"] {
+            assert_eq!(parse_replay_name(bad), None, "{bad}");
         }
     }
 }

@@ -194,6 +194,33 @@ impl UserPolicy {
         })
     }
 
+    /// SHA-256 of the policy's canonical form (each list in order, one
+    /// selector per line, `deny`/`ask`/`allow` sections): journaled in the
+    /// header so an audit replay under a different policy is refused
+    /// before any decision is compared (§2.9, §7.1 header).
+    pub fn digest(&self) -> harness_core::Digest {
+        let mut s = String::new();
+        for (name, list) in [
+            ("deny", &self.deny),
+            ("ask", &self.ask),
+            ("allow", &self.allow),
+        ] {
+            s.push_str(name);
+            s.push('\n');
+            for sel in list {
+                match sel {
+                    Selector::Capability(c) => s.push_str(c.as_str()),
+                    Selector::Provider(p) => {
+                        s.push_str(p.as_str());
+                        s.push_str(".*");
+                    }
+                }
+                s.push('\n');
+            }
+        }
+        harness_core::sha256(s.as_bytes())
+    }
+
     fn first_match(list: &[Selector], id: &CapId) -> Option<usize> {
         list.iter().position(|s| s.matches(id))
     }

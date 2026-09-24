@@ -421,12 +421,25 @@ while IFS= read -r f; do
     scan "leak" "\.leak ?\(" "$tmpdir/norm" "$f"
     case "$f" in
         crates/harness-core/src/lib.rs|crates/harness-model-core/src/protocol.rs|crates/harness-run/src/driver.rs) ;;
-        *) scan "Meter construction" "(^|$nb)Meter::new ?\(" "$tmpdir/norm" "$f" ;;
+        *) scan "Meter construction" "(^|$nb)Meter::new(_resumed)? ?\(" "$tmpdir/norm" "$f" ;;
     esac
 done <"$tmpdir/all-files"
 if [ -s "$tmpdir/hits" ]; then
     fail "provenance or construction-site fence:
 $(cat "$tmpdir/hits")"
+fi
+
+# --- 2e. the shipped binary refuses every state_root (INV-35, H1e-2b F-2) ---
+# Until spike S-F1 lands real probes, `rustyharness` must use `NoProbe`, and
+# nothing in any build of it may choose another probe: its main.rs names
+# exactly one probe, `&NoProbe`. (Tests pass their own probe to the CLI
+# library in process; the binary has no switch.)
+strip_comments crates/harness-cli/src/main.rs "$tmpdir/cli-main"
+normalise "$tmpdir/cli-main" "$tmpdir/cli-main-norm"
+grep -o 'probe:' "$tmpdir/cli-main-norm" >"$tmpdir/cli-probes" || true
+probes=$(wc -l <"$tmpdir/cli-probes" | tr -d ' ')
+if [ "$probes" != 1 ] || ! grep -q 'probe: &NoProbe,' "$tmpdir/cli-main-norm"; then
+    fail "the rustyharness binary must use exactly one probe, NoProbe (crates/harness-cli/src/main.rs)"
 fi
 
 # --- 2d. compile-fail doctests pin their reason (H1a review N-6) -------------
@@ -468,19 +481,25 @@ fi
 # stale result for a tree copied with old mtimes). Control: with debug
 # assertions on (test builds) it must NOT fire.
 command -v rustc >/dev/null 2>&1 || fail "rustc not found on PATH"
+# fi_check DEBUG CRATE FEATURE: expand CRATE's root with FEATURE on and
+# debug assertions DEBUG; count the compile_error! message.
 fi_check() {
-    rustc --edition 2021 --crate-type lib --crate-name harness_journal \
-        --cfg 'feature="fault-injection"' -C "debug-assertions=$1" --emit=metadata \
-        -o "$tmpdir/fi.rmeta" crates/harness-journal/src/lib.rs >"$tmpdir/fi-$1" 2>&1 || true
+    rustc --edition 2021 --crate-type lib --crate-name "$(printf '%s' "$2" | tr - _)" \
+        --cfg "feature=\"$3\"" -C "debug-assertions=$1" --emit=metadata \
+        -o "$tmpdir/fi.rmeta" "crates/$2/src/lib.rs" >"$tmpdir/fi-$1" 2>&1 || true
     grep -c "test-only and refused in optimised builds" "$tmpdir/fi-$1" >"$tmpdir/fi-count" || true
     read -r fi_n <"$tmpdir/fi-count" || fi_n=0
 }
-fi_check off
-[ "${fi_n:-0}" -gt 0 ] ||
-    fail "an optimised build with harness-journal/fault-injection compiles (the compile_error! is gone):
+for seam in harness-journal:fault-injection; do
+    crate=${seam%%:*}
+    feature=${seam#*:}
+    fi_check off "$crate" "$feature"
+    [ "${fi_n:-0}" -gt 0 ] ||
+        fail "an optimised build with $crate/$feature compiles (the compile_error! is gone):
 $(cat "$tmpdir/fi-off")"
-fi_check on
-[ "${fi_n:-0}" -eq 0 ] ||
-    fail "the fault-injection compile_error! also fires with debug assertions on (tests would break)"
+    fi_check on "$crate" "$feature"
+    [ "${fi_n:-0}" -eq 0 ] ||
+        fail "the $crate/$feature compile_error! also fires with debug assertions on (tests would break)"
+done
 
 printf 'purity gate OK: dependency shape, pure-content, INV-28 all clean.\n'

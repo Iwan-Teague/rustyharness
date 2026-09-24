@@ -57,8 +57,16 @@ dependencies = [
 name = "harness-cli"
 version = "0.0.1"
 dependencies = [
+ "gate-outcome",
+ "harness-core",
+ "harness-journal",
+ "harness-manifest",
+ "harness-model",
+ "harness-policy",
+ "harness-run",
  "harness-sandbox",
  "harness-tools",
+ "serde",
  "serde_json",
 ]
 

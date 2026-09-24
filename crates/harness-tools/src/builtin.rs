@@ -42,13 +42,15 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use harness_core::{sha256, Digest, Source, Untrusted};
+use harness_core::{sha256, Digest, Sha256Stream, Source, Untrusted};
 use harness_journal::Journaled;
 use harness_manifest::ProviderName;
 use harness_policy::{workspace_path, Authorized, Call, WorkspacePath};
 use serde_json::Value;
 
-use crate::provider::{InvokeCtx, RefusalKind, ToolError, ToolProvider, ToolResult, ToolStatus};
+use crate::provider::{
+    InvokeCtx, ReadRecord, RefusalKind, ToolError, ToolProvider, ToolResult, ToolStatus,
+};
 
 /// Largest file `fs.read` reads.
 pub const READ_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -151,12 +153,14 @@ impl ReadTools {
 struct Out {
     status: ToolStatus,
     text: String,
+    read: Option<ReadRecord>,
 }
 
 fn err(code: u16, msg: &str) -> Out {
     Out {
         status: ToolStatus::Error { code },
         text: format!("error: {msg}"),
+        read: None,
     }
 }
 
@@ -164,6 +168,7 @@ fn ok(text: String) -> Out {
     Out {
         status: ToolStatus::Ok,
         text,
+        read: None,
     }
 }
 
@@ -171,6 +176,7 @@ fn timeout() -> Out {
     Out {
         status: ToolStatus::Timeout,
         text: "error: the per-call deadline passed".into(),
+        read: None,
     }
 }
 
@@ -208,6 +214,7 @@ fn refused(cap: &str, reason: RefusalKind) -> ToolResult {
         digest: sha256(&text),
         output: Untrusted::new(text, Source::Tool(cap.to_owned())),
         truncated: false,
+        read: None,
     }
 }
 
@@ -229,6 +236,7 @@ fn finish(cap: &str, out: Out) -> ToolResult {
         output: Untrusted::new(text.into_bytes(), Source::Tool(cap.to_owned())),
         truncated,
         digest,
+        read: out.read,
     }
 }
 
@@ -300,11 +308,17 @@ impl ReadTools {
         let digest = sha256(&bytes);
         let text = String::from_utf8(bytes).map_err(|_| err(code::NOT_TEXT, "not UTF-8 text"))?;
         let total = text.lines().count() as u64;
+        let record = ReadRecord {
+            path: wp.clone(),
+            sha256: digest,
+        };
         if total == 0 {
-            return Ok(ok(format!(
+            let mut o = ok(format!(
                 "{}: empty file; sha256 {digest}\n",
                 shown_path(&wp)
-            )));
+            ));
+            o.read = Some(record);
+            return Ok(o);
         }
         if start > total {
             return Err(err(
@@ -322,7 +336,9 @@ impl ReadTools {
         for (i, line) in text.lines().skip(skip).take(take).enumerate() {
             s.push_str(&format!("{}\t{line}\n", start + i as u64));
         }
-        Ok(ok(s))
+        let mut o = ok(s);
+        o.read = Some(record);
+        Ok(o)
     }
 
     fn search(&self, args: &Value, deadline: Instant) -> Out {
@@ -643,13 +659,36 @@ impl Walk {
     }
 }
 
-/// The harness facts of a workspace (§2.3 block 4): the tree digest and the
-/// file count, from a full walk that follows no symlink. The digest is over
-/// every entry in name order as `kind ‖ path ‖ NUL ‖ content digest or
-/// nothing`, so it changes when any name, kind or file content changes.
-/// Refused (an `Err`) past [`FACTS_MAX_ENTRIES`] entries or on any
-/// unreadable entry: a fact the harness cannot measure is not stated.
-pub fn workspace_facts(root: &Path) -> io::Result<(Digest, u64)> {
+/// Files larger than this contribute their size, not their content, to
+/// the workspace tree digest (H1e-2a confirming review NF-1).
+pub const FACTS_FILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Chunk size of the streaming file hash.
+const FACTS_CHUNK_BYTES: usize = 64 * 1024;
+
+/// The harness facts of a workspace (§2.3 block 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkspaceFacts {
+    /// The tree digest.
+    pub tree: Digest,
+    /// Regular files.
+    pub files: u64,
+    /// Files over [`FACTS_FILE_MAX_BYTES`], digested by size only.
+    pub oversize: u64,
+}
+
+/// Measure the workspace facts: a full walk that follows no symlink, in
+/// name order, digesting every entry as `kind ‖ path ‖ NUL ‖ content` where
+/// the content is a file's SHA-256 (streamed in 64 KiB chunks, never read
+/// whole) or, for a file over [`FACTS_FILE_MAX_BYTES`], its size (kind
+/// `F`). So the digest changes when any name, kind or (capped) file
+/// content changes. Refused (an `Err`) past [`FACTS_MAX_ENTRIES`] entries,
+/// on any unreadable entry, or when `deadline` passes: a fact the harness
+/// cannot measure is not stated.
+pub fn workspace_facts(root: &Path, deadline: Instant) -> io::Result<WorkspaceFacts> {
+    facts_with(root, deadline, FACTS_FILE_MAX_BYTES)
+}
+
+fn facts_with(root: &Path, deadline: Instant, file_cap: u64) -> io::Result<WorkspaceFacts> {
     let m = fs::symlink_metadata(root)?;
     if m.file_type().is_symlink() || !m.is_dir() {
         return Err(io::Error::new(
@@ -657,36 +696,54 @@ pub fn workspace_facts(root: &Path) -> io::Result<(Digest, u64)> {
             "the workspace root is not a real directory",
         ));
     }
+    let late = || {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the facts walk passed its deadline",
+        )
+    };
     let mut walk = Walk::new(
         root.to_path_buf(),
         String::new(),
         m,
         usize::MAX,
         FACTS_MAX_ENTRIES,
-    );
-    let mut buf = Vec::new();
+    )
+    .until(deadline);
+    let mut tree = Sha256Stream::new();
     let mut files = 0u64;
+    let mut oversize = 0u64;
     while let Some(e) = walk.next_entry() {
+        if Instant::now() >= deadline {
+            return Err(late());
+        }
         if e.depth == 0 {
             continue;
         }
         let (kind, content) = if e.symlink {
-            (b'l', None)
+            (b'l', String::new())
         } else if e.meta.is_dir() {
-            (b'd', None)
+            (b'd', String::new())
         } else if e.meta.is_file() {
             files += 1;
-            (b'f', Some(sha256(&fs::read(&e.path)?)))
+            match hash_capped(&e.path, file_cap, deadline)? {
+                Some(d) => (b'f', d.to_string()),
+                None => {
+                    oversize += 1;
+                    (b'F', format!("len:{}", e.meta.len()))
+                }
+            }
         } else {
-            (b'o', None)
+            (b'o', String::new())
         };
-        buf.push(kind);
-        buf.extend_from_slice(e.rel.as_bytes());
-        buf.push(0);
-        if let Some(d) = content {
-            buf.extend_from_slice(d.to_string().as_bytes());
-        }
-        buf.push(b'\n');
+        tree.update(&[kind]);
+        tree.update(e.rel.as_bytes());
+        tree.update(&[0]);
+        tree.update(content.as_bytes());
+        tree.update(b"\n");
+    }
+    if walk.timed_out {
+        return Err(late());
     }
     if walk.stopped {
         return Err(io::Error::other(
@@ -696,12 +753,45 @@ pub fn workspace_facts(root: &Path) -> io::Result<(Digest, u64)> {
     if walk.unreadable > 0 {
         return Err(io::Error::other("a workspace entry could not be read"));
     }
-    Ok((sha256(&buf), files))
+    Ok(WorkspaceFacts {
+        tree: tree.finish(),
+        files,
+        oversize,
+    })
+}
+
+/// SHA-256 of a file read in chunks, at most `cap + 1` bytes: `None` when
+/// the file is longer than `cap` (by its metadata, or because it grew
+/// while being read). The deadline is checked between chunks.
+fn hash_capped(path: &Path, cap: u64, deadline: Instant) -> io::Result<Option<Digest>> {
+    if fs::symlink_metadata(path)?.len() > cap {
+        return Ok(None);
+    }
+    let mut f = File::open(path)?.take(cap + 1);
+    let mut h = Sha256Stream::new();
+    let mut buf = vec![0u8; FACTS_CHUNK_BYTES];
+    let mut total: u64 = 0;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the facts walk passed its deadline",
+            ));
+        }
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        h.update(buf.get(..n).unwrap_or(&[]));
+    }
+    Ok((total <= cap).then(|| h.finish()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn dir(name: &str, files: usize) -> PathBuf {
         let d = std::env::temp_dir().join(format!("harness-walk-{name}-{}", std::process::id()));
@@ -739,6 +829,36 @@ mod tests {
         let mut w = walk(&d, 1000).until(Instant::now());
         assert!(w.next_entry().is_none());
         assert!(w.timed_out && w.stack.is_empty());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn nf_1_a_huge_file_is_digested_by_size_and_never_read() {
+        let d = dir("huge", 1);
+        // A sparse file far larger than the cap: metadata says too big, so
+        // it is never opened for hashing.
+        let f = File::create(d.join("huge.bin")).unwrap();
+        f.set_len(8 * 1024 * 1024 * 1024).unwrap();
+        let far = Instant::now() + Duration::from_secs(60);
+        let a = workspace_facts(&d, far).unwrap();
+        assert_eq!((a.files, a.oversize), (2, 1));
+        // Its size still counts: a different size is a different tree.
+        f.set_len(8 * 1024 * 1024 * 1024 + 1).unwrap();
+        assert_ne!(workspace_facts(&d, far).unwrap().tree, a.tree);
+        // Under a small cap a file just over it is size-only too, and one
+        // at the cap is hashed.
+        fs::write(d.join("f000"), vec![b'a'; 1025]).unwrap();
+        assert_eq!(facts_with(&d, far, 1024).unwrap().oversize, 2);
+        fs::write(d.join("f000"), vec![b'a'; 1024]).unwrap();
+        assert_eq!(facts_with(&d, far, 1024).unwrap().oversize, 1);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn nf_1_the_facts_walk_stops_at_its_deadline() {
+        let d = dir("facts-deadline", 5);
+        let err = workspace_facts(&d, Instant::now()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         let _ = fs::remove_dir_all(&d);
     }
 

@@ -18,7 +18,9 @@ use harness_model::{Completion, ModelError, ServerUsage, TaskText, Unavailable};
 use harness_policy::{Authorized, Call, UserPolicy};
 use harness_tools::{InvokeCtx, ToolError, ToolProvider, ToolResult, ToolStatus};
 
-use crate::driver::{commit, new_meter, new_nonce, new_run_id, plan, End, Loop};
+use crate::driver::{
+    commit, new_meter, new_nonce, new_run_id, plan, End, Loop, NonceSource, ReadLog,
+};
 use crate::{RunConfig, TaskSpec};
 
 struct Tick(Cell<u64>);
@@ -69,6 +71,7 @@ impl ToolProvider for Spy {
             digest: sha256(out.as_bytes()),
             output: Untrusted::new(out.into_bytes(), Source::Tool("harness.fs.read".into())),
             truncated: false,
+            read: None,
         })
     }
 }
@@ -165,11 +168,14 @@ fn drive_with(
         turns: Vec::new(),
         config: &cfg,
         step: 0,
+        nonces: NonceSource::default(),
+        feed: std::collections::VecDeque::new(),
+        reads: ReadLog::default(),
     };
     let end = lp.drive(&mut w);
     let tokens = lp.meter.tokens_spent();
     let estimated = lp.meter.tokens_were_estimated();
-    let released = commit(w, &end).outcome;
+    let released = commit(w, &end, None).outcome;
     let journal = buf.borrow().clone();
     let kinds = match verify(&journal, &blobs) {
         Ok(v) => v.records.iter().map(|r| r.kind).collect(),
@@ -635,4 +641,45 @@ fn every_stop_cause_leaves_every_call_paired_and_the_journal_replayable() {
         assert_eq!(&o.end.cause, want, "{what}");
         assert_paired(o, what);
     }
+}
+
+// ---- H1e-2b: the 80% budget condition and the read log ----------------------------
+
+#[test]
+fn the_80_percent_budget_condition_is_journaled_once_on_entry() {
+    let o = drive_with(
+        (0..6).map(|i| read(&format!("f{i}"))).collect(),
+        FaultPlan::default(),
+        |c| c.limits.steps = 5,
+        Duration::ZERO,
+    );
+    assert_eq!(o.end.cause, StopCause::Budget(BudgetDim::Steps));
+    let v = verify(&o.journal, &o.blobs).unwrap();
+    let steps: Vec<(u64, String)> = v
+        .records
+        .iter()
+        .filter(|r| r.kind == EventKind::BudgetCharged)
+        .filter(|r| r.body.get("key").and_then(serde_json::Value::as_str) == Some("steps"))
+        .map(|r| (r.step, r.body["condition"].as_str().unwrap().to_owned()))
+        .collect();
+    assert_eq!(
+        steps,
+        vec![(4, "enter".to_owned())],
+        "4 of 5 steps is 80%, journaled once"
+    );
+}
+
+#[test]
+fn the_read_log_refuses_an_edit_to_a_file_never_read_or_changed_since() {
+    let mut log = ReadLog::default();
+    let d1 = sha256(b"v1");
+    assert_eq!(log.check("a.rs", d1), Err(crate::StaleRead::NeverRead));
+    log.record("a.rs", d1);
+    assert_eq!(log.check("a.rs", d1), Ok(()));
+    assert_eq!(
+        log.check("a.rs", sha256(b"v2")),
+        Err(crate::StaleRead::Changed)
+    );
+    log.record("a.rs", sha256(b"v2"));
+    assert_eq!(log.check("a.rs", sha256(b"v2")), Ok(()));
 }
