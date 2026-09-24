@@ -26,7 +26,26 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::time::Duration;
 
-use gate_outcome::Digest;
+pub use gate_outcome::Digest;
+
+/// SHA-256 of `bytes`: the ONE digest function the harness uses (design
+/// §1.4). Built on the single SHA-256 crate on the purity allowlist
+/// (`sha2`, RustCrypto, pure Rust, default features off).
+pub fn sha256(bytes: &[u8]) -> Digest {
+    sha256_parts(&[bytes])
+}
+
+/// SHA-256 over the concatenation of `parts`, without copying them into one
+/// buffer (used for the journal's `sha256(prev || canonical line)`).
+pub fn sha256_parts(parts: &[&[u8]]) -> Digest {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    for p in parts {
+        h.update(p);
+    }
+    let out: [u8; 32] = h.finalize().into();
+    Digest::from_bytes(out)
+}
 
 /// Data that crossed a trust boundary into the harness: tool output, file
 /// contents, test logs, web pages, model completions.
@@ -722,6 +741,19 @@ impl LoopDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sha256_matches_the_fips_vectors() {
+        assert_eq!(
+            sha256(b"").to_string(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256(b"abc").to_string(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(sha256_parts(&[b"a", b"", b"bc"]), sha256(b"abc"));
+    }
     use gate_outcome::Digest;
 
     // Digest has private fields: build via from_bytes (its only public

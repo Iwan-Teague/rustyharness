@@ -124,23 +124,37 @@ inv28_case "enum in another harness crate" crates/harness-tools/src/zz_plant.rs 
 inv28_case "enum in harness-policy" crates/harness-policy/src/zz_plant.rs 'pub enum PolicyOutcome { Allow }\n'
 
 # --- dependency plant ---------------------------------------------------------
+# The planted edge is to harness-sandbox, an I/O crate that depends on none of
+# the pure crates (harness-tools now depends on harness-core and
+# harness-policy, so planting it would make a cycle, not an intruder).
 fresh
-awk '{ print } /^\[dependencies\]/ { print "harness-tools = { path = \"../harness-tools\" }" }' \
+awk '{ print } /^\[dependencies\]/ { print "harness-sandbox = { path = \"../harness-sandbox\" }" }' \
     "$copy/crates/harness-core/Cargo.toml" >"$tmpdir/Cargo.toml.planted" ||
     fail "awk failed planting a dependency"
 mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-core/Cargo.toml" || fail "mv failed"
-grep -qF 'harness-tools = { path' "$copy/crates/harness-core/Cargo.toml" ||
+grep -qF 'harness-sandbox = { path' "$copy/crates/harness-core/Cargo.toml" ||
     fail "dependency plant did not land"
-expect_refusal "harness-core depends on harness-tools" "harness-core pulled in non-allowlisted crates"
+expect_refusal "harness-core depends on harness-sandbox" "harness-core pulled in non-allowlisted crates"
 
 fresh
-awk '{ print } /^\[dependencies\]/ { print "harness-tools = { path = \"../harness-tools\" }" }' \
+awk '{ print } /^\[dependencies\]/ { print "harness-sandbox = { path = \"../harness-sandbox\" }" }' \
     "$copy/crates/harness-policy/Cargo.toml" >"$tmpdir/Cargo.toml.planted" ||
     fail "awk failed planting a dependency"
 mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-policy/Cargo.toml" || fail "mv failed"
-grep -qF 'harness-tools = { path' "$copy/crates/harness-policy/Cargo.toml" ||
+grep -qF 'harness-sandbox = { path' "$copy/crates/harness-policy/Cargo.toml" ||
     fail "dependency plant did not land"
-expect_refusal "harness-policy depends on harness-tools" "harness-policy pulled in non-allowlisted crates"
+expect_refusal "harness-policy depends on harness-sandbox" "harness-policy pulled in non-allowlisted crates"
+
+# The test-only journal seam must not be enabled by a normal dependency.
+fresh
+awk '{ print } /^\[dependencies\]/ { print "harness-journal = { path = \"../harness-journal\", features = [\"fault-injection\"] }" }' \
+    "$copy/crates/harness-cli/Cargo.toml" >"$tmpdir/Cargo.toml.planted" ||
+    fail "awk failed planting a dependency"
+mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-cli/Cargo.toml" || fail "mv failed"
+grep -qF 'features = ["fault-injection"]' "$copy/crates/harness-cli/Cargo.toml" ||
+    fail "fault-injection plant did not land"
+expect_refusal "harness-cli enables the journal's fault-injection seam" \
+    "a normal dependency edge enables harness-journal/fault-injection"
 
 # --- tool failures must fail closed -------------------------------------------
 mkdir "$tmpdir/shim" || fail "mkdir shim failed"

@@ -13,3 +13,5 @@ workspace = true
 [dependencies]
 # The ONE outcome type (design §1.2: harness-core depends only on gate-outcome).
 gate-outcome = { path = "../gate-outcome" }
+# harness_core::sha256, the one digest function (design §1.4).
+sha2.workspace = true

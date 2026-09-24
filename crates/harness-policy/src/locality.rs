@@ -211,9 +211,12 @@ pub fn classify(q: &FsQuery) -> Result<LocalFs, LocalityRefused> {
 /// `\\.\…`. A verbatim DISK path `\\?\C:\…` (what canonicalisation
 /// returns on Windows) is not UNC and goes on to the volume query.
 pub fn is_unc_shape(path: &str) -> bool {
+    // `\\?\` (Win32 verbatim), `//?/`, and the NT `\??\` prefix, which
+    // Win32 passes through as an NT path (H1b confirming review NF-3).
     let verbatim = path
         .strip_prefix("\\\\?\\")
-        .or_else(|| path.strip_prefix("//?/"));
+        .or_else(|| path.strip_prefix("//?/"))
+        .or_else(|| path.strip_prefix("\\??\\"));
     if let Some(rest) = verbatim {
         let b = rest.as_bytes();
         let disk = b.len() >= 2
@@ -347,6 +350,9 @@ mod tests {
             assert!(is_unc_shape(unc), "{unc}");
         }
         assert!(is_unc_shape("\\\\.\\PhysicalDrive0"));
+        // H1b confirming review NF-3: the NT `\??\` prefix is verbatim too.
+        assert!(is_unc_shape("\\??\\UNC\\server\\share\\x"));
+        assert!(!is_unc_shape("\\??\\C:\\state"));
         // Review F-9: Win32 normalises `/` to `\` outside verbatim paths.
         assert!(is_unc_shape("\\/server/share"));
         assert!(is_unc_shape("/\\server\\share"));

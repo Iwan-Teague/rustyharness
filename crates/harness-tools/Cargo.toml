@@ -11,8 +11,17 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+# Design §1.2 edges: the ToolProvider seam (§4.5) takes only
+# Journaled<Authorized<Call>>, so it names harness-journal and harness-policy.
+harness-core = { path = "../harness-core" }
+harness-journal = { path = "../harness-journal" }
+harness-manifest = { path = "../harness-manifest" }
+harness-policy = { path = "../harness-policy" }
 serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# The sealed JournalFile seam's fault-injecting file, for the INV-33 test.
+harness-journal = { path = "../harness-journal", features = ["fault-injection"] }
+gate-outcome = { path = "../gate-outcome" }
 serde_json.workspace = true

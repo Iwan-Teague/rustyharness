@@ -912,12 +912,6 @@ pub(crate) fn parse_with_origin(
         }
     })?;
 
-    // No nullable field exists in v1: an explicit null is refused rather than
-    // read as "absent" by `#[serde(default)]` (review F-3).
-    if let Some(at) = find_null(&value, String::new()) {
-        return Err(ManifestError::NullValue(at));
-    }
-
     // Version first, so a v0 or v2 manifest gets a version message rather
     // than an "unknown field" one (§4.7: naming both versions).
     let version = value
@@ -945,6 +939,14 @@ pub(crate) fn parse_with_origin(
         if origin == Origin::External && ctx.is_reserved(p) {
             return Err(ManifestError::ReservedProvider(shown(p)));
         }
+    }
+
+    // No nullable field exists in v1: an explicit null is refused rather than
+    // read as "absent" by `#[serde(default)]` (review F-3). It runs after
+    // the version and reserved-name checks so those keep their own messages
+    // (H1b confirming review NF-1), and before the typed parse.
+    if let Some(at) = find_null(&value, String::new()) {
+        return Err(ManifestError::NullValue(at));
     }
 
     let wire: ManifestWire = serde_json::from_value(value).map_err(|e| shape(&e))?;

@@ -81,15 +81,25 @@ printf '%s\n' \
 sort -u "$tmpdir/allowed-json-raw" >"$tmpdir/allowed-json" || fail "sort failed"
 refuse_intruders "$tmpdir/gate-json" "$tmpdir/allowed-json" "gate-outcome (json)"
 
-# harness-core may depend only on gate-outcome (design §1.2). serde and
+# harness-core may depend only on gate-outcome and the ONE SHA-256
+# implementation (design §1.2, §1.4: `harness_core::sha256`). serde and
 # serde_json stay admitted for the child-protocol wire types; any new
 # dependency must be added to this allowlist BY REVIEW.
+#   sha2 0.11 (RustCrypto, pure Rust, default features off) and its tree:
+#     digest, block-buffer, hybrid-array, typenum, crypto-common, cfg-if,
+#     cpufeatures (runtime CPU-feature detection for the SHA extensions),
+#     libc (FFI declarations only, no C is compiled; cpufeatures uses it on
+#     some targets, e.g. aarch64 macOS and Linux). No `cc`, no `asm` feature.
 tree_names "$tmpdir/core" harness-core
 grep -qxF gate-outcome "$tmpdir/core" ||
     fail "harness-core tree does not contain gate-outcome (read the wrong tree?)"
+grep -qxF sha2 "$tmpdir/core" ||
+    fail "harness-core tree does not contain sha2 (read the wrong tree?)"
 printf '%s\n' \
     harness-core gate-outcome serde serde_core serde_derive proc-macro2 \
-    quote syn unicode-ident serde_json itoa ryu >"$tmpdir/allowed-core-raw"
+    quote syn unicode-ident serde_json itoa ryu \
+    sha2 digest block-buffer hybrid-array typenum crypto-common cfg-if \
+    cpufeatures libc >"$tmpdir/allowed-core-raw"
 sort -u "$tmpdir/allowed-core-raw" >"$tmpdir/allowed-core" || fail "sort failed"
 refuse_intruders "$tmpdir/core" "$tmpdir/allowed-core" "harness-core"
 
@@ -116,6 +126,24 @@ grep -qxF harness-manifest "$tmpdir/policy" ||
 printf '%s\n' harness-policy >>"$tmpdir/allowed-manifest-raw" || fail "printf failed"
 sort -u "$tmpdir/allowed-manifest-raw" >"$tmpdir/allowed-policy" || fail "sort failed"
 refuse_intruders "$tmpdir/policy" "$tmpdir/allowed-policy" "harness-policy"
+
+# --- test-only seams stay out of normal builds (H1c review F-3) -------------
+# harness-journal's `fault-injection` feature compiles a JournalFile that
+# fails (or succeeds) on demand. The seam is sealed, and only
+# [dev-dependencies] may enable the feature: no NORMAL edge anywhere in the
+# workspace may. The all-edges tree must name the feature, so a rename
+# cannot make this check vacuous.
+cargo tree --workspace -e all,features >"$tmpdir/feat-all" ||
+    fail "cargo tree failed: --workspace -e all,features"
+grep -qF 'harness-journal feature "fault-injection"' "$tmpdir/feat-all" ||
+    fail "the fault-injection feature is not in the all-edges tree (renamed? read nothing?)"
+cargo tree --workspace -e normal,features >"$tmpdir/feat-normal" ||
+    fail "cargo tree failed: --workspace -e normal,features"
+grep -q 'harness-journal' "$tmpdir/feat-normal" ||
+    fail "the normal feature tree does not name harness-journal (read nothing?)"
+if grep -qF 'fault-injection' "$tmpdir/feat-normal"; then
+    fail "a normal dependency edge enables harness-journal/fault-injection"
+fi
 
 # --- shared: file lists and normalisation -----------------------------------
 

@@ -1,6 +1,6 @@
 [package]
 name = "harness-journal"
-description = "rustyharness run journal: append-only evidence of what a run did."
+description = "rustyharness run journal: per-attempt, hash-chained, append-only JSONL evidence with write-ahead intents and fail-closed poisoning."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,3 +9,17 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+# Test-only fault-injecting JournalFile/BlobSink (src/testing.rs). Enabled
+# only through [dev-dependencies]; purity.sh refuses it on normal edges.
+fault-injection = []
+
+[dependencies]
+# Not a pure crate (it owns files). The pure parts (canonical encoding, the
+# hash chain, verification over bytes) live in `canon`, `conditions` and
+# `reader::verify`, and take no I/O.
+harness-core = { path = "../harness-core" }
+gate-outcome = { path = "../gate-outcome" }
+serde_json.workspace = true
+thiserror.workspace = true

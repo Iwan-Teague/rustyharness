@@ -786,3 +786,29 @@ fn mcp_stdio_program_path_refuses_unc_and_parent_components() {
         assert!(parse_v(&m).is_ok(), "{ok:?}: {:?}", parse_v(&m));
     }
 }
+
+// H1b confirming review NF-1: the null walk runs AFTER the version and
+// reserved-name checks, so those keep their own messages.
+#[test]
+fn null_check_runs_after_version_and_reserved_name_checks() {
+    let v0 = r#"{"schema_version":0,"app":"example","app_version":null,
+        "capabilities":[{"id":"example.status.read","summary":"s","effect":"read"}]}"#;
+    assert_eq!(
+        parse_s(v0),
+        Err(ManifestError::SchemaV0 { supported: &[1] })
+    );
+
+    let mut reserved = fixture();
+    reserved["provider"] = json!("rustyvault");
+    cap0(&mut reserved)["id"] = json!("rustyvault.item.read");
+    cap0(&mut reserved)["limits"] = Value::Null;
+    assert_eq!(
+        parse_v(&reserved),
+        Err(ManifestError::ReservedProvider("rustyvault".into()))
+    );
+
+    // A null is still refused once those checks pass.
+    let mut m = fixture();
+    cap0(&mut m)["limits"] = Value::Null;
+    assert!(matches!(parse_v(&m), Err(ManifestError::NullValue(_))));
+}
