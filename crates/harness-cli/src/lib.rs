@@ -84,10 +84,11 @@ mod exit {
 
 /// Where the CLI writes, and what it is given from outside: the locality
 /// probe and the `GATE_OK_FILE` marker path. The shipped binary
-/// (`src/main.rs`) always passes `NoProbe` (every `state_root` refused
-/// until spike S-F1) and the marker path from the environment; only this
-/// crate's tests pass another probe, in process. No build of the binary
-/// carries a way to switch the probe (H1e-2b review F-2).
+/// (`src/main.rs`) always passes the real per-OS probe
+/// (`harness_sandbox::locality::SystemProbe`, spike S-F1; on Windows it
+/// refuses every `state_root` until spike S-W1) and the marker path from the
+/// environment; only this crate's tests pass another probe, in process. No
+/// build of the binary carries a way to switch the probe (H1e-2b review F-2).
 pub struct Cx<'a> {
     /// The filesystem-locality probe.
     pub probe: &'a dyn LocalityProbe,

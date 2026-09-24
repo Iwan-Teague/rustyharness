@@ -1,12 +1,15 @@
 //! The `rustyharness` CLI as a gate child (design §7.7), end to end against
 //! a mock OpenAI-compatible server on loopback.
 //!
-//! Runs that must get past the locality check call the CLI library in
-//! process with this file's permissive probe (spike S-F1 has not landed a
-//! real one). Everything that must refuse runs the real binary, which
-//! always uses `NoProbe`: no build of it can be switched to another probe,
-//! and the test below sets the old switch variable to prove it is ignored
-//! (H1e-2b review F-2).
+//! The real binary always uses the real per-OS probe
+//! (`harness_sandbox::locality::SystemProbe`, spike S-F1). It measures Linux
+//! and macOS; on Windows it refuses every `state_root` until spike S-W1
+//! ([`REAL_PROBE_MEASURES`]). Tests that need a run to start on EVERY OS
+//! call the CLI library in process with this file's permissive probe; the
+//! whole-run test uses the real binary where its probe measures and, on
+//! Windows, first proves the real binary refuses. No build of the binary
+//! can be switched to another probe, and the tests set the old switch
+//! variable to prove it is ignored (H1e-2b review F-2).
 
 #![allow(
     clippy::unwrap_used,
@@ -170,9 +173,14 @@ impl LocalityProbe for Local {
     }
 }
 
+/// Whether the real binary's probe measures this OS (spike S-F1: Linux and
+/// macOS). Elsewhere, Windows included until spike S-W1, it answers
+/// `Unmeasured` and every `state_root` is refused (design §2.8).
+const REAL_PROBE_MEASURES: bool = cfg!(any(target_os = "linux", target_os = "macos"));
+
 /// `local = true`: the CLI library in process with the permissive probe.
-/// `local = false`: the real binary (always `NoProbe`), with the variable
-/// that once switched the probe set, to show it switches nothing.
+/// `local = false`: the real binary (always the real probe), with the
+/// variable that once switched the probe set, to show it switches nothing.
 fn cli(args: &[&str], local: bool, marker: &Path) -> Output {
     if local {
         let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -260,36 +268,58 @@ const NOTHING_CHECKED: GateOutcome = GateOutcome::Indeterminate {
 
 // ---- the tests ---------------------------------------------------------------------
 
-#[test]
-fn inv_35_the_binary_refuses_a_state_root_that_is_not_a_local_disk() {
-    // `/dev` is devfs (macOS) or devtmpfs (Linux): not an admitted local
-    // filesystem. The real probe must refuse it before anything is written
-    // or the model server is asked, even with the old switch variable set.
-    let fx = fixture("refused");
-    let m = mock(vec![]);
-    let ep = format!("http://127.0.0.1:{}/v1", m.port);
-    let mut args = run_args(&fx, &ep);
-    let at = args.iter().position(|a| *a == "--state-root").unwrap() + 1;
-    args[at] = "/dev";
-    let o = cli(&args, false, &fx.marker);
-    assert_eq!(o.code(), Some(5));
-    let r = report(&o);
+/// The real binary refused `state_root` as not local: before anything was
+/// written under it or the model server was asked (design §2.8, INV-35).
+fn assert_refused_as_not_local(o: &Output, m: &Mock, state_root: &Path, marker: &Path) {
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.code(), Some(5), "stderr: {err}");
+    let r = report(o);
     assert_eq!(r["outcome"]["Indeterminate"]["why"], "CouldNotRun");
     assert_eq!(r["gate"], "rustyharness.run");
-    assert!(String::from_utf8_lossy(&o.stderr).contains("not on a filesystem identified as local"));
-    assert!(!Path::new("/dev/runs").exists(), "nothing was written");
+    assert!(
+        err.contains("not on a filesystem identified as local"),
+        "stderr: {err}"
+    );
+    if !REAL_PROBE_MEASURES {
+        // Unmeasured, and the refusal says why (§2.8: the message names
+        // what was detected).
+        assert!(err.contains("spike S-W1"), "stderr: {err}");
+    }
+    assert!(!state_root.join("runs").exists(), "nothing was written");
     assert_eq!(
         *m.requests.lock().unwrap(),
         0,
         "the model server was never contacted"
     );
-    assert!(!fx.marker.exists());
+    assert!(!marker.exists());
     assert_eq!(
-        as_parent_sees(&o, "rustyharness.run", &fx.marker, true),
+        as_parent_sees(o, "rustyharness.run", marker, true),
         GateOutcome::Indeterminate {
             why: IndeterminateKind::CouldNotRun
         }
     );
+}
+
+#[test]
+fn inv_35_the_binary_refuses_a_state_root_that_is_not_a_local_disk() {
+    // Where the real probe measures, `/dev` is devfs (macOS) or devtmpfs
+    // (Linux): not an admitted local filesystem. Where it does not (Windows
+    // until spike S-W1), every state root is refused, so the fixture's own
+    // is. Either way the refusal comes before anything is written or the
+    // model server is asked, even with the old switch variable set.
+    let fx = fixture("refused");
+    let m = mock(vec![]);
+    let ep = format!("http://127.0.0.1:{}/v1", m.port);
+    let state_root = if REAL_PROBE_MEASURES {
+        Path::new("/dev")
+    } else {
+        fx.state.as_path()
+    };
+    let mut args = run_args(&fx, &ep);
+    let at = args.iter().position(|a| *a == "--state-root").unwrap() + 1;
+    args[at] = state_root.to_str().unwrap();
+    let o = cli(&args, false, &fx.marker);
+    assert_refused_as_not_local(&o, &m, state_root, &fx.marker);
 }
 
 #[test]
@@ -303,9 +333,19 @@ fn a_whole_run_is_nothing_checked_exit_5_no_marker_and_prints_its_chain_head() {
         ),
     ]);
     let ep = format!("http://127.0.0.1:{}/v1", m.port);
-    // The real binary with the real probe (spike S-F1): the state root
-    // under the target directory is on a local disk, so the run starts.
-    let o = cli(&run_args(&fx, &ep), false, &fx.marker);
+    // Where the real probe measures (spike S-F1), the real binary runs: the
+    // state root under the target directory is on a local disk. Where it
+    // does not (Windows until spike S-W1), the real binary must refuse that
+    // same state root; the run is then driven in process with the permissive
+    // probe, so everything after the locality check is still covered on
+    // every OS. The refusal contacted no server, so the replies are unused.
+    let o = if REAL_PROBE_MEASURES {
+        cli(&run_args(&fx, &ep), false, &fx.marker)
+    } else {
+        let refused = cli(&run_args(&fx, &ep), false, &fx.marker);
+        assert_refused_as_not_local(&refused, &m, &fx.state, &fx.marker);
+        cli(&run_args(&fx, &ep), true, &fx.marker)
+    };
     let stdout = String::from_utf8(o.stdout.clone()).unwrap();
     assert_eq!(
         o.code(),

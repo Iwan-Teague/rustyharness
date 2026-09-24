@@ -124,8 +124,9 @@ pub struct Run<'a> {
     pub profile: &'a Profile,
     /// The model backend.
     pub backend: &'a dyn ModelBackend,
-    /// The filesystem-locality probe (`NoProbe` refuses every state root
-    /// until spike S-F1 lands a real one).
+    /// The filesystem-locality probe (the binary passes
+    /// `harness_sandbox::locality::SystemProbe`; `NoProbe` refuses every
+    /// state root).
     pub probe: &'a dyn LocalityProbe,
     /// Budgets and timeouts.
     pub config: &'a RunConfig,

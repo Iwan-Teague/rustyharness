@@ -26,9 +26,9 @@ printf '%s\n' '--- clippy again with gate-outcome/json (the §6 wire types must 
 cargo clippy --locked --workspace --all-targets --features gate-outcome/json -- -D warnings
 
 printf '=== 5/5 cargo test --workspace ===\n'
-cargo test --locked --workspace
+cargo test --locked --workspace --no-fail-fast
 printf '%s\n' '--- tests again with gate-outcome/json ---'
-cargo test --locked --workspace --features gate-outcome/json
+cargo test --locked --workspace --no-fail-fast --features gate-outcome/json
 printf '%s\n' '--- compile-fail doctests with their expected error codes enforced ---'
 # Stable rustdoc accepts `compile_fail,E0451` but checks the code only when
 # it believes it is a nightly build; RUSTC_BOOTSTRAP=1 turns that check on

@@ -9,13 +9,30 @@ permissions:
   contents: read
 
 jobs:
+  # The member gate entrypoint itself, exactly as tooling/dev-push.sh runs
+  # it (scripts/ci/gates.sh): fmt, the purity gate and its refusal
+  # witnesses, cargo-deny, clippy and tests with and without
+  # gate-outcome/json, and the compile-fail doctests with their error codes.
+  # The purity gate reads `cargo tree --target all`, so the dependency shape
+  # of every target, Windows included, is checked here.
   gates:
-    # Portability is a design driver: every gate runs on all three OSes.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny --version 0.20.2
+      - name: Member gates (scripts/ci/gates.sh)
+        run: sh scripts/ci/gates.sh
+
+  # Windows runs every cargo step of the gates. The purity scripts are POSIX
+  # sh and run in the job above; the compile-fail doctests check error codes,
+  # which do not depend on the target.
+  gates-windows:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install cargo-deny
@@ -26,5 +43,10 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Clippy (gate-outcome/json)
+        run: cargo clippy --locked --workspace --all-targets --features gate-outcome/json -- -D warnings
+      # --no-fail-fast: one failing test binary must not hide the others.
       - name: Test
-        run: cargo test --locked --workspace
+        run: cargo test --locked --workspace --no-fail-fast
+      - name: Test (gate-outcome/json)
+        run: cargo test --locked --workspace --no-fail-fast --features gate-outcome/json
