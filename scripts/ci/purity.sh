@@ -429,17 +429,31 @@ if [ -s "$tmpdir/hits" ]; then
 $(cat "$tmpdir/hits")"
 fi
 
-# --- 2e. the shipped binary refuses every state_root (INV-35, H1e-2b F-2) ---
-# Until spike S-F1 lands real probes, `rustyharness` must use `NoProbe`, and
-# nothing in any build of it may choose another probe: its main.rs names
-# exactly one probe, `&NoProbe`. (Tests pass their own probe to the CLI
-# library in process; the binary has no switch.)
+# --- 2e. the shipped binary uses the real locality probe (INV-35) ----------
+# `rustyharness` must use exactly the production probe,
+# `harness_sandbox::locality::SystemProbe` (spike S-F1), and nothing in any
+# build of it may choose another (H1e-2b review F-2). Checked by content,
+# not by name (H1e-2b confirming review NF-2: a local `struct` with the
+# production name passed a name-only check): main.rs must import the probe
+# from its real path, name it exactly twice (that import and the one
+# `probe:` field), and define or alias nothing (no struct, enum, trait,
+# impl, mod, type, const, static, macro or `as` rename) that could shadow
+# it. (Tests pass their own probe to the CLI library in process; the
+# binary has no switch.)
 strip_comments crates/harness-cli/src/main.rs "$tmpdir/cli-main"
 normalise "$tmpdir/cli-main" "$tmpdir/cli-main-norm"
-grep -o 'probe:' "$tmpdir/cli-main-norm" >"$tmpdir/cli-probes" || true
-probes=$(wc -l <"$tmpdir/cli-probes" | tr -d ' ')
-if [ "$probes" != 1 ] || ! grep -q 'probe: &NoProbe,' "$tmpdir/cli-main-norm"; then
-    fail "the rustyharness binary must use exactly one probe, NoProbe (crates/harness-cli/src/main.rs)"
+count() { grep -o -- "$1" "$tmpdir/cli-main-norm" | wc -l | tr -d ' '; }
+cli_bad=""
+[ "$(count 'probe:')" = 1 ] || cli_bad="$cli_bad; not exactly one probe field"
+grep -qF 'probe: &SystemProbe,' "$tmpdir/cli-main-norm" || cli_bad="$cli_bad; the probe field is not &SystemProbe"
+grep -qF 'use harness_sandbox::locality::SystemProbe;' "$tmpdir/cli-main-norm" ||
+    cli_bad="$cli_bad; SystemProbe is not imported from harness_sandbox::locality"
+[ "$(count 'SystemProbe')" = 2 ] || cli_bad="$cli_bad; SystemProbe is named other than by its import and its use"
+if grep -qE "(^|$nb)(struct|enum|trait|impl|mod|type|const|static|macro_rules)($nb|\$)| as " "$tmpdir/cli-main-norm"; then
+    cli_bad="$cli_bad; main.rs defines or renames an item"
+fi
+if [ -n "$cli_bad" ]; then
+    fail "the rustyharness binary must use exactly the production probe, harness_sandbox::locality::SystemProbe (crates/harness-cli/src/main.rs)$cli_bad"
 fi
 
 # --- 2d. compile-fail doctests pin their reason (H1a review N-6) -------------

@@ -618,3 +618,62 @@ fn a_resumed_attempt_is_charged_the_wall_time_already_spent() {
     assert_eq!(res.attempt, 2);
     assert_eq!(res.cause, StopCause::Budget(harness_core::BudgetDim::Wall));
 }
+
+/// Re-write a journal with its last record's monotonic time set to `ms`
+/// (the writer's elapsed time when it stopped), re-chained.
+fn set_last_mono(path: &Path, ms: u64) {
+    let text = fs::read_to_string(path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    let (last, body) = lines.split_last().unwrap();
+    let mut prev = GENESIS;
+    let mut out = String::new();
+    for l in body {
+        let v: Value = serde_json::from_str(l).unwrap();
+        prev = fields(&v, prev, None).encode().1;
+        out.push_str(l);
+        out.push('\n');
+    }
+    let mut v: Value = serde_json::from_str(last).unwrap();
+    v["t_mono_ms"] = Value::from(ms);
+    out.push_str(std::str::from_utf8(&fields(&v, prev, None).encode().0).unwrap());
+    out.push('\n');
+    fs::write(path, out).unwrap();
+}
+
+/// H1e-2b confirming review NF-1: crash, resume, crash, resume charges the
+/// wall time of BOTH earlier attempts, not only the latest one.
+#[test]
+fn nf_1_chained_resumes_are_charged_every_earlier_attempts_wall_time() {
+    let (state, ws) = scratch("resume-chain");
+    let twenty_min = 20 * 60 * 1000;
+    let r = go(&state, &ws, vec![read("a.txt"), read("b.txt"), submit()]);
+    crash_after(&journal_path(&r, 1), 3);
+    set_last_mono(&journal_path(&r, 1), twenty_min);
+    // 20 of 30 minutes spent: the first resume runs to its end.
+    let second = resume_with(&state, &ws, &r.run, TASK, vec![read("b.txt"), submit()]).unwrap();
+    assert_eq!(
+        (second.attempt, second.cause.clone()),
+        (2, StopCause::Submitted)
+    );
+    let h2 = JournalReader::open(&layout::attempt_dir(&r.run_dir, 2)).unwrap();
+    assert_eq!(
+        h2.records[0].body["resumed_from"]["wall_carried_ms"],
+        twenty_min
+    );
+    // Attempt 2 crashes after another 20 minutes of its own.
+    crash_after(&journal_path(&r, 2), 3);
+    set_last_mono(&journal_path(&r, 2), twenty_min);
+    // 40 of 30 minutes: the second resume must stop on the wall budget at once.
+    let third = resume_with(&state, &ws, &r.run, TASK, vec![read("b.txt"), submit()]).unwrap();
+    assert_eq!(third.attempt, 3);
+    let h3 = JournalReader::open(&layout::attempt_dir(&r.run_dir, 3)).unwrap();
+    assert_eq!(
+        h3.records[0].body["resumed_from"]["wall_carried_ms"],
+        2 * twenty_min,
+        "attempt 1's time survives through attempt 2"
+    );
+    assert_eq!(
+        third.cause,
+        StopCause::Budget(harness_core::BudgetDim::Wall)
+    );
+}

@@ -1,5 +1,6 @@
-//! Filesystem-locality check: interface and conservative default (design
-//! §2.8, INV-35; spike S-F1 is NOT done here).
+//! Filesystem-locality check: interface, decision and conservative default
+//! (design §2.8, INV-35). The measuring probes of spike S-F1 live in
+//! `harness_sandbox::locality`.
 //!
 //! `state_root` is used only on a filesystem POSITIVELY identified as local,
 //! because the journal's single-writer lock and fsync durability (§7.1) do
@@ -7,16 +8,17 @@
 //! unrecognised filesystem, a failed query or no query at all is a refusal.
 //!
 //! Split, so the decision stays pure and replayable:
-//! - [`LocalityProbe`] measures (`statfs(2)` on Linux/macOS, the volume APIs
-//!   on Windows). Implementations do I/O and belong in `harness-sandbox`
-//!   (Windows calls in `harness-sandbox-windows`). This crate ships only
-//!   [`NoProbe`], which measures nothing.
+//! - [`LocalityProbe`] measures (the mount table on Linux and macOS since
+//!   S-F1; the volume APIs on Windows once S-W1 lands). Implementations do
+//!   I/O and belong in `harness-sandbox` (Windows calls in
+//!   `harness-sandbox-windows`). This crate ships only [`NoProbe`], which
+//!   measures nothing.
 //! - [`classify`] decides over the measured facts, here, with the §2.8
 //!   allowlist rows.
 //!
-//! **The conservative default:** until S-F1 has confirmed a probe on an OS,
-//! there is no probe for it, [`NoProbe`] answers [`FsQuery::Unmeasured`],
-//! and [`check`] refuses. There is no override flag (§2.8).
+//! **The conservative default:** an OS without a confirmed probe (Windows
+//! until S-W1) answers [`FsQuery::Unmeasured`], and [`check`] refuses.
+//! There is no override flag (§2.8).
 //!
 //! No `Path` type here (review F-2): `Path` carries I/O methods (`exists`,
 //! `canonicalize`, `read_dir`, ...) that never name the `fs` module. The
@@ -38,6 +40,18 @@ pub const LINUX_LOCAL_MAGIC: &[(u64, &str)] = &[
 
 /// overlayfs: admitted only when its upper layer is itself admitted.
 pub const LINUX_OVERLAYFS_MAGIC: u64 = 0x794C_7630;
+
+/// Local Linux filesystems by their kernel type NAME, as the mount table
+/// (`/proc/self/mountinfo`) reports them: the same six rows as
+/// [`LINUX_LOCAL_MAGIC`] (S-F1 measures names; see the design's H1e-2c
+/// row). Everything else is refused, explicitly including `nfs`, `nfs4`,
+/// `cifs`, `smb3`, `9p`, `ceph`, `fuse`, `fuseblk` and every `fuse.*`.
+pub const LINUX_LOCAL_TYPES: &[&str] = &[
+    "ext2", "ext3", "ext4", "xfs", "btrfs", "tmpfs", "zfs", "f2fs",
+];
+
+/// The overlayfs type name.
+pub const LINUX_OVERLAY_TYPE: &str = "overlay";
 
 /// macOS `f_fstypename` values admitted when `MNT_LOCAL` is also set.
 pub const MACOS_LOCAL_TYPES: &[&str] = &["apfs", "hfs"];
@@ -71,7 +85,17 @@ pub enum FsQuery {
         /// `/proc/self/mountinfo`), if it could be read.
         overlay_upper: Option<u64>,
     },
-    /// macOS `statfs(2)`.
+    /// Linux, measured through the mount table: the kernel's type name of
+    /// the mount the path is on (matched by device number).
+    LinuxNamed {
+        /// The mount's filesystem type name (e.g. `ext4`, `nfs4`, `fuse.sshfs`).
+        fs_type: String,
+        /// For overlayfs: the type name of the mount holding `upperdir`,
+        /// if it could be determined.
+        overlay_upper: Option<String>,
+    },
+    /// macOS: the `MNT_LOCAL` flag and the type name of the volume (as
+    /// `statfs(2)` or the mount list reports them).
     MacOs {
         /// `f_flags & MNT_LOCAL != 0`.
         mnt_local: bool,
@@ -168,6 +192,27 @@ pub fn classify(q: &FsQuery) -> Result<LocalFs, LocalityRefused> {
             }
             Err(refuse(format!("Linux f_type {f_type:#x}")))
         }
+        FsQuery::LinuxNamed {
+            fs_type,
+            overlay_upper,
+        } => {
+            if LINUX_LOCAL_TYPES.contains(&fs_type.as_str()) {
+                return Ok(LocalFs {
+                    fs_type: fs_type.clone(),
+                });
+            }
+            if fs_type == LINUX_OVERLAY_TYPE {
+                return match overlay_upper {
+                    Some(u) if LINUX_LOCAL_TYPES.contains(&u.as_str()) => Ok(LocalFs {
+                        fs_type: format!("overlayfs over {u}"),
+                    }),
+                    _ => Err(refuse(format!(
+                        "overlayfs whose upper layer is not admitted ({overlay_upper:?})"
+                    ))),
+                };
+            }
+            Err(refuse(format!("Linux {fs_type:?}")))
+        }
         FsQuery::MacOs {
             mnt_local,
             fs_type_name,
@@ -201,7 +246,7 @@ pub fn classify(q: &FsQuery) -> Result<LocalFs, LocalityRefused> {
         }
         FsQuery::QueryFailed { detail } => Err(refuse(format!("query failed: {detail}"))),
         FsQuery::Unmeasured => Err(refuse(
-            "no filesystem probe for this OS in this build (spike S-F1 pending)",
+            "no filesystem probe for this OS in this build (Windows: the volume query awaits spike S-W1)",
         )),
     }
 }
@@ -338,6 +383,42 @@ mod tests {
             };
             assert!(classify(&q).is_ok());
         }
+    }
+
+    #[test]
+    fn inv_35_linux_type_names_admit_only_the_local_rows() {
+        let named = |t: &str, up: Option<&str>| FsQuery::LinuxNamed {
+            fs_type: t.into(),
+            overlay_upper: up.map(Into::into),
+        };
+        for ok in LINUX_LOCAL_TYPES {
+            assert!(classify(&named(ok, None)).is_ok(), "{ok}");
+        }
+        for bad in [
+            "nfs",
+            "nfs4",
+            "cifs",
+            "smb3",
+            "9p",
+            "ceph",
+            "fuse",
+            "fuseblk",
+            "fuse.sshfs",
+            "fuse.rclone",
+            "proc",
+            "sysfs",
+            "devtmpfs",
+            "autofs",
+            "vfat",
+            "",
+            "EXT4",
+        ] {
+            let e = classify(&named(bad, None)).unwrap_err();
+            assert!(e.detected.contains(&format!("{bad:?}")), "{bad}: {e}");
+        }
+        assert!(classify(&named("overlay", Some("ext4"))).is_ok());
+        assert!(classify(&named("overlay", Some("nfs4"))).is_err());
+        assert!(classify(&named("overlay", None)).is_err());
     }
 
     #[test]

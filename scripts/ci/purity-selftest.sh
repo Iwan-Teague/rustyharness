@@ -124,26 +124,26 @@ inv28_case "enum in another harness crate" crates/harness-tools/src/zz_plant.rs 
 inv28_case "enum in harness-policy" crates/harness-policy/src/zz_plant.rs 'pub enum PolicyOutcome { Allow }\n'
 
 # --- dependency plant ---------------------------------------------------------
-# The planted edge is to harness-sandbox, an I/O crate that depends on none of
-# the pure crates (harness-tools now depends on harness-core and
-# harness-policy, so planting it would make a cycle, not an intruder).
-fresh
-awk '{ print } /^\[dependencies\]/ { print "harness-sandbox = { path = \"../harness-sandbox\" }" }' \
-    "$copy/crates/harness-core/Cargo.toml" >"$tmpdir/Cargo.toml.planted" ||
-    fail "awk failed planting a dependency"
-mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-core/Cargo.toml" || fail "mv failed"
-grep -qF 'harness-sandbox = { path' "$copy/crates/harness-core/Cargo.toml" ||
-    fail "dependency plant did not land"
-expect_refusal "harness-core depends on harness-sandbox" "harness-core pulled in non-allowlisted crates"
-
-fresh
-awk '{ print } /^\[dependencies\]/ { print "harness-sandbox = { path = \"../harness-sandbox\" }" }' \
-    "$copy/crates/harness-policy/Cargo.toml" >"$tmpdir/Cargo.toml.planted" ||
-    fail "awk failed planting a dependency"
-mv "$tmpdir/Cargo.toml.planted" "$copy/crates/harness-policy/Cargo.toml" || fail "mv failed"
-grep -qF 'harness-sandbox = { path' "$copy/crates/harness-policy/Cargo.toml" ||
-    fail "dependency plant did not land"
-expect_refusal "harness-policy depends on harness-sandbox" "harness-policy pulled in non-allowlisted crates"
+# The planted edge is to a planted I/O crate that depends on nothing in the
+# workspace (every harness crate now reaches a pure crate, so planting one of
+# them would make a cycle, not an intruder: since H1e-2c even harness-sandbox
+# depends on harness-policy).
+plant_io_dep() {
+    fresh
+    mkdir -p "$copy/crates/zz-io/src" || fail "mkdir failed"
+    printf '[package]\nname = "zz-io"\nversion = "0.0.0"\nedition = "2021"\npublish = false\nlicense = "MIT"\n' \
+        >"$copy/crates/zz-io/Cargo.toml" || fail "could not plant zz-io"
+    printf 'pub fn read() -> std::io::Result<Vec<u8>> { std::fs::read("x") }\n' \
+        >"$copy/crates/zz-io/src/lib.rs" || fail "could not plant zz-io lib"
+    awk '{ print } /^\[dependencies\]/ { print "zz-io = { path = \"../zz-io\" }" }' \
+        "$copy/crates/$1/Cargo.toml" >"$tmpdir/Cargo.toml.planted" ||
+        fail "awk failed planting a dependency"
+    mv "$tmpdir/Cargo.toml.planted" "$copy/crates/$1/Cargo.toml" || fail "mv failed"
+    grep -qF 'zz-io = { path' "$copy/crates/$1/Cargo.toml" || fail "dependency plant did not land"
+    expect_refusal "$1 depends on an I/O crate" "$1 pulled in non-allowlisted crates"
+}
+plant_io_dep harness-core
+plant_io_dep harness-policy
 
 # The test-only journal seam must not be enabled by a normal dependency.
 fresh
@@ -228,19 +228,29 @@ grep -q 'compile_error' "$copy/crates/harness-journal/src/lib.rs" &&
     fail "compile_error! plant did not land"
 expect_refusal "the fault-injection compile_error! removed" "an optimised build with harness-journal/fault-injection compiles"
 
-# H1e-2b review F-2: the shipped binary's probe is NoProbe, with no switch.
-fresh
-sed 's/probe: &NoProbe,/probe: \&harness_policy::locality::NoProbe, probe: \&Other,/' \
-    "$copy/crates/harness-cli/src/main.rs" >"$tmpdir/main.rs.planted" || fail "sed failed"
-mv "$tmpdir/main.rs.planted" "$copy/crates/harness-cli/src/main.rs" || fail "mv failed"
-grep -q 'probe: &Other' "$copy/crates/harness-cli/src/main.rs" || fail "probe plant did not land"
-expect_refusal "the binary gains a second probe" "the rustyharness binary must use exactly one probe"
-fresh
-sed 's/probe: &NoProbe,/probe: \&PermissiveProbe,/' \
-    "$copy/crates/harness-cli/src/main.rs" >"$tmpdir/main.rs.planted" || fail "sed failed"
-mv "$tmpdir/main.rs.planted" "$copy/crates/harness-cli/src/main.rs" || fail "mv failed"
-grep -q 'probe: &PermissiveProbe' "$copy/crates/harness-cli/src/main.rs" || fail "probe plant did not land"
-expect_refusal "the binary uses a permissive probe" "the rustyharness binary must use exactly one probe"
+# H1e-2b review F-2 / confirming review NF-2: the shipped binary uses the
+# real probe, by content, not by name.
+probe_case() {
+    fresh
+    awk -v from="$2" -v to="$3" '{ i = index($0, from); if (i) $0 = substr($0, 1, i - 1) to substr($0, i + length(from)); print }' \
+        "$copy/crates/harness-cli/src/main.rs" >"$tmpdir/main.rs.planted" || fail "awk failed"
+    mv "$tmpdir/main.rs.planted" "$copy/crates/harness-cli/src/main.rs" || fail "mv failed"
+    grep -qF "$4" "$copy/crates/harness-cli/src/main.rs" || fail "probe plant '$1' did not land"
+    expect_refusal "$1" "the rustyharness binary must use exactly the production probe"
+}
+probe_case "the binary gains a second probe" 'probe: &SystemProbe,' \
+    'probe: &SystemProbe, probe: &Other,' 'probe: &Other'
+probe_case "the binary uses a permissive probe" 'probe: &SystemProbe,' \
+    'probe: &PermissiveProbe,' 'probe: &PermissiveProbe'
+probe_case "a local struct shadows the probe's name (NF-2)" \
+    'use harness_sandbox::locality::SystemProbe;' \
+    'struct SystemProbe; impl harness_policy::locality::LocalityProbe for SystemProbe { fn query(&self, _: &str) -> harness_policy::locality::FsQuery { harness_policy::locality::FsQuery::Unmeasured } }' \
+    'struct SystemProbe;'
+probe_case "the probe imported from another path" \
+    'use harness_sandbox::locality::SystemProbe;' \
+    'use harness_policy::locality::NoProbe as SystemProbe;' 'NoProbe as SystemProbe'
+probe_case "a let binding shadows the probe" 'let cx' \
+    'let SystemProbe = harness_policy::locality::NoProbe; let cx' 'let SystemProbe'
 
 # H1a review N-3: the remaining name-scan gaps.
 n3_case() {

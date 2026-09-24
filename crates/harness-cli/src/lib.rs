@@ -525,6 +525,9 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
     if let Some(e) = &report.journal_error {
         note!(cx, "journal failure: {e}");
     }
+    // Design §9 H1: the outcome is shown to the user, in words, not only
+    // in the report line and the exit code.
+    note!(cx, "outcome: {}", outcome_in_words(&report.outcome));
     let findings = info(
         "harness.run",
         &format!("run {} attempt {}", report.run, report.attempt),
@@ -542,6 +545,25 @@ fn try_run(cx: &Cx<'_>, o: &BTreeMap<&str, &str>, verb: Verb) -> Result<Outcome,
         chain_head: report.chain_head.map(|d| d.to_string()),
         exit_override: None,
     })
+}
+
+/// The run's outcome, said plainly for the person at the terminal.
+fn outcome_in_words(o: &GateOutcome) -> &'static str {
+    match o {
+        GateOutcome::Passed(_) => "Passed: every planned check passed",
+        GateOutcome::Failed => "Failed: a planned check failed",
+        GateOutcome::Indeterminate { why } => match why {
+            IndeterminateKind::NothingChecked => {
+                "Indeterminate (NothingChecked): this task plans no checks, so nothing has verified the result; it is not a pass"
+            }
+            IndeterminateKind::UnreadableEvidence => {
+                "Indeterminate (UnreadableEvidence): the run's record cannot be trusted; it is not a pass"
+            }
+            IndeterminateKind::CouldNotRun => "Indeterminate (CouldNotRun): it is not a pass",
+            IndeterminateKind::UnsupportedOs => "Indeterminate (UnsupportedOs): it is not a pass",
+            IndeterminateKind::StaleBinary => "Indeterminate (StaleBinary): it is not a pass",
+        },
+    }
 }
 
 fn harness_journal_cause(c: &harness_core::StopCause) -> &'static str {

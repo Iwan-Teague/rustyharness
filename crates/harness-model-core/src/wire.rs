@@ -98,9 +98,17 @@ pub fn render_request(req: &ModelRequest, profile: &Profile) -> Result<Value, Re
     let open = format!("<<untrusted {}>>", req.nonce.as_str());
     let close = format!("<</untrusted {}>>", req.nonce.as_str());
     let mut messages = Vec::with_capacity(req.messages.len());
-    for m in &req.messages {
+    for (i, m) in req.messages.iter().enumerate() {
         let (role, content) = match m {
-            Message::System(t) => ("system", t.as_str().to_owned()),
+            // Only the FIRST message may use the system role: common chat
+            // templates (Qwen, Llama and others) refuse a system message
+            // after the conversation has started (H1e-2c exit test: the
+            // server answered 500). Later harness messages (facts, the
+            // observation index, repair and loop notices) are sent in the
+            // user role, marked as the harness's. They are still
+            // harness-authored text: nothing untrusted is rendered here.
+            Message::System(t) if i == 0 => ("system", t.as_str().to_owned()),
+            Message::System(t) => ("user", format!("[harness] {}", t.as_str())),
             Message::Task(t) => ("user", t.as_str().to_owned()),
             Message::Assistant(u) => ("assistant", strip(u.inspect("prompt-assembly"))),
             Message::Observation { call, body } => {
@@ -435,6 +443,24 @@ mod tests {
 
     fn content(c: &Completion) -> &str {
         c.content.inspect("test")
+    }
+
+    #[test]
+    fn only_the_first_message_uses_the_system_role() {
+        let req = ModelRequest {
+            messages: vec![
+                Message::System(HarnessText::from_static("rules")),
+                Message::Task(TaskText::new("task".into())),
+                Message::System(HarnessText::from_static("facts")),
+            ],
+            tools: Vec::new(),
+            nonce: RenderNonce::new("00112233445566778899aabbccddeeff").unwrap(),
+        };
+        let v = render_request(&req, &Profile::conservative_default("m")).unwrap();
+        let m = v["messages"].as_array().unwrap();
+        let roles: Vec<&str> = m.iter().map(|x| x["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["system", "user", "user"]);
+        assert_eq!(m[2]["content"], "[harness] facts");
     }
 
     #[test]

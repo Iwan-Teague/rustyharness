@@ -21,7 +21,7 @@
 //!   `Deny` (§5.2).
 //! - [`path`]: what a built-in read may touch (the workspace, lexically).
 //! - [`locality`]: the `state_root` filesystem-locality check's interface
-//!   and its refusing default (S-F1 pending).
+//!   and its refusing default (the per-OS probes live in `harness-sandbox`).
 //!
 //! Fail-closed throughout: an unknown capability, a class this slice does
 //! not decide, or an ambiguous lookup is refused, never allowed.

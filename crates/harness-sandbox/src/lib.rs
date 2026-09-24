@@ -14,6 +14,13 @@
 //! refuses everywhere. That is the correct scaffold behaviour.
 
 #![forbid(unsafe_code)]
+// The panic-set lints ratchet production code; unit tests may assert loosely.
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
+)]
+
+pub mod locality;
 
 /// What confinement this platform can establish.
 #[derive(Debug, Clone, PartialEq, Eq)]

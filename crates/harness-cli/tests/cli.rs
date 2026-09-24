@@ -261,17 +261,23 @@ const NOTHING_CHECKED: GateOutcome = GateOutcome::Indeterminate {
 // ---- the tests ---------------------------------------------------------------------
 
 #[test]
-fn the_binary_refuses_with_its_only_probe_even_with_the_old_switch_set() {
+fn inv_35_the_binary_refuses_a_state_root_that_is_not_a_local_disk() {
+    // `/dev` is devfs (macOS) or devtmpfs (Linux): not an admitted local
+    // filesystem. The real probe must refuse it before anything is written
+    // or the model server is asked, even with the old switch variable set.
     let fx = fixture("refused");
     let m = mock(vec![]);
     let ep = format!("http://127.0.0.1:{}/v1", m.port);
-    let o = cli(&run_args(&fx, &ep), false, &fx.marker);
+    let mut args = run_args(&fx, &ep);
+    let at = args.iter().position(|a| *a == "--state-root").unwrap() + 1;
+    args[at] = "/dev";
+    let o = cli(&args, false, &fx.marker);
     assert_eq!(o.code(), Some(5));
     let r = report(&o);
     assert_eq!(r["outcome"]["Indeterminate"]["why"], "CouldNotRun");
     assert_eq!(r["gate"], "rustyharness.run");
     assert!(String::from_utf8_lossy(&o.stderr).contains("not on a filesystem identified as local"));
-    assert!(!fx.state.join("runs").exists(), "nothing was written");
+    assert!(!Path::new("/dev/runs").exists(), "nothing was written");
     assert_eq!(
         *m.requests.lock().unwrap(),
         0,
@@ -297,7 +303,9 @@ fn a_whole_run_is_nothing_checked_exit_5_no_marker_and_prints_its_chain_head() {
         ),
     ]);
     let ep = format!("http://127.0.0.1:{}/v1", m.port);
-    let o = cli(&run_args(&fx, &ep), true, &fx.marker);
+    // The real binary with the real probe (spike S-F1): the state root
+    // under the target directory is on a local disk, so the run starts.
+    let o = cli(&run_args(&fx, &ep), false, &fx.marker);
     let stdout = String::from_utf8(o.stdout.clone()).unwrap();
     assert_eq!(
         o.code(),
@@ -316,6 +324,10 @@ fn a_whole_run_is_nothing_checked_exit_5_no_marker_and_prints_its_chain_head() {
         "stopped: submitted; no checks planned"
     );
     assert!(!fx.marker.exists(), "no marker for a run that did not pass");
+    // §9 H1: the outcome is shown to the user in words.
+    assert!(String::from_utf8_lossy(&o.stderr).contains(
+        "outcome: Indeterminate (NothingChecked): this task plans no checks, so nothing has verified the result; it is not a pass"
+    ));
     // The parent's view, under both child conventions: never a pass.
     assert_eq!(
         as_parent_sees(&o, "rustyharness.run", &fx.marker, true),

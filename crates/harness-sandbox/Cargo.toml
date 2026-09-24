@@ -11,4 +11,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+# The filesystem-locality probe measures for the pure decision in
+# harness-policy (design §2.8: the probe here, the allowlist there).
+harness-policy = { path = "../harness-policy" }
 thiserror.workspace = true

@@ -744,6 +744,16 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
     let blobs = DirBlobSource::new(attempt_dir.join(layout::BLOBS_DIR));
     let rec = recorded(&kept, &blobs, r.profile)
         .map_err(|_| nope("the last attempt's records cannot be replayed"))?;
+    // The wall time already spent: what the old attempt carried in (itself
+    // a resumed attempt, H1e-2b confirming review NF-1) plus what its own
+    // writer measured (its last record's monotonic time).
+    let carried_in = head
+        .body
+        .get("resumed_from")
+        .and_then(|f| f.get("wall_carried_ms"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let carried_ms = carried_in.saturating_add(v.records.last().map_or(0, |x| x.t_mono_ms));
     let hdr = header(&HeaderInputs {
         spec: r.spec,
         registry: r.registry,
@@ -752,7 +762,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         identity: &r.backend.identity(),
         facts: pre.facts,
         limits: &limits,
-        resumed_from: Some((n, v.head)),
+        resumed_from: Some((n, v.head, carried_ms)),
     })?;
     let (mut w, attempt) = JournalWriter::create_next_attempt_checked(
         &run_dir,
@@ -781,7 +791,7 @@ pub fn resume(r: Resume<'_>) -> Result<RunReport, RunRefused> {
         meter: new_meter_resumed(
             limits,
             Box::new(SystemClock::default()),
-            Duration::from_millis(v.records.last().map_or(0, |x| x.t_mono_ms)),
+            Duration::from_millis(carried_ms),
         ),
         detector: LoopDetector::new(),
         turns: Vec::new(),

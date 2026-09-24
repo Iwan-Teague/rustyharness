@@ -442,9 +442,10 @@ pub(crate) struct HeaderInputs<'a> {
     pub(crate) identity: &'a harness_model::ModelIdentity,
     pub(crate) facts: WorkspaceFacts,
     pub(crate) limits: &'a MeterLimits,
-    /// A resumed attempt: the attempt it continues and that journal's
-    /// chain head.
-    pub(crate) resumed_from: Option<(u32, Digest)>,
+    /// A resumed attempt: the attempt it continues, that journal's chain
+    /// head, and the wall time carried into this attempt (every earlier
+    /// attempt's, in milliseconds).
+    pub(crate) resumed_from: Option<(u32, Digest, u64)>,
 }
 
 /// The header keys an audit replay or a resume recomputes from its own
@@ -530,12 +531,15 @@ pub(crate) fn header(h: &HeaderInputs<'_>) -> Result<Header, RunRefused> {
             ]),
         )
         .field("checks", Trusted::U64(0));
-    if let Some((attempt, head)) = h.resumed_from {
+    if let Some((attempt, head, carried_ms)) = h.resumed_from {
         hd = hd.field(
             "resumed_from",
             Trusted::Obj(vec![
                 ("attempt", Trusted::U64(u64::from(attempt))),
                 ("chain_head", Trusted::Digest(head)),
+                // H1e-2b confirming review NF-1: the wall time of EVERY
+                // earlier attempt, so a chain of resumes is charged in full.
+                ("wall_carried_ms", Trusted::U64(carried_ms)),
             ]),
         );
     }
